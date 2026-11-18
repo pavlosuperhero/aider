@@ -47,6 +47,17 @@ jobs:
           # A conflict fails the workflow without modifying main.
           git merge --no-edit upstream/main
 
+          # Keep the fork's Actions UI and PR checks limited to this sync workflow.
+          # Upstream may add new workflows in later releases.
+          while IFS= read -r -d '' workflow; do
+            if [ "$workflow" != ".github/workflows/sync-upstream.yml" ]; then
+              git rm -f -- "$workflow"
+            fi
+          done < <(git ls-files -z .github/workflows)
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: exclude upstream CI workflows from fork"
+          fi
+
           # This is a bot-owned review branch. Never force-push main.
           git push --force-with-lease origin HEAD:refs/heads/automation/sync-upstream
           echo "changed=true" >> "$GITHUB_OUTPUT"
