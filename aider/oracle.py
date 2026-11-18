@@ -385,12 +385,12 @@ class OracleSession:
             {"role": "user", "content": self.context},
             {
                 "role": "assistant",
-                "content": "I will apply relevant foundations to the project code.",
+                "content": oracle_prompts.ACKNOWLEDGEMENT,
             },
         ]
 
     def _fits(self, context, token_count):
-        count = token_count(context + oracle_prompts.REMINDER)
+        count = token_count(context + oracle_prompts.REMINDER + oracle_prompts.ACKNOWLEDGEMENT)
         if type(count) is not int or count <= 0:
             raise OracleBudgetError("Oracle requires a valid model token count.")
         return count <= self.config.max_context_tokens
@@ -423,12 +423,16 @@ class OracleSession:
             )
         self.search_count += 1
         context = self._filtered_provider(request["source"], top_k=self.config.top_k).retrieve(
-            request["query"], token_count
+            request["query"], lambda text: token_count(text + oracle_prompts.REFRESH_SUFFIX)
         )
-        return context or (
-            "Oracle returned no matching passages for that focused question. This is an evidence "
-            "gap. Continue from the foundation and project code, or refine the question within "
-            "the remaining search limit; identify any claim you cannot support."
+        return (
+            (context + oracle_prompts.REFRESH_SUFFIX)
+            if context
+            else (
+                "Oracle returned no matching passages for that focused question. This is an evidence "
+                "gap. Continue from the foundation and project code, or refine the question within "
+                "the remaining search limit; identify any claim you cannot support."
+            )
         )
 
 

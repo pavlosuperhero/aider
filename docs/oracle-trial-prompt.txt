@@ -1,0 +1,33 @@
+Fix the programmatic dry-run contract in this Aider fork.
+
+Context: Coder.create(..., dry_run=True) can still write an existing file when
+the caller supplies an ordinary InputOutput without separately enabling its
+dry-run setting. The CLI configures both, so focus on the Python scripting API.
+
+Goal: dry-run produces a preview with no file writes or Git commits. Normal
+runs still apply the intended edits, and caller-supplied stricter I/O behavior
+remains respected.
+
+Work in aider/coders/base_coder.py, aider/io.py, and tests/basic/test_scripting.py:
+1. Read the edit, I/O, and clone paths to locate the side-effect boundary.
+2. Add a regression test in a temporary Git repository with a mocked model
+   response. Run it before the fix and record the specific failing assertion.
+3. Implement the smallest coherent fix. Verify that dry-run leaves an existing
+   file unchanged, creates no proposed new file, and leaves Git HEAD unchanged.
+   Also verify that a normal run edits its intended file and cloning preserves
+   the relevant dry-run behavior.
+4. Run .venv/bin/python -m pytest -q tests/basic/test_scripting.py
+   tests/basic/test_coder.py tests/basic/test_oracle.py
+   tests/basic/test_oracle_integration.py
+
+Apply the required Oracle foundations to the interface contract and side-effect
+boundary. Request a focused refresh only for an unresolved knowledge question.
+Connect relevant source claims to the actual code; identify unsupported claims
+as evidence gaps. Keep Oracle integration behavior and unrelated code unchanged.
+Leave the changes uncommitted for review.
+
+Return three concise items:
+- Root cause and the concrete behavior changed.
+- Test commands and observed before/after results, including any unchecked case.
+- Oracle passage IDs, origins and available locators, with one sentence on how
+  each cited principle supports the fix. Cite only evidence actually supplied.
