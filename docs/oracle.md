@@ -276,10 +276,13 @@ python -m pytest -q tests/basic/test_oracle.py tests/basic/test_oracle_integrati
   tests/basic/test_scripting.py
 ```
 
-The existing upstream-sync workflow runs these checks against a proposed merge
-before pushing its review branch, and on relevant pull requests. A failed check
-is the alert for incompatible scripting API changes. Real Oracle/Qwen smoke
-steps above remain available and require separately running services. The local
+Run these compatibility checks manually before accepting an upstream merge.
+Repository automation remains a single weekly/manual upstream-sync workflow:
+it checks `Aider-AI/aider`, prepares a review branch in this fork when changes
+are available, and opens or updates a pull request here. It does not run Oracle
+test jobs on fork pull requests or push changes back to the upstream project.
+Real Oracle/Qwen smoke steps above remain available and require separately
+running services. The local
 live-service smoke and its limitations are recorded in
 [the verification notes](oracle-verification.md).
 
