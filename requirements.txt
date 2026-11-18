@@ -136,6 +136,7 @@ httpcore>=1.0.9
 httpx>=0.28.1
     # via
     #   -c requirements/common-constraints.txt
+    #   -r requirements/requirements.in
     #   huggingface-hub
     #   litellm
     #   mixpanel

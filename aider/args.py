@@ -64,6 +64,53 @@ def get_parser(default_config_files, git_root):
     )
 
     ##########
+    group = parser.add_argument_group("Oracle retrieval (opt-in)")
+    group.add_argument(
+        "--oracle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Retrieve read-only documentation context from a separate Oracle service",
+    )
+    group.add_argument("--oracle-base-url", default="http://127.0.0.1:8742")
+    group.add_argument(
+        "--oracle-token-env",
+        default="ORACLE_TOKEN",
+        help="Name of the environment variable containing the Oracle bearer token",
+    )
+    group.add_argument("--oracle-top-k", type=int, default=3)
+    group.add_argument("--oracle-timeout-seconds", type=float, default=10.0)
+    group.add_argument("--oracle-max-context-tokens", type=int, default=4096)
+    group.add_argument(
+        "--oracle-mode",
+        choices=("adaptive", "always"),
+        default="adaptive",
+        help="Load required foundations then refresh on model request, or retrieve every user message",
+    )
+    group.add_argument(
+        "--oracle-foundation-source",
+        action="append",
+        default=None,
+        help="Required initial source filter (repeatable; defaults: clean-architecture, think-python)",
+    )
+    group.add_argument(
+        "--oracle-max-searches",
+        type=int,
+        default=2,
+        help="Maximum model-requested refreshes per turn (1–3; shares the reflection limit)",
+    )
+    group.add_argument(
+        "--oracle-source",
+        action="append",
+        default=[],
+        help="Source path substring filter (repeatable; at most eight)",
+    )
+    group.add_argument(
+        "--oracle-fail-open",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Continue without evidence if Oracle retrieval fails (default: cancel the turn)",
+    )
+
     group = parser.add_argument_group("API Keys and settings")
     group.add_argument(
         "--openai-api-key",

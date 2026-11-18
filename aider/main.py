@@ -970,6 +970,11 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     analytics.event("auto_commits", enabled=bool(args.auto_commits))
 
     try:
+        oracle_kwargs = {}
+        if args.oracle:
+            from aider.oracle import OracleConfig, create_oracle_provider
+
+            oracle_kwargs["oracle_provider"] = create_oracle_provider(OracleConfig.from_args(args))
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
@@ -1004,6 +1009,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             auto_copy_context=args.copy_paste,
             auto_accept_architect=args.auto_accept_architect,
             add_gitignore_files=args.add_gitignore_files,
+            **oracle_kwargs,
         )
     except UnknownEditFormat as err:
         io.tool_error(str(err))
