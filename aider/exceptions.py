@@ -19,7 +19,24 @@ EXCEPTIONS = [
         False,
         "The API provider is not able to authenticate you. Check your API key.",
     ),
+    ExInfo(
+        "CallerCredentialAuthenticationError",
+        False,
+        "The API provider is not able to authenticate you. Check your credentials.",
+    ),
+    ExInfo(
+        "CallerCredentialRateLimitError",
+        True,
+        "The API provider has rate limited you. Try again later or check your quotas.",
+    ),
     ExInfo("AzureOpenAIError", True, None),
+    ExInfo("MalformedRequestFieldError", False, None),
+    ExInfo("ModelNotMappedError", False, None),
+    ExInfo("PaymentRequiredError", False, None),
+    ExInfo("UnsupportedEndpointError", False, None),
+    ExInfo("ValidationError", False, None),
+    ExInfo("VectorStoreSearchError", False, None),
+    ExInfo("ZoneInfoNotFoundError", False, None),
     ExInfo("BadGatewayError", True, "The API provider's servers are down or overloaded."),
     ExInfo("BadRequestError", False, None),
     ExInfo("BudgetExceededError", True, None),
@@ -76,8 +93,9 @@ class LiteLLMExceptions:
                     raise ValueError(f"{var} is in litellm but not in aider's exceptions list")
 
         for var in self.exception_info:
-            ex = getattr(litellm, var)
-            self.exceptions[ex] = self.exception_info[var]
+            ex = getattr(litellm, var, None)
+            if ex is not None:
+                self.exceptions[ex] = self.exception_info[var]
 
     def exceptions_tuple(self):
         return tuple(self.exceptions)
