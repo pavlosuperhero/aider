@@ -338,7 +338,9 @@ class Coder:
         file_watcher=None,
         auto_copy_context=False,
         auto_accept_architect=True,
+        oracle_provider=None,
     ):
+        self.oracle_provider = oracle_provider
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
 
@@ -859,9 +861,34 @@ class Coder:
     def run_stream(self, user_message):
         self.io.user_input(user_message)
         self.init_before_message()
-        yield from self.send_message(user_message)
+        user_message = self.get_oracle_message(user_message)
+        if self.oracle_provider is not None and not user_message:
+            return
+        while True:
+            self.oracle_response_pending = False
+            yield from self.send_message(user_message)
+            if not self.oracle_response_pending:
+                break
+            if self.num_reflections >= self.max_reflections:
+                self.io.tool_warning("Oracle refresh reached the reflection limit, stopping.")
+                return
+            self.num_reflections += 1
+            user_message = self.reflected_message
+
+    def get_oracle_message(self, message):
+        if not message or self.oracle_provider is None:
+            return message
+        from aider.oracle import add_oracle_context
+
+        message = add_oracle_context(
+            message, self.oracle_provider, self.main_model.token_count, self.io
+        )
+        if message is None:
+            self.partial_response_content = None
+        return message
 
     def init_before_message(self):
+        self.oracle_response_pending = False
         self.aider_edited_files = set()
         self.reflected_message = None
         self.num_reflections = 0
@@ -872,6 +899,31 @@ class Coder:
 
         if self.repo:
             self.commit_before_message.append(self.repo.get_head_commit_sha())
+
+    def handle_oracle_response(self, content):
+        provider = self.oracle_provider
+        if provider is None or not callable(getattr(type(provider), "respond", None)):
+            return False
+        from aider.oracle import OracleError
+
+        try:
+            response = provider.respond(content, self.main_model.token_count)
+        except OracleError as error:
+            if not provider.config.fail_open:
+                self.io.tool_error(str(error))
+                self.partial_response_content = None
+                return True
+            self.io.tool_warning(str(error))
+            response = (
+                "Oracle refresh failed. Continue using the existing foundation and project code; "
+                "report the evidence gap and do not request more searches this turn."
+            )
+        if response is None:
+            return False
+        self.io.tool_output("Oracle: focused refresh handled.")
+        self.reflected_message = response
+        self.oracle_response_pending = True
+        return True
 
     def run(self, with_message=None, preproc=True):
         try:
@@ -928,6 +980,11 @@ class Coder:
             message = self.preproc_user_input(user_message)
         else:
             message = user_message
+
+        # Enrich only after command/URL/file preprocessing. Retrieved data must
+        # never enter command dispatch, and reflections reuse the existing evidence.
+        if preproc:
+            message = self.get_oracle_message(message)
 
         while message:
             self.reflected_message = None
@@ -1280,6 +1337,9 @@ class Coder:
 
         chunks.repo = self.get_repo_messages()
         chunks.readonly_files = self.get_readonly_files_messages()
+        provider = self.oracle_provider
+        if provider is not None and callable(getattr(type(provider), "context_messages", None)):
+            chunks.readonly_files = provider.context_messages() + chunks.readonly_files
         chunks.chat_files = self.get_chat_files_messages()
 
         if self.gpt_prompts.system_reminder:
@@ -1558,6 +1618,9 @@ class Coder:
             content = ""
 
         if not interrupted:
+            # Resolve model requests before file mentions, edit parsing or shell suggestions.
+            if self.handle_oracle_response(content):
+                return
             add_rel_files_message = self.check_for_file_mentions(content)
             if add_rel_files_message:
                 if self.reflected_message:

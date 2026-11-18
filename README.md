@@ -39,6 +39,10 @@ src="https://img.shields.io/badge/🔄%20Singularity-88%25-e74c3c?style=flat-squ
 
 ## Features
 
+This fork supports opt-in [Oracle documentation context](docs/oracle.md) through
+`--oracle` or `.aider.conf.yml`. Oracle runs as a separate service; Aider retains
+ownership of code edits and Git operations.
+
 ### [Cloud and local LLMs](https://aider.chat/docs/llms.html)
 
 <a href="https://aider.chat/docs/llms.html"><img src="https://aider.chat/assets/icons/brain.svg" width="32" height="32" align="left" valign="middle" style="margin-right:10px"></a>

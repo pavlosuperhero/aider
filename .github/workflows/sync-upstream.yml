@@ -5,6 +5,15 @@ on:
     # Weekly, Monday 04:17 UTC. GitHub may delay scheduled runs.
     - cron: "17 4 * * 1"
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "aider/**"
+      - "tests/basic/test_oracle*.py"
+      - "tests/basic/test_scripting.py"
+      - "requirements*.txt"
+      - "requirements/**"
+      - "pyproject.toml"
+      - ".github/workflows/sync-upstream.yml"
 
 permissions:
   contents: write
@@ -16,7 +25,7 @@ concurrency:
 
 jobs:
   sync:
-    if: github.repository == 'pavlosuperhero/aider'
+    if: github.repository == 'pavlosuperhero/aider' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
@@ -24,6 +33,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Set up compatibility Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Merge upstream into a review branch
         id: sync
@@ -46,6 +60,14 @@ jobs:
           git checkout -B automation/sync-upstream origin/main
           # A conflict fails the workflow without modifying main.
           git merge --no-edit upstream/main
+
+          # The scripting API is unsupported upstream. Fail before publishing a
+          # sync branch if the real coder/CLI contract no longer holds.
+          python -m pip install -e . pytest pytest-env
+          AIDER_ANALYTICS=false python -m pytest -q \
+            tests/basic/test_oracle.py \
+            tests/basic/test_oracle_integration.py \
+            tests/basic/test_scripting.py
 
           # Keep the fork's Actions UI and PR checks limited to this sync workflow.
           # Upstream may add new workflows in later releases.
@@ -79,3 +101,29 @@ jobs:
               --title "chore: sync changes from Aider-AI/aider" \
               --body "Automated weekly upstream merge from Aider-AI/aider. Review differences and CI before merging. The original Apache-2.0 LICENSE.txt and upstream attribution must remain intact."
           fi
+
+  oracle-compatibility:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Aider and test dependencies
+        run: python -m pip install -e . pytest pytest-env
+      - name: Verify pinned scripting and Oracle contracts
+        env:
+          AIDER_ANALYTICS: "false"
+        run: >-
+          python -m pytest -q
+          tests/basic/test_oracle.py
+          tests/basic/test_oracle_integration.py
+          tests/basic/test_scripting.py
