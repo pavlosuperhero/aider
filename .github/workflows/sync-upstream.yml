@@ -47,10 +47,11 @@ jobs:
           # A conflict fails the workflow without modifying main.
           git merge --no-edit upstream/main
 
-          # Keep the fork's Actions UI and PR checks limited to this sync workflow.
+          # Preserve the fork-owned sync and Oracle test workflows.
           # Upstream may add new workflows in later releases.
           while IFS= read -r -d '' workflow; do
-            if [ "$workflow" != ".github/workflows/sync-upstream.yml" ]; then
+            if [ "$workflow" != ".github/workflows/sync-upstream.yml" ] && \
+               [ "$workflow" != ".github/workflows/oracle-compatibility.yml" ]; then
               git rm -f -- "$workflow"
             fi
           done < <(git ls-files -z .github/workflows)

@@ -276,11 +276,22 @@ python -m pytest -q tests/basic/test_oracle.py tests/basic/test_oracle_integrati
   tests/basic/test_scripting.py
 ```
 
-Run these compatibility checks manually before accepting an upstream merge.
-Repository automation remains a single weekly/manual upstream-sync workflow:
-it checks `Aider-AI/aider`, prepares a review branch in this fork when changes
-are available, and opens or updates a pull request here. It does not run Oracle
-test jobs on fork pull requests or push changes back to the upstream project.
+Repository automation has two separate workflows:
+
+- `sync-upstream.yml` runs weekly or manually. It checks `Aider-AI/aider`, prepares
+  a review branch in this fork when changes are available, and opens or updates
+  a pull request here. It does not run integration tests or push changes back
+  to the upstream project.
+- `oracle-compatibility.yml` runs the Oracle integration and scripting API tests
+  on relevant pull requests or a manual run, using Python 3.10 and 3.12. It has
+  read-only repository permissions and does not merge or push changes. The sync
+  workflow preserves this file when removing unrelated upstream workflows.
+
+For sync PRs opened with `GITHUB_TOKEN`, GitHub can require a maintainer to
+select **Approve workflows to run** before PR checks start. A manual test run
+can also select the sync branch. See
+[GitHub's workflow-trigger rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
+Review the compatibility results before accepting an upstream merge.
 Real Oracle/Qwen smoke steps above remain available and require separately
 running services. The local
 live-service smoke and its limitations are recorded in

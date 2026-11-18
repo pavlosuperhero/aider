@@ -1,0 +1,44 @@
+name: Oracle integration and compatibility
+
+on:
+  pull_request:
+    paths:
+      - "aider/**"
+      - "tests/basic/test_oracle*.py"
+      - "tests/basic/test_scripting.py"
+      - "requirements*.txt"
+      - "requirements/**"
+      - "pyproject.toml"
+      - ".github/workflows/oracle-compatibility.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oracle-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Aider and test dependencies
+        run: python -m pip install -e . pytest pytest-env
+      - name: Verify scripting API and Oracle integration
+        env:
+          AIDER_ANALYTICS: "false"
+        run: >-
+          python -m pytest -q
+          tests/basic/test_oracle.py
+          tests/basic/test_oracle_integration.py
+          tests/basic/test_scripting.py
