@@ -22,6 +22,10 @@ three-part review output. The prepared `.venv` contains the test dependencies.
 On another checkout, prepare it with `uv venv --python 3.12` followed by
 `uv pip install -e . pytest pytest-env`.
 
+The task file is supplied explicitly by `--message-file`. The standing Oracle
+policy is supplied by the module from `aider/oracle_prompts.py`; this guide and
+`docs/oracle.md` are human reference documents, not automatically loaded prompts.
+
 Keep the Aider conversation and the diff. When requesting evaluation, include
 the transcript or its history-file path and say “evaluate the Aider trial”.
 Evaluation should inspect the actual source, test results and retrieved

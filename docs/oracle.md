@@ -4,6 +4,20 @@ Oracle is an opt-in, read-only context provider for this fork. It runs as a
 separate HTTP service. Aider continues to own model calls, repo maps, edit
 parsing, linting, tests and Git. Nothing changes when `--oracle` is absent.
 
+## Which instructions reach the model
+
+`aider/oracle_prompts.py` contains the versioned operating policy that the
+module supplies to the coding model. This Markdown guide describes that policy;
+it is not automatically loaded as a model instruction or ingested into Oracle.
+The trial's `--message-file` explicitly supplies its task prompt. A Markdown
+file needed for another task can be added explicitly with Aider's `--read`
+option; reference documents remain read-only.
+
+The model receives the policy, bounded cited foundation passages and an allowed
+source catalog, alongside the project context Aider already supplies. It then
+produces either an ordinary coding response or an exact focused-search request.
+The adapter validates the latter before any edit processing.
+
 ## When and what gets searched
 
 The default `adaptive` mode combines mandatory foundations with focused refreshes:
@@ -11,10 +25,13 @@ The default `adaptive` mode combines mandatory foundations with focused refreshe
 1. On the first normal user turn, read the indexed source catalog and retrieve
    one passage each from the configured foundations. Defaults are
    `clean-architecture` and `think-python`, which are present in the verified
-   catalog. The model cannot skip this step because it feels confident.
+   catalog. The adapter performs this lookup regardless of model confidence;
+   this does not verify that the model correctly reads or applies the evidence.
 2. Keep that bounded foundation and catalog in Aider's read-only message chunk,
    outside summarizable conversation history. Ordinary turns and coder clones
    reuse it without repeating HTTP queries or duplicating it in chat history.
+   It still occupies model context. Start a new Aider session to reload these
+   references after changing the Oracle index or available source catalog.
 3. Aider supplies the project code normally. The model reads it and requests
    additional knowledge only for unresolved architecture, unfamiliar APIs or
    PEPs, uncertain documented behavior, or a debugging hypothesis needing
@@ -30,6 +47,30 @@ than project files. It asks the model to connect relevant principles to actual
 code and identify a real mismatch instead of dismissing a source merely for
 not mentioning the repository. The model may still choose poor queries or
 misapply a principle; the mechanism does not guarantee better reasoning.
+
+### Concrete search decisions
+
+These examples express the intended policy, not guaranteed model decisions:
+
+| Task or knowledge gap | Expected action |
+| --- | --- |
+| Rename a local variable with no semantic change | Use the project code and existing foundations; make no additional lookup. |
+| Decide where to isolate an external service | Apply relevant foundation evidence; refresh a displayed Cosmic Python source if the boundary question remains unresolved. |
+| Determine exactly what an HTTPX read timeout limits | Request a focused `httpx-timeouts` lookup, if that filter is in the supplied catalog. |
+| Returned text describes phase timeouts but not a total deadline | State the supported scope and the missing guarantee; do not invent an overall deadline. |
+| No relevant passage is returned | Identify the evidence gap, then refine within the remaining limit or continue with explicitly limited claims. |
+
+For the timeout example, the complete model response requesting a lookup is:
+
+```xml
+<oracle_search>{"query":"What does an HTTPX read timeout limit?","source":"httpx-timeouts"}</oracle_search>
+```
+
+The envelope contains exactly `query` and `source`; the source must be one of
+the displayed filters. A request cannot include edits, shell commands or extra
+JSON fields. After the evidence is supplied, continue the original task and cite
+the actual passage ID, origin and available page/line locator for supported
+claims. General book advice must be connected to the relevant code decision.
 
 `--oracle-mode always` retains deterministic retrieval of each preprocessed
 user message. Commands and internal editor messages do not trigger a new
@@ -82,11 +123,11 @@ No raw-token flag is provided.
 | `oracle` | false | Explicitly enables retrieval |
 | `oracle-base-url` | `http://127.0.0.1:8742` | HTTP(S) URL without credentials, query or fragment |
 | `oracle-token-env` | `ORACLE_TOKEN` | Environment variable name, independent of model API keys |
-| `oracle-top-k` | 3 | 1–20 complete candidate passages in total |
+| `oracle-top-k` | 3 | 1–20 passages per focused refresh; a shared total across filters in always mode; initialization separately retrieves one passage per required foundation |
 | `oracle-timeout-seconds` | 10 | Positive, finite HTTPX inactivity timeout per request |
 | `oracle-max-context-tokens` | 4096 | Positive reference budget, including the policy, foundation, catalog and reminder |
 | `oracle-source` | none | Repeatable path substring filters, at most eight |
-| `oracle-fail-open` | false | On failure, cancel the turn; true warns and uses the original instruction |
+| `oracle-fail-open` | false | On failure, cancel the turn; true warns and continues without the failed lookup |
 | `oracle-mode` | adaptive | Required foundations plus focused requests; `always` retrieves each user message |
 | `oracle-foundation-source` | clean-architecture, think-python | 1–4 required initial source filters, independently configured from refresh filters |
 | `oracle-max-searches` | 2 | 1–3 focused refreshes per user turn, also bounded by Aider's existing reflection limit |
@@ -120,8 +161,11 @@ and share a total candidate limit. Duplicate IDs are included once per retrieval
    ```
 
    Check the diff and citations. Repeat with `--no-oracle` to confirm the normal
-   path. Stop Oracle and verify the default cancels the turn; then try
-   `--oracle-fail-open` to see the warning and ordinary Aider behavior.
+   path. To test an outage, stop Oracle and start a fresh Aider process so the
+   required foundations are not already cached. The default should cancel its
+   first model turn; repeat with `--oracle-fail-open` to check the warning and
+   continuation without new evidence. A warm session can continue from cached
+   foundations until it requests a refresh that needs the service.
 
 The [Aider LM Studio guide](https://aider.chat/docs/llms/lm-studio.html) documents
 that model prefix and environment setup. A vLLM server can instead use the
@@ -141,12 +185,15 @@ from aider.oracle import AiderOracleAdapter, OracleConfig
 adapter = AiderOracleAdapter.create(
     main_model=Model("lm_studio/YOUR_QWEN_MODEL_ID"),
     fnames=["greeting.py"],
-    io=InputOutput(yes=True),
+    io=InputOutput(),
     auto_commits=False,
     oracle_config=OracleConfig(enabled=True, source_ids=("cosmic-python",)),
 )
 adapter.run("Improve the interface using relevant retrieved guidance")
 ```
+
+`InputOutput()` retains normal confirmations. Unattended scripts can explicitly
+choose `InputOutput(yes=True)` if automatic confirmation is intended.
 
 For direct use, pass `create_oracle_provider(config)` as `oracle_provider` to
 `Coder.create`. `OracleContextProvider` itself is the low-level deterministic HTTP
@@ -156,7 +203,10 @@ occurs after command, URL and file-mention preprocessing and before sending the
 first model message. Lint/error reflections reuse existing evidence; validated
 search envelopes intentionally cause a bounded retrieval continuation.
 Internal `run(..., preproc=False)` calls, including architect-to-editor handoffs,
-bypass retrieval; `run_stream` retrieves once before sending its message.
+bypass initial context preparation; an initialized shared provider still supplies
+its pinned foundations and can handle focused requests within the shared search
+budget. `run_stream` prepares context before sending, then handles focused-search
+continuations without running the evidence through user-command preprocessing.
 `clone` retains the provider through the existing `original_kwargs` mechanism.
 
 ## Verified service boundary and failure behavior
@@ -177,8 +227,8 @@ indexed passage without re-embedding. See Oracle's
 MCP transport is not implemented in this MVP.
 
 401/403, timeouts, network/index unavailability, malformed JSON, missing passage
-metadata, source-filter violations, invalid model requests and excessive responses raise distinct
-`OracleError` subclasses. The native path displays the error and cancels that
+metadata, source-filter violations, invalid model requests and excessive
+responses raise distinct `OracleError` subclasses. The native path displays the error and cancels that
 turn unless fail-open is enabled. Missing required foundation evidence cancels
 initialization by default; fail-open explicitly permits continuing without it.
 Empty focused results return an evidence-gap message to the model. Empty results
@@ -186,8 +236,9 @@ in always mode warn and continue. If no whole
 passage fits, a budget error follows the configured failure policy. The budget
 includes the evidence envelope and metadata, excluding the original user
 instruction. Initialization additionally counts its policy, catalog and reminder.
-Reference counts use Aider's `Model.token_count`; estimates can differ from the server tokenizer. Each focused refresh has its own reference budget; chat history remains governed
-by Aider's context settings. Oversized individual passages are omitted, never silently
+Reference counts use Aider's `Model.token_count`; estimates can differ from the
+server tokenizer. Each focused refresh has its own reference budget; chat history
+remains governed by Aider's context settings. Oversized individual passages are omitted, never silently
 cut mid-citation. A one MiB decompressed response limit applies to each request.
 HTTP redirects and environment-derived HTTP proxies are disabled for retrieval.
 Timeouts are inactivity limits, not an overall wall-clock deadline; multiple
@@ -228,7 +279,31 @@ python -m pytest -q tests/basic/test_oracle.py tests/basic/test_oracle_integrati
 The existing upstream-sync workflow runs these checks against a proposed merge
 before pushing its review branch, and on relevant pull requests. A failed check
 is the alert for incompatible scripting API changes. Real Oracle/Qwen smoke
-steps above remain available and require separately running services. The local live-service smoke and its limitations are recorded in [the verification notes](oracle-verification.md).
+steps above remain available and require separately running services. The local
+live-service smoke and its limitations are recorded in
+[the verification notes](oracle-verification.md).
+
+## Markdown instruction review
+
+This guide, [the trial instructions](oracle-trial.md),
+[the trial prompt](oracle-trial-prompt.txt), and
+[the verification record](oracle-verification.md) serve different purposes:
+operating contract, coding task, and observed evidence. Only the runtime policy
+and explicitly supplied task files reach the model automatically through this
+integration. Keep these documents aligned with the implementation rather than
+treating documentation text as an independently executed policy.
+
+The Markdown review used Oracle's *Google Prompt Engineering*, PDF p. 55,
+passage `1718bc208ed1472ae14c4086`, for clear, concise instructions, and p. 56,
+passage `bac1d6367a4987d87c1f7f18`, for specific expected output. Applied changes
+include the explicit input/output contract, concrete search cases, the complete
+request example, and cache-aware outage steps. This is an application of those
+principles; it does not establish that the model will follow every instruction.
+
+Retrieval query, with `--source prompt-engineering --top-k 3`:
+“Design with simplicity. Be specific about desired output. Use clear concise
+prompts and provide examples of expected behavior.” The table-of-contents result
+was not used as supporting evidence.
 
 ## Design evidence retrieved through Oracle
 

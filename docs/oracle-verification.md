@@ -62,3 +62,12 @@ passage `90595d98465d965c36f7c6b0`: test changes against examples and record
 relevant RAG settings. The runtime policy is kept separately in
 `aider/oracle_prompts.py`; it does not persist private queries or retrieved
 passages as a new cache on disk.
+
+## Documentation review
+
+The Markdown instructions were also checked against the runtime policy and
+configuration. The review clarified which files actually reach the model,
+added concrete search/response examples, distinguished mandatory initialization
+from refresh limits, and corrected the outage procedure for cached sessions.
+The runtime policy was unchanged in this documentation review, so the live
+model observations above still refer to the same tested prompt versions.
