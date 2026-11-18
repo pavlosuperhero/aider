@@ -1,0 +1,70 @@
+name: Sync upstream Aider
+
+on:
+  schedule:
+    # Weekly, Monday 04:17 UTC. GitHub may delay scheduled runs.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-aider-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'pavlosuperhero/aider'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream into a review branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/Aider-AI/aider.git
+          git fetch upstream main
+
+          # Nothing to do when the fork already contains every upstream commit.
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Keep upstream changes separate from custom changes on main.
+          git checkout -B automation/sync-upstream origin/main
+          # A conflict fails the workflow without modifying main.
+          git merge --no-edit upstream/main
+
+          # This is a bot-owned review branch. Never force-push main.
+          git push --force-with-lease origin HEAD:refs/heads/automation/sync-upstream
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or reuse an upstream sync pull request
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          existing="$(gh pr list --base main --head automation/sync-upstream --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "Updated existing upstream sync PR #$existing"
+          else
+            gh pr create \
+              --base main \
+              --head automation/sync-upstream \
+              --title "chore: sync changes from Aider-AI/aider" \
+              --body "Automated weekly upstream merge from Aider-AI/aider. Review differences and CI before merging. The original Apache-2.0 LICENSE.txt and upstream attribution must remain intact."
+          fi
