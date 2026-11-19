@@ -3,14 +3,17 @@
 Only plain data and fake callbacks are used: no Coder, no files, no subprocesses.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import aider.tdd as tdd_mod
 from aider.hooks import EditProposal, ResponseHookResult, TestRunObservation
 from aider.tdd import (
-    DEFAULT_DOC_GLOBS,
+    AIDER_REPO_ROOT,
     DEFAULT_SOURCE_GLOBS,
+    DEFAULT_TDD_SCRIPT_PATH,
     DEFAULT_TEST_CMD,
     DEFAULT_TEST_GLOBS,
     Phase,
@@ -19,6 +22,7 @@ from aider.tdd import (
     TddConfig,
     TddController,
     classify_pytest_run,
+    load_tdd_controller_class,
     supports_pytest,
 )
 
@@ -253,6 +257,10 @@ def test_config_rejects_unusable_scope_or_budgets(kwargs):
 
 def test_tdd_config_default_constants():
     config = TddConfig()
+    expected_script = str(Path(tdd_mod.__file__).resolve())
+    assert AIDER_REPO_ROOT == Path(tdd_mod.__file__).resolve().parent.parent
+    assert DEFAULT_TDD_SCRIPT_PATH == expected_script
+    assert config.script_path == expected_script
     assert config.test_globs == DEFAULT_TEST_GLOBS == ("tests/*",)
     assert (
         config.source_globs
@@ -266,8 +274,11 @@ def test_tdd_config_default_constants():
         )
     )
     assert config.doc_globs == ()
-    assert DEFAULT_DOC_GLOBS == ("docs/oracle.md",)
     assert DEFAULT_TEST_CMD == "pytest -q"
+    assert load_tdd_controller_class() is TddController
+    assert load_tdd_controller_class(DEFAULT_TDD_SCRIPT_PATH) is TddController
+    with pytest.raises(ValueError, match="not found"):
+        load_tdd_controller_class("/nonexistent/path/to/custom_tdd.py")
 
 
 def test_scope_is_explicit_not_inferred_from_file_names():

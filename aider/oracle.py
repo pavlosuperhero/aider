@@ -11,12 +11,16 @@ import os
 import re
 from dataclasses import dataclass, replace
 from html import escape, unescape
+from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
 import httpx
 
 from aider import oracle_prompts
+
+AIDER_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ORACLE_DOC_PATH = str(AIDER_REPO_ROOT / "docs" / "oracle.md")
 
 
 class OracleError(Exception):
@@ -59,10 +63,13 @@ class OracleConfig:
     foundation_sources: tuple[str, ...] = ("clean-architecture", "think-python")
     max_searches: int = 2
     require_search: bool = False
+    doc_path: str = DEFAULT_ORACLE_DOC_PATH
 
     def __post_init__(self):
         if type(self.enabled) is not bool or type(self.fail_open) is not bool:
             raise ValueError("Oracle enabled and fail_open settings must be booleans.")
+        if not isinstance(self.doc_path, str) or not self.doc_path.strip():
+            raise ValueError("Oracle doc_path must be a nonempty file path.")
         if not isinstance(self.base_url, str) or any(c.isspace() for c in self.base_url):
             raise ValueError("Oracle base URL must be an HTTP(S) URL without whitespace.")
         try:
@@ -134,6 +141,7 @@ class OracleConfig:
             foundation_sources=tuple(args.oracle_foundation_source or cls.foundation_sources),
             max_searches=args.oracle_max_searches,
             require_search=args.oracle_require_search,
+            doc_path=getattr(args, "oracle_doc", None) or DEFAULT_ORACLE_DOC_PATH,
         )
 
 

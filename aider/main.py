@@ -977,14 +977,15 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             oracle_kwargs["oracle_provider"] = create_oracle_provider(OracleConfig.from_args(args))
         tdd_kwargs = {}
         if args.tdd:
-            from aider.tdd import TddConfig, TddController
+            from aider.tdd import TddConfig, load_tdd_controller_class
 
             tdd_config = TddConfig.from_args(
                 args, args.edit_format or main_model.edit_format, fnames=fnames
             )
+            controller_cls = load_tdd_controller_class(tdd_config.script_path)
             provider = oracle_kwargs.get("oracle_provider")
             citation_validator = getattr(provider, "unknown_cited_ids", None)
-            tdd_controller = TddController(tdd_config, citation_validator=citation_validator)
+            tdd_controller = controller_cls(tdd_config, citation_validator=citation_validator)
             if hasattr(provider, "post_search_guidance"):
                 provider.post_search_guidance = tdd_controller.phase_guidance
             tdd_kwargs = tdd_controller.hook_kwargs()

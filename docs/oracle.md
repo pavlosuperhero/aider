@@ -148,14 +148,23 @@ YAML):
 
 - `--tdd` / `--no-tdd`: enable or disable the TDD workflow (default: false).
   Enabling `--tdd` automatically enables `--auto-test`.
+- `--tdd-script`: path to the TDD controller Python script (default:
+  `<aider-repo>/aider/tdd.py`, resolved via `Path(__file__).resolve()` from the
+  installed Aider repository regardless of your terminal's current working
+  directory; override with `--tdd-script /custom/path/to/my_tdd.py`).
+- `--oracle-doc`: path to the Oracle reference/policy markdown file (default:
+  `<aider-repo>/docs/oracle.md`, resolved via `Path(__file__).resolve()` from the
+  installed Aider repository regardless of your terminal's current working
+  directory; override with `--oracle-doc /custom/path/to/oracle.md`).
 - `--tdd-test-glob`: repeatable fnmatch glob for test files (default: `tests/*`;
   override with `--tdd-test-glob <glob>`).
 - `--tdd-source-glob`: repeatable fnmatch glob for production files (default:
   `aider/*`, `src/*`, `lib/*`, `app/*`, `pkg/*`, plus any non-test/non-doc chat
   files passed on the command line; override with `--tdd-source-glob <glob>`).
 - `--tdd-doc-glob` / `--no-tdd-doc-glob`: repeatable fnmatch glob for
-  documentation files in scope (default: `docs/oracle.md`; override with
-  `--tdd-doc-glob <glob>` or disable with `--no-tdd-doc-glob`).
+  documentation files in scope (default: `()`, disabled unless specified for the
+  target project; enable with `--tdd-doc-glob <glob>` or disable any configured
+  YAML glob with `--no-tdd-doc-glob`).
 - `--test-cmd`: pytest test command (default: `.venv/bin/python -m pytest -q`
   when `.venv/bin/python` exists, otherwise `pytest -q`; override with
   `--test-cmd <cmd>`). Non-pytest test runners and `--edit-format architect` are
@@ -297,6 +306,8 @@ No raw-token flag is provided.
 | `oracle-require-search` | false | Require successful nonempty focused retrieval each user turn; adaptive mode only, incompatible with fail-open |
 | `oracle-foundation-source` | clean-architecture, think-python | 1–4 required initial source filters, independently configured from refresh filters |
 | `oracle-max-searches` | 2 | 1–3 focused refreshes per user turn, also bounded by Aider's existing reflection limit |
+| `oracle-doc` | `<aider-repo>/docs/oracle.md` | Path to the Oracle reference/policy markdown file (resolved from the installed Aider repo, overridable via `--oracle-doc` or YAML) |
+| `tdd-script` | `<aider-repo>/aider/tdd.py` | Path to the TDD controller Python script (resolved from the installed Aider repo, overridable via `--tdd-script` or YAML) |
 
 Source filters use Oracle's **source path substring** semantics, not an exact
 catalog identity. In adaptive mode they restrict the refresh catalog; required
@@ -326,23 +337,23 @@ and share a total candidate limit. Duplicate IDs are included once per retrieval
    oracle-require-search: true
    ```
 
-3. Run with default TDD globs and test command, or override any default on the CLI:
+3. Run with default TDD globs and test command from any repository, or override any default on the CLI:
 
    ```sh
-   # Uses default test glob (tests/*), source globs (aider/*, src/*, ...),
-   # doc glob (docs/oracle.md), auto-test, and pytest test-cmd:
-   aider --tdd aider/oracle.py tests/basic/test_oracle.py docs/oracle.md
+   # Uses Aider-repo defaults (<aider-repo>/docs/oracle.md and <aider-repo>/aider/tdd.py),
+   # default test glob (tests/*), source globs (aider/*, src/*, ... + non-test chat files),
+   # empty doc glob (), auto-test, and pytest test-cmd:
+   aider --oracle --tdd calc.py tests/test_calc.py
 
-   # Override any default with explicit flags:
-   aider --tdd \
+   # Override any default with explicit flags (e.g., enforce a doc glob or custom script/doc):
+   aider --oracle --tdd \
+     --oracle-doc /custom/path/to/oracle.md \
+     --tdd-script /custom/path/to/tdd.py \
      --tdd-test-glob "tests/basic/test_oracle*.py" \
      --tdd-source-glob "aider/oracle.py" \
      --tdd-doc-glob "docs/oracle.md" \
      --test-cmd ".venv/bin/python -m pytest -q tests/basic/test_oracle.py" \
      aider/oracle.py tests/basic/test_oracle.py docs/oracle.md
-
-   # Disable the default docs/oracle.md requirement when no doc update is needed:
-   aider --tdd --no-tdd-doc-glob calc.py tests/test_calc.py
    ```
 
 4. The four independent mode combinations work via CLI flags or `.aider.conf.yml`:

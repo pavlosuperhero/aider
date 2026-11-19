@@ -25,11 +25,13 @@ name guessing. Nothing here judges whether a test is meaningful or the code corr
 """
 
 import fnmatch
+import importlib.util
 import os
 import re
 import shlex
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from aider.hooks import EditProposal, ResponseHookResult, TestRunObservation
 
@@ -57,9 +59,10 @@ class RunKind(str, Enum):
     UNEXPECTED = "unexpected"
 
 
+AIDER_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TDD_SCRIPT_PATH = str(Path(__file__).resolve())
 DEFAULT_TEST_GLOBS = ("tests/*",)
 DEFAULT_SOURCE_GLOBS = ("aider/*", "src/*", "lib/*", "app/*", "pkg/*")
-DEFAULT_DOC_GLOBS = ("docs/oracle.md",)
 DEFAULT_TEST_CMD = "pytest -q"
 
 
@@ -104,8 +107,11 @@ class TddConfig:
     max_corrections: int = 6  # rejected edits, invalid reds and failing runs after a change
     max_refactor_rechecks: int = 2
     require_citation: bool = False
+    script_path: str = DEFAULT_TDD_SCRIPT_PATH
 
     def __post_init__(self):
+        if not isinstance(self.script_path, str) or not self.script_path.strip():
+            raise ValueError("TDD script_path must be a nonempty file path.")
         object.__setattr__(self, "test_globs", _globs("test", self.test_globs))
         object.__setattr__(self, "source_globs", _globs("source", self.source_globs))
         object.__setattr__(self, "doc_globs", _globs("doc", self.doc_globs, allow_empty=True))
@@ -121,11 +127,12 @@ class TddConfig:
     @classmethod
     def from_args(cls, args, edit_format=None, fnames=()):
         """Build the config from parsed CLI/YAML arguments, resolving defaults and overrides."""
+        script_path = getattr(args, "tdd_script", None) or DEFAULT_TDD_SCRIPT_PATH
         test_globs = tuple(getattr(args, "tdd_test_glob", None) or DEFAULT_TEST_GLOBS)
         if getattr(args, "no_tdd_doc_glob", False):
             doc_globs = ()
         else:
-            doc_globs = tuple(getattr(args, "tdd_doc_glob", None) or DEFAULT_DOC_GLOBS)
+            doc_globs = tuple(getattr(args, "tdd_doc_glob", None) or ())
         raw_sources = getattr(args, "tdd_source_glob", None)
         if raw_sources:
             source_globs = tuple(raw_sources)
@@ -153,7 +160,12 @@ class TddConfig:
             raise ValueError("--tdd supports only a pytest --test-cmd (for example 'pytest -q').")
         if edit_format == "architect":
             raise ValueError("--tdd does not support the architect edit format.")
-        return cls(test_globs=test_globs, source_globs=source_globs, doc_globs=doc_globs)
+        return cls(
+            test_globs=test_globs,
+            source_globs=source_globs,
+            doc_globs=doc_globs,
+            script_path=script_path,
+        )
 
 
 @dataclass(frozen=True)
@@ -830,3 +842,23 @@ class TddController:
             f"Tests are not passing after your change: {_run_line(run)} {run.detail}\n{failures}\n"
             "Next action: fix the production code so the test command passes; do not edit tests."
         )
+
+
+def load_tdd_controller_class(script_path=None):
+    """Load TddController from the default Aider module or a custom --tdd-script path."""
+    if not script_path:
+        return TddController
+    resolved = Path(script_path).expanduser().resolve()
+    if str(resolved) == DEFAULT_TDD_SCRIPT_PATH:
+        return TddController
+    if not resolved.is_file():
+        raise ValueError(f"TDD script not found: {script_path}")
+    spec = importlib.util.spec_from_file_location("aider_custom_tdd", str(resolved))
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Cannot load TDD script: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    controller_cls = getattr(module, "TddController", None)
+    if not isinstance(controller_cls, type):
+        raise ValueError(f"TDD script {script_path} does not define a TddController class.")
+    return controller_cls

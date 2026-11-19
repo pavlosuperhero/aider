@@ -116,6 +116,11 @@ def get_parser(default_config_files, git_root):
         default=False,
         help="Continue without evidence if Oracle retrieval fails (default: cancel the turn)",
     )
+    group.add_argument(
+        "--oracle-doc",
+        default=None,
+        help="Path to the Oracle reference/policy markdown file (default: <aider-repo>/docs/oracle.md)",
+    )
 
     group = parser.add_argument_group("TDD workflow (opt-in)")
     group.add_argument(
@@ -123,6 +128,11 @@ def get_parser(default_config_files, git_root):
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enforce a test-first workflow (pytest only; uses smart defaults when globs/test-cmd are omitted)",
+    )
+    group.add_argument(
+        "--tdd-script",
+        default=None,
+        help="Path to the TDD controller Python script (default: <aider-repo>/aider/tdd.py)",
     )
     group.add_argument(
         "--tdd-test-glob",
@@ -140,13 +150,13 @@ def get_parser(default_config_files, git_root):
         "--tdd-doc-glob",
         action="append",
         default=None,
-        help="Optional glob for documentation files, relative to the project root (repeatable; default: docs/oracle.md)",
+        help="Optional glob for documentation files, relative to the project root (repeatable; default: none)",
     )
     group.add_argument(
         "--no-tdd-doc-glob",
         action="store_true",
         default=False,
-        help="Disable the default TDD documentation glob requirement",
+        help="Disable any configured TDD documentation glob requirement",
     )
 
     group = parser.add_argument_group("API Keys and settings")

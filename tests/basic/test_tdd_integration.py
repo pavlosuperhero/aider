@@ -12,13 +12,15 @@ from unittest.mock import Mock
 import git
 import pytest
 
+import aider.tdd as tdd_mod
 from aider.args import get_parser
 from aider.coders import Coder
 from aider.io import InputOutput
 from aider.models import Model
 from aider.tdd import (
-    DEFAULT_DOC_GLOBS,
+    AIDER_REPO_ROOT,
     DEFAULT_SOURCE_GLOBS,
+    DEFAULT_TDD_SCRIPT_PATH,
     DEFAULT_TEST_CMD,
     DEFAULT_TEST_GLOBS,
     Phase,
@@ -26,6 +28,7 @@ from aider.tdd import (
     StopReason,
     TddConfig,
     TddController,
+    load_tdd_controller_class,
 )
 
 TEST_CMD = f"{sys.executable} -m pytest -q -p no:cacheprovider"
@@ -318,16 +321,29 @@ def test_config_from_args_and_refusals(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     parser = get_parser([], None)
 
-    # Defaults when only --tdd is supplied (no .venv/bin/python in tmp_path)
+    expected_script = str(Path(tdd_mod.__file__).resolve())
+    assert AIDER_REPO_ROOT == Path(tdd_mod.__file__).resolve().parent.parent
+    assert DEFAULT_TDD_SCRIPT_PATH == expected_script
+    assert not expected_script.startswith(str(tmp_path))
+
+    # Defaults when only --tdd is supplied in an external repo (tmp_path):
+    # script_path resolves to the Aider repo's aider/tdd.py, and doc_globs is ()
     default_args = parser.parse_args(["--tdd"])
-    default_config = TddConfig.from_args(
-        default_args, fnames=["calc.py", "tests/test_calc.py", "docs/oracle.md"]
-    )
+    default_config = TddConfig.from_args(default_args, fnames=["calc.py", "tests/test_calc.py"])
+    assert default_config.script_path == expected_script
     assert default_config.test_globs == DEFAULT_TEST_GLOBS == ("tests/*",)
     assert default_config.source_globs == (*DEFAULT_SOURCE_GLOBS, "calc.py")
-    assert default_config.doc_globs == DEFAULT_DOC_GLOBS == ("docs/oracle.md",)
+    assert default_config.doc_globs == ()
     assert default_args.test_cmd == DEFAULT_TEST_CMD == "pytest -q"
     assert default_args.auto_test is True
+
+    # Passing --tdd-doc-glob docs/oracle.md explicitly enables that doc glob
+    doc_args = parser.parse_args(["--tdd", "--tdd-doc-glob", "docs/oracle.md"])
+    doc_config = TddConfig.from_args(
+        doc_args, fnames=["calc.py", "tests/test_calc.py", "docs/oracle.md"]
+    )
+    assert doc_config.doc_globs == ("docs/oracle.md",)
+    assert "docs/oracle.md" not in doc_config.source_globs
 
     # Smart .venv/bin/python default when .venv/bin/python exists
     venv_python = tmp_path / ".venv" / "bin" / "python"
@@ -337,16 +353,41 @@ def test_config_from_args_and_refusals(tmp_path, monkeypatch):
     TddConfig.from_args(venv_args)
     assert venv_args.test_cmd == ".venv/bin/python -m pytest -q"
 
-    # Explicit CLI overrides
-    override_args = tdd_args(parser, "--tdd", "--tdd-doc-glob", "docs/*.md")
+    # Explicit CLI overrides including --tdd-script
+    custom_script = tmp_path / "custom_tdd.py"
+    custom_script.write_text(
+        "from aider.tdd import TddController as BaseTddController\n"
+        "class TddController(BaseTddController):\n"
+        "    custom_loaded = True\n"
+    )
+    override_args = tdd_args(
+        parser,
+        "--tdd",
+        "--tdd-doc-glob",
+        "docs/*.md",
+        "--tdd-script",
+        str(custom_script),
+    )
     config = TddConfig.from_args(override_args)
     assert config.test_globs == ("tests/*",)
     assert config.source_globs == ("calc.py", "pkg/*")
     assert config.doc_globs == ("docs/*.md",)
+    assert config.script_path == str(custom_script)
+    loaded_cls = load_tdd_controller_class(config.script_path)
+    assert issubclass(loaded_cls, TddController)
+    assert getattr(loaded_cls, "custom_loaded", False) is True
     assert override_args.test_cmd == "python -m pytest -q"
 
-    # --no-tdd-doc-glob disables the default doc glob
-    no_doc_args = parser.parse_args(["--tdd", "--no-tdd-doc-glob"])
+    # Script missing TddController class raises ValueError
+    bad_script = tmp_path / "bad_tdd.py"
+    bad_script.write_text("X = 1\n")
+    with pytest.raises(ValueError, match="TddController"):
+        load_tdd_controller_class(str(bad_script))
+
+    # --no-tdd-doc-glob disables any configured doc glob
+    no_doc_args = parser.parse_args(
+        ["--tdd", "--tdd-doc-glob", "docs/oracle.md", "--no-tdd-doc-glob"]
+    )
     assert TddConfig.from_args(no_doc_args).doc_globs == ()
 
     def refused(*argv, edit_format=None):
@@ -394,11 +435,24 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     )
     default_hook = coder_default_tdd.response_hooks[0]
     assert isinstance(default_hook, TddController)
+    assert default_hook.config.script_path == DEFAULT_TDD_SCRIPT_PATH
     assert default_hook.config.test_globs == DEFAULT_TEST_GLOBS
     assert "calc.py" in default_hook.config.source_globs
-    assert default_hook.config.doc_globs == DEFAULT_DOC_GLOBS
+    assert default_hook.config.doc_globs == ()
     assert coder_default_tdd.auto_test is True
     assert coder_default_tdd.test_cmd == DEFAULT_TEST_CMD
+
+    # Custom --tdd-script override loads the custom TddController in main()
+    custom_script = project / "custom_tdd.py"
+    custom_script.write_text(
+        "from aider.tdd import TddController as BaseTddController\n"
+        "class TddController(BaseTddController):\n"
+        "    from_custom_script = True\n"
+    )
+    coder_custom_script = main_module.main(
+        base + ["--tdd", "--tdd-script", str(custom_script)], return_coder=True
+    )
+    assert getattr(coder_custom_script.response_hooks[0], "from_custom_script", False) is True
 
     tdd = [
         "--tdd",
