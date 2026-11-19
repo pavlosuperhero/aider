@@ -4,6 +4,7 @@ import re
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import git
 
@@ -17,6 +18,35 @@ from aider.utils import GitTemporaryDirectory, IgnorantTemporaryDirectory
 class TestRepoMap(unittest.TestCase):
     def setUp(self):
         self.GPT35 = Model("gpt-3.5-turbo")
+
+    def test_missing_tags_query_does_not_load_parser(self):
+        with IgnorantTemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "example.py"
+            source.write_text("def example():\n    pass\n")
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=InputOutput())
+            with (
+                patch("aider.repomap.get_scm_fname", return_value=Path(temp_dir) / "missing.scm"),
+                patch("aider.repomap.get_language") as language,
+                patch("aider.repomap.get_parser") as parser,
+            ):
+                self.assertEqual(list(repo_map.get_tags_raw(str(source), source.name)), [])
+                language.assert_not_called()
+                parser.assert_not_called()
+            del repo_map
+
+    def test_empty_source_does_not_load_parser(self):
+        with IgnorantTemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "example.py"
+            source.touch()
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=InputOutput())
+            with (
+                patch("aider.repomap.get_language") as language,
+                patch("aider.repomap.get_parser") as parser,
+            ):
+                self.assertEqual(list(repo_map.get_tags_raw(str(source), source.name)), [])
+                language.assert_not_called()
+                parser.assert_not_called()
+            del repo_map
 
     def test_get_repo_map(self):
         # Create a temporary directory with sample files for testing

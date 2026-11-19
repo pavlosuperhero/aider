@@ -420,9 +420,10 @@ tree-sitter-embedded-template>=0.25.0
     # via
     #   -c requirements/common-constraints.txt
     #   tree-sitter-language-pack
-tree-sitter-language-pack>=0.13.0
+tree-sitter-language-pack==0.13.0
     # via
     #   -c requirements/common-constraints.txt
+    #   -r requirements/requirements.in
     #   grep-ast
 tree-sitter-yaml>=0.7.2
     # via

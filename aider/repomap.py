@@ -281,6 +281,14 @@ class RepoMap:
         if not lang:
             return
 
+        query_scm = get_scm_fname(lang)
+        if not query_scm.exists():
+            return
+
+        code = self.io.read_text(fname)
+        if not code:
+            return
+
         try:
             language = get_language(lang)
             parser = get_parser(lang)
@@ -288,14 +296,8 @@ class RepoMap:
             print(f"Skipping file {fname}: {err}")
             return
 
-        query_scm = get_scm_fname(lang)
-        if not query_scm.exists():
-            return
         query_scm = query_scm.read_text()
 
-        code = self.io.read_text(fname)
-        if not code:
-            return
         tree = parser.parse(bytes(code, "utf-8"))
 
         # Run the tags queries
