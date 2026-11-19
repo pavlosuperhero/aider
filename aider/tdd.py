@@ -163,6 +163,10 @@ class TddState:
 _COUNT_WORDS = {"errors": "error", "warnings": "warning"}
 _SUMMARY = re.compile(r"^(no tests ran|\d+ \w+(?:, \d+ \w+)*) in [\d.]+s(?: \(\d+:\d+:\d+\))?$")
 _FAILED_LINE = re.compile(r"^FAILED (.+?)(?: - (.*))?$")
+_FAILURE_HEADER = re.compile(r"^_+\s+(.+?)\s+_+$")
+_SECTION_SEP = re.compile(r"^={3,}\s+.+\s+={3,}$")
+_E_LINE = re.compile(r"^E\s+(.+)$")
+_CRASH_LINE = re.compile(r"^([^\s:][^:]*):(\d+):\s*([A-Za-z_][\w.]*(?::.*)?)$")
 
 
 def supports_pytest(command):
@@ -189,12 +193,75 @@ def parse_pytest_summary(output):
     return None
 
 
+def _parse_failure_reasons(output):
+    """Extract full failure reasons from pytest FAILURES traceback blocks."""
+    by_file_and_header = {}
+    by_header = {}
+    header = None
+    e_reason = ""
+    crash_file = ""
+    crash_exc = ""
+    in_e_block = False
+
+    def flush():
+        nonlocal header, e_reason, crash_file, crash_exc, in_e_block
+        if header is not None:
+            reason = (e_reason or crash_exc).strip()
+            if reason:
+                by_header[header] = reason
+                if crash_file:
+                    norm_file = os.path.normpath(crash_file).replace(os.sep, "/")
+                    by_file_and_header[(norm_file, header)] = reason
+        header = None
+        e_reason = ""
+        crash_file = ""
+        crash_exc = ""
+        in_e_block = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if _SECTION_SEP.match(line):
+            flush()
+            continue
+        header_match = _FAILURE_HEADER.match(line)
+        if header_match:
+            flush()
+            header = header_match.group(1).strip()
+            continue
+        if header is None:
+            continue
+        e_match = _E_LINE.match(raw_line.lstrip())
+        if e_match:
+            if not in_e_block:
+                e_reason = e_match.group(1).strip()
+                in_e_block = True
+            continue
+        in_e_block = False
+        crash_match = _CRASH_LINE.match(line)
+        if crash_match and not crash_match.group(3).startswith("in "):
+            crash_file = crash_match.group(1).strip()
+            crash_exc = crash_match.group(3).strip()
+
+    flush()
+    return by_file_and_header, by_header
+
+
 def parse_failed_tests(output):
+    by_file_and_header, by_header = _parse_failure_reasons(output)
     failed = []
     for line in output.splitlines():
         match = _FAILED_LINE.match(line.strip())
         if match:
-            failed.append(FailedTest(match.group(1).strip(), (match.group(2) or "").strip()))
+            node_id = match.group(1).strip()
+            reason = (match.group(2) or "").strip()
+            if not reason or reason.endswith("..."):
+                parts = node_id.split("::")
+                file_part = os.path.normpath(parts[0]).replace(os.sep, "/")
+                header = ".".join(parts[1:])
+                tb_reason = by_file_and_header.get((file_part, header)) or by_header.get(header)
+                if tb_reason:
+                    reason = tb_reason
+            failed.append(FailedTest(node_id, reason))
     return tuple(failed)
 
 
@@ -298,6 +365,8 @@ class TddController:
     reminder is never replaced; guidance is carried by the literal continuations.
     """
 
+    call_on_empty = True
+
     def __init__(self, config, *, citation_validator=None):
         self.config = config
         self.citation_validator = citation_validator
@@ -311,6 +380,48 @@ class TddController:
             "edit_hooks": (self.check_edits,),
             "test_result_hooks": (self.observe_test,),
         }
+
+    def phase_guidance(self):
+        """Return explicit phase-specific TDD instructions for post-search or turn continuations."""
+        s = self.state
+        tdd = self.config
+        tests = ", ".join(tdd.test_globs)
+        sources = ", ".join(tdd.source_globs)
+        docs = ", ".join(tdd.doc_globs)
+        if s.phase is Phase.TEST_ONLY_EDIT:
+            forbidden = f"production source files ({sources})" + (
+                f" or documentation files ({docs})" if docs else ""
+            )
+            return (
+                f"TDD phase: test_only_edit. Your next response MUST edit ONLY test files "
+                f"matching {tests} to add a failing test for the requested behavior. Do NOT edit "
+                f"{forbidden} in this turn; any combined or production edit will be rejected "
+                "before execution."
+            )
+        if s.phase in (Phase.RED_OBSERVED, Phase.IMPLEMENT, Phase.REFACTOR_RECHECK):
+            doc_instruction = (
+                f" and required documentation files matching {docs}"
+                if docs and not s.docs_edited
+                else (f" (and optionally documentation files matching {docs})" if docs else "")
+            )
+            return (
+                f"TDD phase: {s.phase.value}. Intended red test failure observed. Now edit "
+                f"production source files matching {sources}{doc_instruction} to make the "
+                f"failing test pass. Do NOT edit test files ({tests}) in this step."
+            )
+        if s.phase is Phase.REPORT:
+            if docs and not s.docs_edited:
+                return (
+                    f"TDD phase: report. All tests passed (green observed), but required "
+                    f"documentation files matching {docs} have not been updated yet. Edit {docs} "
+                    "now (tests will re-run automatically) before submitting the final report."
+                )
+            return (
+                "TDD phase: report. All tests passed (green observed). Do NOT propose further "
+                "edits; provide the final completion report citing the returned Oracle passage "
+                "IDs and source URIs, plus before/after test results."
+            )
+        return ""
 
     # -- plain-data view -----------------------------------------------------------------
 
@@ -441,7 +552,7 @@ class TddController:
         self._serial += 1
         s = self.state
         text = (content or "").strip()
-        if text.startswith("<oracle_search>"):
+        if text.startswith("<oracle_search>") or re.match(r"```\w*\s*<oracle_search>", text):
             return None
         if s.phase is Phase.REPORT:
             # If the response contains code fences (an edit attempt), let check_edits handle it
@@ -489,7 +600,7 @@ class TddController:
         if s.phase is Phase.ABORTED:
             self._report_stop(io)
             return ResponseHookResult()
-        if s.phase is Phase.DONE:
+        if s.phase is Phase.DONE and (proposal.paths or proposal.shell_commands):
             if self._serial == self._done_serial:  # edits came with the report: reopen
                 self._move(Phase.REPORT, "edit in the report response")
             elif not self._new_cycle("edit after the completed workflow", io):
@@ -527,6 +638,12 @@ class TddController:
                 io,
             )
         if not tests and not sources and not docs:
+            if s.phase in (Phase.TEST_ONLY_EDIT, Phase.RED_OBSERVED, Phase.IMPLEMENT):
+                return self._veto(
+                    f"No file edits were found in your response during TDD phase "
+                    f"{s.phase.value}. {self.phase_guidance()}",
+                    io,
+                )
             return None
 
         if tests:
@@ -589,11 +706,17 @@ class TddController:
             if run.kind is RunKind.INTENDED_RED:
                 s.red = run
                 self._move(Phase.RED_OBSERVED, "intended red observed")
+                doc_note = (
+                    f" Also update required documentation ({', '.join(tdd.doc_globs)}) in this "
+                    "step or immediately after green."
+                    if tdd.doc_globs and not s.docs_edited
+                    else ""
+                )
                 return ResponseHookResult(
                     f"Observed red: {_run_line(run)} Failed tests:\n{_failed_listing(run.failed)}\n"
                     "This is the expected red. Next action: make the smallest production change "
-                    f"({', '.join(tdd.source_globs)}) that makes these tests pass. Do not edit "
-                    "test files in this step; the test command runs automatically afterwards."
+                    f"({', '.join(tdd.source_globs)}) that makes these tests pass.{doc_note} Do not "
+                    "edit test files in this step; the test command runs automatically afterwards."
                 )
             if self._charge(io):
                 return None
@@ -624,6 +747,17 @@ class TddController:
                 else "- Documentation: update any in-scope docs if requested; a changed docs file "
                 "alone is not proof its claims are correct.\n"
             )
+            next_action = (
+                f"Next action: required documentation ({', '.join(tdd.doc_globs)}) is still UNMET. "
+                f"Edit {', '.join(tdd.doc_globs)} now to document the change accurately (tests "
+                "will re-run automatically), and only provide the final report after "
+                "documentation is updated."
+                if tdd.doc_globs and not s.docs_edited
+                else "Next action: review the change for refactoring or remaining doc updates. If "
+                "you refactor or update docs, edit production/doc files only (tests re-run "
+                "automatically). Otherwise reply without edits with the final report: what "
+                "changed, which test was red then green, and any skipped tests."
+            )
             return ResponseHookResult(
                 f"Observed green: {_run_line(run)}\n"
                 f"Before (observed red): {before_line}\n"
@@ -635,10 +769,7 @@ class TddController:
                 f"{doc_req}"
                 "- Grounded citations & report: cite only passage IDs and origins actually "
                 "returned in this session (valid passage identity does not prove semantic support).\n"
-                "Next action: review the change for refactoring or remaining doc updates. If you "
-                "refactor or update docs, edit production/doc files only (tests re-run "
-                "automatically). Otherwise reply without edits with the final report: what "
-                "changed, which test was red then green, and any skipped tests."
+                f"{next_action}"
             )
         if self._charge(io):
             return None

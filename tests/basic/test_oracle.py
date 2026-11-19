@@ -391,10 +391,27 @@ def test_disabled_oracle_does_not_enforce_search():
 @pytest.mark.parametrize(
     "envelope",
     [
+        '<oracle_search>{"query":"Read timeout versus total deadline?","source":"httpx-timeouts"}\n```',
+        '```xml\n<oracle_search>{"query":"Read timeout versus total deadline?","source":"httpx-timeouts"}\n```',
+        '```\n<oracle_search>{"query":"Read timeout versus total deadline?","source":"httpx-timeouts"}</oracle_search>\n```',
+    ],
+)
+def test_adaptive_refresh_tolerates_unclosed_tag_or_fence_wrappers_on_pure_search(envelope):
+    session, calls = adaptive_session()
+    session.retrieve("Fix timeout handling", len)
+    context = session.respond(envelope, len)
+    assert context is not None and "httpx-timeouts" in context
+    assert calls[-1] == ("httpx-timeouts", "Read timeout versus total deadline?")
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
         "<oracle_search>not json</oracle_search>",
         '<oracle_search>{"query":"q","source":"unknown"}</oracle_search>',
         '<oracle_search>{"query":"q","source":"httpx-timeouts","command":"run"}</oracle_search>',
         '<oracle_search>{"query":"q","source":"httpx-timeouts"}</oracle_search>\nfile.py\n```edit```',
+        '<oracle_search>{"query":"q","source":"httpx-timeouts"}\nfile.py\n```edit```',
     ],
 )
 def test_invalid_model_requests_never_reach_http_or_edit_dispatch(envelope):

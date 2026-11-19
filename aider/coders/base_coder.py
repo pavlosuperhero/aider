@@ -956,10 +956,19 @@ class Coder:
                 paths.append(path)
         shell_commands = tuple(self.shell_commands[len(shell_commands_before) :])
         if not paths and not shell_commands:
-            return False
+            hooks = [
+                h
+                for h in self.edit_hooks
+                if getattr(h, "call_on_empty", False) is True
+                or getattr(getattr(h, "__self__", None), "call_on_empty", False) is True
+            ]
+            if not hooks:
+                return False
+        else:
+            hooks = self.edit_hooks
 
         proposal = EditProposal(tuple(paths), shell_commands)
-        for hook in self.edit_hooks:
+        for hook in hooks:
             result = hook(proposal, io=self.io)
             if result is None:
                 continue

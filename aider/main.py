@@ -982,9 +982,10 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             tdd_config = TddConfig.from_args(args, args.edit_format or main_model.edit_format)
             provider = oracle_kwargs.get("oracle_provider")
             citation_validator = getattr(provider, "unknown_cited_ids", None)
-            tdd_kwargs = TddController(
-                tdd_config, citation_validator=citation_validator
-            ).hook_kwargs()
+            tdd_controller = TddController(tdd_config, citation_validator=citation_validator)
+            if hasattr(provider, "post_search_guidance"):
+                provider.post_search_guidance = tdd_controller.phase_guidance
+            tdd_kwargs = tdd_controller.hook_kwargs()
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
@@ -1022,6 +1023,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             **oracle_kwargs,
             **tdd_kwargs,
         )
+        if args.tdd:
+            coder.max_reflections = max(coder.max_reflections, 8)
     except UnknownEditFormat as err:
         io.tool_error(str(err))
         io.offer_url(urls.edit_formats, "Open documentation about edit formats?")

@@ -324,6 +324,11 @@ class PassageEvidence:
 
 _METADATA_RE = re.compile(r"<metadata>(.*?)</metadata>", re.DOTALL)
 _PASSAGE_ID_RE = re.compile(r"\b([0-9a-f]{24})\b")
+_SEARCH_PREFIX_RE = re.compile(r"\s*(?:```\w*\s*)?<oracle_search>", re.DOTALL)
+_SEARCH_ENVELOPE_RE = re.compile(
+    r"\s*(?:```\w*\s*)?<oracle_search>\s*(.*?)\s*(?:</oracle_search>)?\s*(?:```\s*)?",
+    re.DOTALL,
+)
 
 
 class OracleSession:
@@ -333,9 +338,10 @@ class OracleSession:
     initial foundation are cached; focused refreshes are bounded per user turn.
     """
 
-    def __init__(self, provider: OracleContextProvider):
+    def __init__(self, provider: OracleContextProvider, *, post_search_guidance=None):
         self.provider = provider
         self.config = provider.config
+        self.post_search_guidance = post_search_guidance
         self.ready = False
         self.search_count = 0
         self._has_focused_evidence = False
@@ -492,11 +498,19 @@ class OracleSession:
             raise OracleBudgetError("Oracle requires a valid model token count.")
         return count <= self.config.max_context_tokens
 
+    def _refresh_suffix(self):
+        suffix = oracle_prompts.REFRESH_SUFFIX
+        if callable(self.post_search_guidance):
+            extra = self.post_search_guidance()
+            if isinstance(extra, str) and extra.strip():
+                suffix = f"{suffix}\n\n{extra.strip()}"
+        return suffix
+
     def respond(self, content, token_count):
         """Resolve a search or enforce the evidence requirement before dispatch."""
         if not self.config.enabled:
             return None
-        is_search = content.lstrip().startswith("<oracle_search>")
+        is_search = _SEARCH_PREFIX_RE.match(content) is not None
         search_required = self.config.require_search and not self._has_focused_evidence
         if not is_search and not search_required:
             unknown = self.unknown_cited_ids(content)
@@ -533,11 +547,14 @@ class OracleSession:
             return oracle_prompts.REQUIRED_SEARCH_REMINDER
         if len(content) > 16000:
             raise OracleResponseError("Oracle search request exceeds the size limit.")
-        match = re.fullmatch(r"\s*<oracle_search>(.*?)</oracle_search>\s*", content, re.DOTALL)
+        match = _SEARCH_ENVELOPE_RE.fullmatch(content)
         if match is None:
             raise OracleResponseError("Oracle search requests must not contain edits or commands.")
+        payload = match.group(1)
+        if "\n```" in payload or ("</oracle_search>" not in content and not payload.endswith("}")):
+            raise OracleResponseError("Oracle search requests must not contain edits or commands.")
         try:
-            request = json.loads(match.group(1))
+            request = json.loads(payload)
         except ValueError:
             raise OracleResponseError("Oracle search request must contain valid JSON.") from None
         if (
@@ -550,13 +567,14 @@ class OracleSession:
                 "Oracle search must select one of the supplied catalog filters."
             )
         self.search_count += 1
+        suffix = self._refresh_suffix()
         context = self._filtered_provider(request["source"], top_k=self.config.top_k).retrieve(
-            request["query"], lambda text: token_count(text + oracle_prompts.REFRESH_SUFFIX)
+            request["query"], lambda text: token_count(text + suffix)
         )
         if context:
             self._has_focused_evidence = True
             self._record_evidence(context)
-            return context + oracle_prompts.REFRESH_SUFFIX
+            return context + suffix
         if search_required:
             return oracle_prompts.NO_FOCUSED_RESULTS + oracle_prompts.SEARCH_PENDING_REMINDER
         return oracle_prompts.NO_FOCUSED_RESULTS + (

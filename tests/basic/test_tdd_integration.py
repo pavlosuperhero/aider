@@ -182,12 +182,20 @@ def test_production_edit_before_red_is_vetoed(project):
 
 def test_passing_new_test_is_not_a_valid_red(project):
     coder, controller = make_coder("whole")
-    sends = fake_send(coder, [whole("tests/test_calc.py", PASSING_TEST), "stop"])
+    sends = fake_send(
+        coder,
+        [
+            whole("tests/test_calc.py", PASSING_TEST),
+            whole("tests/test_calc.py", FAILING_TEST),
+            whole("calc.py", FIXED_CALC),
+            "Report.",
+        ],
+    )
     coder.run("add a test")
     assert "did not fail" in sends[1] and "not valid red" in sends[1]
     assert "exit status 0" in sends[1]
-    assert controller.state.phase is Phase.TEST_ONLY_EDIT
-    assert controller.state.red is None
+    assert controller.state.phase is Phase.DONE
+    assert controller.state.red is not None
     assert controller.state.corrections == 1
 
 
@@ -358,6 +366,7 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     assert len(coder.response_hooks) == len(coder.edit_hooks) == len(coder.test_result_hooks) == 1
     assert isinstance(coder.response_hooks[0], TddController)
     assert coder.response_hooks[0].citation_validator is None
+    assert coder.max_reflections >= 8
 
     coder_with_oracle = main_module.main(
         base + tdd + ["--tdd-doc-glob", "docs/*", "--oracle"], return_coder=True
@@ -366,6 +375,8 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     assert isinstance(tdd_hook, TddController)
     assert tdd_hook.config.doc_globs == ("docs/*",)
     assert tdd_hook.citation_validator == coder_with_oracle.oracle_provider.unknown_cited_ids
+    assert coder_with_oracle.oracle_provider.post_search_guidance == tdd_hook.phase_guidance
+    assert "test_only_edit" in coder_with_oracle.oracle_provider._refresh_suffix()
 
     coder = main_module.main(base + tdd + ["--no-tdd"], return_coder=True)
     assert coder.edit_hooks == ()
@@ -438,3 +449,22 @@ def test_completion_requires_doc_glob_and_rejects_unknown_citations_end_to_end(p
     assert unknown_id in sends[3]
     assert controller.state.phase is Phase.DONE
     assert read(project, "docs/guide.md") == "# Guide\nUpdated add.\n"
+
+
+def test_editless_talk_during_test_phase_is_vetoed_and_recovers(project):
+    coder, controller = make_coder("whole")
+    sends = fake_send(
+        coder,
+        [
+            "I'll implement this task by adding a test first:\n",
+            whole("tests/test_calc.py", FAILING_TEST),
+            whole("calc.py", FIXED_CALC),
+            "Final report: add now sums.",
+        ],
+    )
+    coder.run("make add sum its arguments")
+    assert len(sends) == 4
+    assert "No file edits were found in your response during TDD phase test_only_edit" in sends[1]
+    assert controller.state.corrections == 1
+    assert controller.state.phase is Phase.DONE
+    assert read(project, "calc.py") == FIXED_CALC

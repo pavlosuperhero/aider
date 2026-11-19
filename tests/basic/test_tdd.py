@@ -136,6 +136,76 @@ def test_assertion_style_reasons_are_intended(reason):
     assert classify_pytest_run(obs(output, 1), (TEST_FILE,)).kind is RunKind.INTENDED_RED
 
 
+def test_truncated_80_col_short_summary_recovers_full_assertion_from_traceback():
+    truncated_output = (
+        "F....................................................................... [ 67%]\n"
+        "..................................                                       [100%]\n"
+        "=================================== FAILURES ===================================\n"
+        "_____________________ test_timeout_error_specific_details ______________________\n"
+        "\n"
+        "monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x105b92ad0>\n"
+        "\n"
+        "    def test_timeout_error_specific_details(monkeypatch):\n"
+        '        error_message = "Oracle retrieval timed out."\n'
+        '>       assert "read" in error_message.lower() or "timeout" in error_message.lower()\n'
+        "E       AssertionError: assert ('read' in 'oracle retrieval timed out.' or "
+        "'timeout' in 'oracle retrieval timed out.')\n"
+        "E        +  where 'oracle retrieval timed out.' = <built-in method lower of str>()\n"
+        "\n"
+        "tests/basic/test_oracle.py:177: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/basic/test_oracle.py::test_timeout_error_specific_details - Asse...\n"
+        "1 failed, 105 passed in 6.91s\n"
+    )
+    result = classify_pytest_run(
+        obs(truncated_output, 1), edited_test_paths=("tests/basic/test_oracle.py",)
+    )
+    assert result.kind is RunKind.INTENDED_RED
+    assert len(result.failed) == 1
+    assert (
+        result.failed[0].node_id
+        == "tests/basic/test_oracle.py::test_timeout_error_specific_details"
+    )
+    assert result.failed[0].reason.startswith("AssertionError: assert ('read' in")
+
+
+def test_long_node_id_without_short_summary_reason_recovers_reason_from_traceback():
+    long_name = "test_timeout_error_specific_details_with_a_very_long_descriptive_function_name"
+    assertion_output = (
+        "=================================== FAILURES ===================================\n"
+        f"_ {long_name} _\n"
+        f"    def {long_name}():\n"
+        ">       assert 1 == 2\n"
+        "E       AssertionError: assert 1 == 2\n"
+        f"tests/basic/test_oracle.py:190: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        f"FAILED tests/basic/test_oracle.py::{long_name}\n"
+        "1 failed in 0.12s\n"
+    )
+    result = classify_pytest_run(
+        obs(assertion_output, 1), edited_test_paths=("tests/basic/test_oracle.py",)
+    )
+    assert result.kind is RunKind.INTENDED_RED
+    assert result.failed[0].reason == "AssertionError: assert 1 == 2"
+
+    non_assertion_output = (
+        "=================================== FAILURES ===================================\n"
+        f"_ {long_name} _\n"
+        f"    def {long_name}():\n"
+        ">       return unknown_symbol\n"
+        "E       NameError: name 'unknown_symbol' is not defined\n"
+        f"tests/basic/test_oracle.py:190: NameError\n"
+        "=========================== short test summary info ============================\n"
+        f"FAILED tests/basic/test_oracle.py::{long_name}\n"
+        "1 failed in 0.12s\n"
+    )
+    bad = classify_pytest_run(
+        obs(non_assertion_output, 1), edited_test_paths=("tests/basic/test_oracle.py",)
+    )
+    assert bad.kind is RunKind.UNEXPECTED
+    assert "NameError: name 'unknown_symbol' is not defined" in bad.detail
+
+
 @pytest.mark.parametrize(
     "command, expected",
     [
@@ -228,6 +298,52 @@ def test_shell_commands_are_vetoed_before_red_even_without_edits():
     result = controller.check_edits(EditProposal((TEST_FILE,), ("touch calc.py",)))
     assert isinstance(result, ResponseHookResult)
     assert controller.state.tests_edited == ()
+
+
+def test_empty_edit_proposal_is_vetoed_during_edit_phases_and_accepted_in_report():
+    controller = make_controller()
+    # In TEST_ONLY_EDIT: empty proposal is vetoed and charges 1 correction.
+    result = controller.check_edits(EditProposal(()))
+    assert isinstance(result, ResponseHookResult)
+    assert "NOT applied" in result.continuation
+    assert (
+        "No file edits were found in your response during TDD phase test_only_edit"
+        in result.continuation
+    )
+    assert controller.phase_guidance() in result.continuation
+    assert controller.state.corrections == 1
+    assert controller.state.phase is Phase.TEST_ONLY_EDIT
+
+    # In RED_OBSERVED: empty proposal is also vetoed.
+    red_stage(controller)
+    result = controller.check_edits(EditProposal(()))
+    assert isinstance(result, ResponseHookResult)
+    assert (
+        "No file edits were found in your response during TDD phase red_observed"
+        in result.continuation
+    )
+    assert controller.state.corrections == 2
+    assert controller.state.phase is Phase.RED_OBSERVED
+
+    # Move to IMPLEMENT (failing test after source edit), empty proposal is vetoed.
+    assert controller.check_edits(EditProposal((SRC_FILE,))) is None
+    assert controller.observe_test(obs(RED, 1)) is not None
+    assert controller.state.phase is Phase.IMPLEMENT
+    result = controller.check_edits(EditProposal(()))
+    assert isinstance(result, ResponseHookResult)
+    assert (
+        "No file edits were found in your response during TDD phase implement"
+        in result.continuation
+    )
+    assert controller.state.phase is Phase.IMPLEMENT
+
+    # In REPORT and DONE: empty proposal is accepted (final report has no file edits).
+    assert controller.observe_test(obs(GREEN, 0)) is not None
+    assert controller.state.phase is Phase.REPORT
+    assert controller.check_edits(EditProposal(())) is None
+    assert controller("final report") is None
+    assert controller.state.phase is Phase.DONE
+    assert controller.check_edits(EditProposal(())) is None
 
 
 # ---- red / green flow -----------------------------------------------------------------------
@@ -440,6 +556,31 @@ def test_hook_kwargs_register_all_three_callbacks_on_one_controller():
     assert not hasattr(controller, "prompt_reminder")
 
 
+def test_phase_guidance_tracks_tdd_phase_and_doc_scope():
+    controller = TddController(
+        TddConfig(
+            test_globs=("tests/*",),
+            source_globs=("calc.py",),
+            doc_globs=("docs/*",),
+        )
+    )
+    assert "test_only_edit" in controller.phase_guidance()
+    assert "tests/*" in controller.phase_guidance()
+    assert "calc.py" in controller.phase_guidance()
+    assert "docs/*" in controller.phase_guidance()
+
+    red_stage(controller)
+    assert (
+        "red_observed" in controller.phase_guidance() or "implement" in controller.phase_guidance()
+    )
+    assert "calc.py" in controller.phase_guidance()
+    assert "docs/*" in controller.phase_guidance()
+
+    green_stage(controller)
+    assert "report" in controller.phase_guidance()
+    assert "docs/*" in controller.phase_guidance()
+
+
 # ---- completion and grounding (Milestone 3) -------------------------------------------------
 
 
@@ -464,6 +605,11 @@ def test_green_continuation_shows_before_and_after_commands_outcomes_and_visible
     assert "not satisfied by an old suite passing" in text
     assert "docs/*" in text
     assert "changed docs file alone is not proof its claims are correct" in text
+    assert "Next action: required documentation (docs/*) is still UNMET. Edit docs/* now" in text
+
+    assert controller.check_edits(EditProposal(("docs/guide.md",))) is None
+    after_docs = controller.observe_test(obs(GREEN, 0)).continuation
+    assert "Otherwise reply without edits with the final report" in after_docs
 
 
 def test_early_completion_before_red_or_green_reports_unmet_requirements():
