@@ -36,7 +36,7 @@ class OracleUnavailableError(OracleError):
 
 
 class OracleResponseError(OracleError):
-    """The service returned invalid or excessive data."""
+    """An Oracle service response or model request violated the retrieval protocol."""
 
 
 class OracleBudgetError(OracleError):
@@ -58,6 +58,7 @@ class OracleConfig:
     mode: str = "adaptive"
     foundation_sources: tuple[str, ...] = ("clean-architecture", "think-python")
     max_searches: int = 2
+    require_search: bool = False
 
     def __post_init__(self):
         if type(self.enabled) is not bool or type(self.fail_open) is not bool:
@@ -98,6 +99,12 @@ class OracleConfig:
         object.__setattr__(self, "source_ids", tuple(self.source_ids))
         if self.mode not in ("adaptive", "always"):
             raise ValueError("Oracle mode must be adaptive or always.")
+        if type(self.require_search) is not bool:
+            raise ValueError("Oracle require_search must be a boolean.")
+        if self.require_search and (self.mode != "adaptive" or self.fail_open):
+            raise ValueError(
+                "--oracle-require-search needs adaptive mode with --no-oracle-fail-open."
+            )
         if type(self.max_searches) is not int or not 1 <= self.max_searches <= 3:
             raise ValueError("Oracle allows 1–3 focused refreshes per turn.")
         if (
@@ -126,6 +133,7 @@ class OracleConfig:
             mode=args.oracle_mode,
             foundation_sources=tuple(args.oracle_foundation_source or cls.foundation_sources),
             max_searches=args.oracle_max_searches,
+            require_search=args.oracle_require_search,
         )
 
 
@@ -312,6 +320,8 @@ class OracleSession:
         self.config = provider.config
         self.ready = False
         self.search_count = 0
+        self._has_focused_evidence = False
+        self._reminded_to_search = False
         self.catalog_filters = ()
         self.catalog_truncated = False
         self.context = ""
@@ -324,6 +334,8 @@ class OracleSession:
 
     def retrieve(self, query, token_count):
         self.search_count = 0
+        self._has_focused_evidence = False
+        self._reminded_to_search = False
         if not self.config.enabled:
             return ""
         if self.ready:
@@ -389,20 +401,71 @@ class OracleSession:
             },
         ]
 
+    def system_prompt(self):
+        """Expose only local workflow instructions, never retrieved source text."""
+        if not self.config.enabled or not self.ready:
+            return ""
+        return self._system_policy()
+
+    def _system_policy(self):
+        if self.config.require_search:
+            return oracle_prompts.STRICT_SYSTEM_POLICY
+        return oracle_prompts.SYSTEM_POLICY
+
+    def prompt_reminder(self):
+        """Describe the next permitted action while this turn lacks focused evidence."""
+        if (
+            self.config.enabled
+            and self.ready
+            and self.config.require_search
+            and not self._has_focused_evidence
+        ):
+            return oracle_prompts.SEARCH_PENDING_REMINDER
+        return None
+
     def _fits(self, context, token_count):
-        count = token_count(context + oracle_prompts.REMINDER + oracle_prompts.ACKNOWLEDGEMENT)
+        prompt_text = (
+            context
+            + self._system_policy()
+            + oracle_prompts.REMINDER
+            + oracle_prompts.ACKNOWLEDGEMENT
+        )
+        if self.config.require_search:
+            prompt_text += (
+                oracle_prompts.NO_FOCUSED_RESULTS
+                + oracle_prompts.REQUIRED_SEARCH_REMINDER
+                + 2 * oracle_prompts.SEARCH_PENDING_REMINDER
+            )
+        count = token_count(prompt_text)
         if type(count) is not int or count <= 0:
             raise OracleBudgetError("Oracle requires a valid model token count.")
         return count <= self.config.max_context_tokens
 
     def respond(self, content, token_count):
-        """Resolve one exact model search envelope before Aider parses edits or commands."""
-        if not content.strip().startswith("<oracle_search>"):
+        """Resolve a search or enforce the evidence requirement before dispatch."""
+        if not self.config.enabled:
+            return None
+        is_search = content.lstrip().startswith("<oracle_search>")
+        search_required = self.config.require_search and not self._has_focused_evidence
+        if not is_search and not search_required:
             return None
         if not self.ready:
             raise OracleResponseError("Oracle foundation must be loaded before a focused refresh.")
         if self.search_count >= self.config.max_searches:
+            if search_required:
+                raise OracleResponseError(
+                    "Oracle focused-search limit reached without evidence. Retry with a more "
+                    "focused question or disable --oracle-require-search."
+                )
             raise OracleResponseError("Oracle focused-search limit reached for this turn.")
+        if not is_search:
+            if self._reminded_to_search:
+                raise OracleResponseError(
+                    "The model skipped the required Oracle search twice. Retry with a model "
+                    "that follows the search protocol or disable --oracle-require-search."
+                )
+            self._reminded_to_search = True
+            return oracle_prompts.REQUIRED_SEARCH_REMINDER
         if len(content) > 16000:
             raise OracleResponseError("Oracle search request exceeds the size limit.")
         match = re.fullmatch(r"\s*<oracle_search>(.*?)</oracle_search>\s*", content, re.DOTALL)
@@ -425,14 +488,14 @@ class OracleSession:
         context = self._filtered_provider(request["source"], top_k=self.config.top_k).retrieve(
             request["query"], lambda text: token_count(text + oracle_prompts.REFRESH_SUFFIX)
         )
-        return (
-            (context + oracle_prompts.REFRESH_SUFFIX)
-            if context
-            else (
-                "Oracle returned no matching passages for that focused question. This is an evidence "
-                "gap. Continue from the foundation and project code, or refine the question within "
-                "the remaining search limit; identify any claim you cannot support."
-            )
+        if context:
+            self._has_focused_evidence = True
+            return context + oracle_prompts.REFRESH_SUFFIX
+        if search_required:
+            return oracle_prompts.NO_FOCUSED_RESULTS + oracle_prompts.SEARCH_PENDING_REMINDER
+        return oracle_prompts.NO_FOCUSED_RESULTS + (
+            "This is an evidence gap. Continue from the foundation and project code, or refine "
+            "the question within the remaining search limit; identify any claim you cannot support."
         )
 
 
@@ -458,6 +521,44 @@ def add_oracle_context(message, provider, token_count, io):
     if initializing and provider.ready:
         io.tool_output("Oracle: required foundations loaded; source catalog ready.")
     return message + context
+
+
+class OracleResponseHook:
+    """Translate the session's retrieval policy into Aider's optional hook result."""
+
+    def __init__(self, provider):
+        self.provider = provider
+
+    def prompt_reminder(self):
+        if callable(getattr(type(self.provider), "prompt_reminder", None)):
+            return self.provider.prompt_reminder()
+        return None
+
+    def __call__(self, content, *, token_count, io):
+        from aider.hooks import ResponseHookResult
+
+        try:
+            response = self.provider.respond(content, token_count)
+        except OracleError as error:
+            if not self.provider.config.fail_open:
+                io.tool_error(str(error))
+                return ResponseHookResult()
+            io.tool_warning(str(error))
+            response = (
+                "Oracle refresh failed. Continue using the existing foundation and project code; "
+                "report the evidence gap and do not request more searches this turn."
+            )
+        if response is None:
+            return None
+        io.tool_output("Oracle: continuing after intercepting the model response.")
+        return ResponseHookResult(response)
+
+
+def create_oracle_response_hook(provider):
+    """Register a response hook only for an enabled provider with a session policy."""
+    if provider.config.enabled and callable(getattr(type(provider), "respond", None)):
+        return OracleResponseHook(provider)
+    return None
 
 
 class AiderOracleAdapter:

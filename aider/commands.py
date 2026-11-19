@@ -17,6 +17,7 @@ from aider import models, prompts, voice
 from aider.editor import pipe_editor
 from aider.format_settings import format_settings
 from aider.help import Help, install_help_extra
+from aider.hooks import TestRunObservation
 from aider.io import CommandCompletionException
 from aider.llm import litellm
 from aider.repo import ANY_GIT_ERROR
@@ -1004,6 +1005,15 @@ class Commands:
             return self.cmd_run(args, True)
 
         errors = args()
+        if self.coder.test_result_hooks:
+            self.coder.handle_test_result_hooks(
+                TestRunObservation.create(
+                    getattr(args, "__name__", repr(args)),
+                    self.coder.root,
+                    1 if errors else 0,
+                    errors,
+                )
+            )
         if not errors:
             return
 
@@ -1015,6 +1025,11 @@ class Commands:
         exit_status, combined_output = run_cmd(
             args, verbose=self.verbose, error_print=self.io.tool_error, cwd=self.coder.root
         )
+
+        if add_on_nonzero_exit and self.coder.test_result_hooks:
+            self.coder.handle_test_result_hooks(
+                TestRunObservation.create(args, self.coder.root, exit_status, combined_output)
+            )
 
         if combined_output is None:
             return

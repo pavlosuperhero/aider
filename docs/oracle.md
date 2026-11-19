@@ -13,8 +13,11 @@ The trial's `--message-file` explicitly supplies its task prompt. A Markdown
 file needed for another task can be added explicitly with Aider's `--read`
 option; reference documents remain read-only.
 
-The model receives the policy, bounded cited foundation passages and an allowed
-source catalog, alongside the project context Aider already supplies. It then
+The adaptive action policy is appended to Aider's system instructions after
+successful foundation initialization. Models without a system role receive it
+through Aider's existing instruction fallback. Retrieved passages and the source
+catalog stay in read-only reference messages; they are never promoted into the
+system instructions. The model receives these alongside the project context. It then
 produces either an ordinary coding response or an exact focused-search request.
 The adapter validates the latter before any edit processing.
 
@@ -32,21 +35,102 @@ The default `adaptive` mode combines mandatory foundations with focused refreshe
    reuse it without repeating HTTP queries or duplicating it in chat history.
    It still occupies model context. Start a new Aider session to reload these
    references after changing the Oracle index or available source catalog.
-3. Aider supplies the project code normally. The model reads it and requests
-   additional knowledge only for unresolved architecture, unfamiliar APIs or
-   PEPs, uncertain documented behavior, or a debugging hypothesis needing
-   external evidence. Mechanical edits need no additional search.
+3. Aider supplies the project code normally. Before proposing a change that
+   depends on a dependency, API or standard's documented behavior, the policy
+   instructs the model to refresh the relevant contract even when it feels
+   confident. Applicable evidence already retrieved for the same question and
+   version can be reused. Unresolved architecture decisions and debugging
+   hypotheses may also need external evidence. Mechanical edits supported by
+   the existing context need no additional search.
 4. The model can emit one exact `<oracle_search>` envelope containing a JSON
    `query` and catalog `source`. Aider validates it, queries Oracle and supplies
    the cited evidence in a continuation before applying any edits. This is a
    text protocol handled by the module, not a shell command or a LiteLLM plugin.
    There is no separate planning-model call on every turn.
 
-The policy explicitly explains that books supply general principles rather
-than project files. It asks the model to connect relevant principles to actual
-code and identify a real mismatch instead of dismissing a source merely for
-not mentioning the repository. The model may still choose poor queries or
-misapply a principle; the mechanism does not guarantee better reasoning.
+The policy asks the model to connect relevant principles to actual code and
+report evidence gaps. By default this is a model-followed action protocol; an
+ordinary response can still omit a lookup. For tasks that require fresh evidence,
+enable `--oracle-require-search` as described below. Neither mode verifies that
+the model chose a relevant passage or applied it correctly. Tests and review
+remain necessary.
+
+### Require retrieval before accepting a response
+
+Use `--oracle --oracle-require-search` for an adaptive session where each normal
+user turn must include a successful focused lookup. This uses the existing
+response interception point before Aider parses edits or dispatches commands;
+it is not a Git hook or a user-supplied shell hook.
+
+Required foundations alone do not satisfy this condition. If the model skips
+the lookup, the module holds its response and sends one corrective continuation.
+A second skipped lookup stops the turn without applying those responses.
+Empty results and failed lookups do not satisfy the condition. The existing
+search and reflection limits still bound the interaction. The condition resets
+for the next user turn, while internal reflections share its state.
+
+While a lookup is pending, Oracle replaces the normal edit reminder with the
+search protocol through a generic hook method. This uses Aider's configured
+reminder channel and token checks, so ordinary edit instructions no longer
+follow the search correction. Once focused evidence arrives, the normal edit
+reminder returns. A rejected response explicitly reports that none of its
+proposed edits or commands were applied; the model must use the actual supplied
+file contents rather than assume its previous patch was accepted.
+
+This setting defaults to false and requires adaptive mode with fail-open
+disabled. Use it explicitly for evidence-dependent work; ordinary adaptive mode
+still permits mechanical edits without another lookup. A successful lookup
+proves that reference material was returned, not that it supports the patch.
+The guard does not establish task completion, citation accuracy or test quality.
+
+The placement follows the existing module boundaries: `OracleSession` owns the
+retrieval precondition and `OracleResponseHook` translates its result. Aider only
+dispatches generic response hooks before applying edits. Oracle's *Think Python*, PDF p. 58, passage
+`37125e7b0eee4eebee434db3`, defines interface preconditions and postconditions;
+p. 81, `0284bd306f4d5bc7d5237220`, describes guardian checks. The *Clean
+Architecture* blog, passage `a892b437bacbc32f4e64e3db` (no page/line locator),
+separates use-case orchestration from external-service adapters. *Cosmic Python*,
+"Our First Use Case: Flask API and Service Layer", passage
+`354853d1e08d13856ad0eb16` (no page/line locator), supports testing orchestration
+in memory. These principles inform the implementation; they do not establish
+that retrieval improves a model's reasoning.
+
+### Generic response hooks
+
+The scripting API accepts `Coder.create(..., response_hooks=(callback,))`.
+A callback receives `content` and keyword-only `token_count` and `io` arguments.
+Return `None` to let the next hook run, or
+`aider.hooks.ResponseHookResult(continuation="...")` to hold the response and
+ask the model to continue. `ResponseHookResult()` stops the turn. The first
+interception ends dispatch for that response; ordinary reflection limits bound
+continuations. Held responses do not reach edit or command processing.
+
+A callable hook may optionally implement `prompt_reminder()`. Return literal
+text to replace the edit reminder, or `None` to keep the default. The first
+override wins; literal JSON braces are preserved. This method supplies
+instructions only: it does not retrieve evidence or satisfy a response guard.
+
+Oracle registers its callback only for an enabled adaptive provider. Aider
+without Oracle has no Oracle callback; other callers may register their own
+callbacks independently. Coder clones preserve callbacks and Oracle's shared
+session state. This is an in-process extension point, not arbitrary shell-hook
+execution. The Oracle lookup requirement, error handling and corrective prompt
+all live in the Oracle module.
+
+### Generic test-result hooks
+
+`Coder.create(..., test_result_hooks=(callback,))` lets an optional module observe
+each `/test` or auto-test run, passing or failing. A callback is called as
+`callback(observation, io=io)` with an immutable `aider.hooks.TestRunObservation`
+(`command`, `cwd`, `exit_status`, `output`, `truncated`). `output` keeps the last
+20,000 characters. Return `None` for no change, or
+`ResponseHookResult(continuation="...")` to send that text as the next reflected
+message, even when tests passed. The first continuation wins and counts against
+`max_reflections`; no new loop exists. Hooks never change what `/test` prints or
+returns, and without hooks behavior is unchanged. A continuation is applied by the
+auto-test flow only; `/test` just notifies hooks. If the continuation turn edits
+files, auto-test runs again; core does not retain earlier green results. Hooks do
+not enable tests: `--auto-test`/`--test-cmd` still decide that.
 
 ### Concrete search decisions
 
@@ -77,13 +161,21 @@ user message. Commands and internal editor messages do not trigger a new
 initial retrieval; architect/editor clones still receive pinned foundations.
 
 The routing instructions live in `aider/oracle_prompts.py`, version
-`foundation-refresh-v2`. Oracle's retrieved *Google Prompt Engineering*, PDF pp. 18–19, passages
+`foundation-refresh-v5`. Oracle's retrieved *Google Prompt Engineering*, PDF pp. 18–19, passages
 `8421356d1139085ef9e033ec` and `772852df727c4d9b3f1c5c00`, supports providing
 clear purpose, task context and output instructions; it does not establish
 the correctness of these particular routing decisions. Its p. 65, passage
 `90595d98465d965c36f7c6b0`, supports testing prompt changes and tracking RAG
 settings. Tests verify mandatory initialization, request validation and
 continuation behavior; a real-model trial is needed to assess query quality.
+Its p. 37, passage `a6d4e6e89737d00ed31c0eac`, describes the tool
+action/observation loop; p. 56, passage `bac1d6367a4987d87c1f7f18`, supports
+specific output instructions. These informed v3's pre-edit search example and
+normal-edit continuation. They do not establish that v3 improves this model's
+behavior; compare fresh trials with the recorded v2 checkpoints.
+Version v5 applies the same action/observation principle to explicit rejection
+feedback and a pending-search reminder. Tests verify outgoing message order;
+they do not establish that a live model will follow the corrected instructions.
 
 ## Flags and configuration
 
@@ -129,6 +221,7 @@ No raw-token flag is provided.
 | `oracle-source` | none | Repeatable path substring filters, at most eight |
 | `oracle-fail-open` | false | On failure, cancel the turn; true warns and continues without the failed lookup |
 | `oracle-mode` | adaptive | Required foundations plus focused requests; `always` retrieves each user message |
+| `oracle-require-search` | false | Require successful nonempty focused retrieval each user turn; adaptive mode only, incompatible with fail-open |
 | `oracle-foundation-source` | clean-architecture, think-python | 1–4 required initial source filters, independently configured from refresh filters |
 | `oracle-max-searches` | 2 | 1–3 focused refreshes per user turn, also bounded by Aider's existing reflection limit |
 

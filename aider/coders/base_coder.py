@@ -33,6 +33,7 @@ from aider.analytics import Analytics
 from aider.commands import Commands
 from aider.exceptions import LiteLLMExceptions
 from aider.history import ChatSummary
+from aider.hooks import ResponseHookResult
 from aider.io import ConfirmGroup, InputOutput
 from aider.linter import Linter
 from aider.llm import litellm
@@ -187,6 +188,11 @@ class Coder:
             kwargs = use_kwargs
             from_coder.ok_to_warm_cache = False
 
+        if "response_hooks" in kwargs:
+            kwargs["response_hooks"] = tuple(kwargs["response_hooks"])
+        if "test_result_hooks" in kwargs:
+            kwargs["test_result_hooks"] = tuple(kwargs["test_result_hooks"])
+
         for coder in coders.__all__:
             if hasattr(coder, "edit_format") and coder.edit_format == edit_format:
                 res = coder(main_model, io, **kwargs)
@@ -339,8 +345,19 @@ class Coder:
         auto_copy_context=False,
         auto_accept_architect=True,
         oracle_provider=None,
+        response_hooks=(),
+        test_result_hooks=(),
     ):
+        self.test_result_hooks = tuple(test_result_hooks)
+        self.test_hook_continuation = None
         self.oracle_provider = oracle_provider
+        self.response_hooks = tuple(response_hooks)
+        if oracle_provider is not None:
+            from aider.oracle import create_oracle_response_hook
+
+            hook = create_oracle_response_hook(oracle_provider)
+            if hook is not None:
+                self.response_hooks += (hook,)
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
 
@@ -865,12 +882,12 @@ class Coder:
         if self.oracle_provider is not None and not user_message:
             return
         while True:
-            self.oracle_response_pending = False
+            self.response_hook_pending = False
             yield from self.send_message(user_message)
-            if not self.oracle_response_pending:
+            if not self.response_hook_pending:
                 break
             if self.num_reflections >= self.max_reflections:
-                self.io.tool_warning("Oracle refresh reached the reflection limit, stopping.")
+                self.io.tool_warning("Response hook reached the reflection limit, stopping.")
                 return
             self.num_reflections += 1
             user_message = self.reflected_message
@@ -888,7 +905,7 @@ class Coder:
         return message
 
     def init_before_message(self):
-        self.oracle_response_pending = False
+        self.response_hook_pending = False
         self.aider_edited_files = set()
         self.reflected_message = None
         self.num_reflections = 0
@@ -900,30 +917,32 @@ class Coder:
         if self.repo:
             self.commit_before_message.append(self.repo.get_head_commit_sha())
 
-    def handle_oracle_response(self, content):
-        provider = self.oracle_provider
-        if provider is None or not callable(getattr(type(provider), "respond", None)):
-            return False
-        from aider.oracle import OracleError
+    def handle_response_hooks(self, content):
+        for hook in self.response_hooks:
+            result = hook(content, token_count=self.main_model.token_count, io=self.io)
+            if result is None:
+                continue
+            if not isinstance(result, ResponseHookResult):
+                raise TypeError("Response hooks must return None or ResponseHookResult.")
+            self.partial_response_content = None
+            self.partial_response_function_call = None
+            self.reflected_message = result.continuation
+            self.response_hook_pending = result.continuation is not None
+            return True
+        return False
 
-        try:
-            response = provider.respond(content, self.main_model.token_count)
-        except OracleError as error:
-            if not provider.config.fail_open:
-                self.io.tool_error(str(error))
-                self.partial_response_content = None
-                return True
-            self.io.tool_warning(str(error))
-            response = (
-                "Oracle refresh failed. Continue using the existing foundation and project code; "
-                "report the evidence gap and do not request more searches this turn."
-            )
-        if response is None:
-            return False
-        self.io.tool_output("Oracle: focused refresh handled.")
-        self.reflected_message = response
-        self.oracle_response_pending = True
-        return True
+    def handle_test_result_hooks(self, observation):
+        """Notify hooks of a test run; the first continuation is kept for the caller."""
+        self.test_hook_continuation = None
+        for hook in self.test_result_hooks:
+            result = hook(observation, io=self.io)
+            if result is None:
+                continue
+            if not isinstance(result, ResponseHookResult):
+                raise TypeError("Test result hooks must return None or ResponseHookResult.")
+            if result.continuation is not None:
+                self.test_hook_continuation = result.continuation
+                break
 
     def run(self, with_message=None, preproc=True):
         try:
@@ -1286,6 +1305,22 @@ class Coder:
         if self.main_model.system_prompt_prefix:
             main_sys = self.main_model.system_prompt_prefix + "\n" + main_sys
 
+        system_reminder = (
+            self.fmt_system_prompt(self.gpt_prompts.system_reminder)
+            if self.gpt_prompts.system_reminder
+            else ""
+        )
+        for hook in self.response_hooks:
+            if not callable(getattr(type(hook), "prompt_reminder", None)):
+                continue
+            override = hook.prompt_reminder()
+            if override is None:
+                continue
+            if not isinstance(override, str) or not override.strip():
+                raise TypeError("Hook prompt reminders must be nonempty text or None.")
+            system_reminder = override
+            break
+
         example_messages = []
         if self.main_model.examples_as_sys_msg:
             if self.gpt_prompts.example_messages:
@@ -1315,8 +1350,14 @@ class Coder:
                     dict(role="assistant", content="Ok."),
                 ]
 
-        if self.gpt_prompts.system_reminder:
-            main_sys += "\n" + self.fmt_system_prompt(self.gpt_prompts.system_reminder)
+        if system_reminder:
+            main_sys += "\n" + system_reminder
+
+        provider = self.oracle_provider
+        if provider is not None and callable(getattr(type(provider), "system_prompt", None)):
+            oracle_system = provider.system_prompt()
+            if oracle_system:
+                main_sys += "\n\n" + oracle_system
 
         chunks = ChatChunks()
 
@@ -1342,12 +1383,8 @@ class Coder:
             chunks.readonly_files = provider.context_messages() + chunks.readonly_files
         chunks.chat_files = self.get_chat_files_messages()
 
-        if self.gpt_prompts.system_reminder:
-            reminder_message = [
-                dict(
-                    role="system", content=self.fmt_system_prompt(self.gpt_prompts.system_reminder)
-                ),
-            ]
+        if system_reminder:
+            reminder_message = [dict(role="system", content=system_reminder)]
         else:
             reminder_message = []
 
@@ -1372,20 +1409,12 @@ class Coder:
 
         max_input_tokens = self.main_model.info.get("max_input_tokens") or 0
         # Add the reminder prompt if we still have room to include it.
-        if (
-            not max_input_tokens
-            or total_tokens < max_input_tokens
-            and self.gpt_prompts.system_reminder
-        ):
+        if not max_input_tokens or total_tokens < max_input_tokens and system_reminder:
             if self.main_model.reminder == "sys":
                 chunks.reminder = reminder_message
             elif self.main_model.reminder == "user" and final and final["role"] == "user":
                 # stuff it into the user message
-                new_content = (
-                    final["content"]
-                    + "\n\n"
-                    + self.fmt_system_prompt(self.gpt_prompts.system_reminder)
-                )
+                new_content = final["content"] + "\n\n" + system_reminder
                 chunks.cur[-1] = dict(role=final["role"], content=new_content)
 
         return chunks
@@ -1619,7 +1648,7 @@ class Coder:
 
         if not interrupted:
             # Resolve model requests before file mentions, edit parsing or shell suggestions.
-            if self.handle_oracle_response(content):
+            if self.handle_response_hooks(content):
                 return
             add_rel_files_message = self.check_for_file_mentions(content)
             if add_rel_files_message:
@@ -1677,8 +1706,13 @@ class Coder:
             ]
 
         if edited and self.auto_test:
+            self.test_hook_continuation = None
             test_errors = self.commands.cmd_test(self.test_cmd)
             self.test_outcome = not test_errors
+            continuation, self.test_hook_continuation = self.test_hook_continuation, None
+            if continuation:
+                self.reflected_message = continuation
+                return
             if test_errors:
                 ok = self.io.confirm_ask("Attempt to fix test errors?")
                 if ok:

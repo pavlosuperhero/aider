@@ -99,6 +99,12 @@ def get_parser(default_config_files, git_root):
         help="Maximum model-requested refreshes per turn (1–3; shares the reflection limit)",
     )
     group.add_argument(
+        "--oracle-require-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require a nonempty focused search result each turn with adaptive Oracle",
+    )
+    group.add_argument(
         "--oracle-source",
         action="append",
         default=[],

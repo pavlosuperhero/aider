@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from aider import oracle_prompts
 from aider.oracle import (
     CONTEXT_PREFIX,
     AiderOracleAdapter,
@@ -260,7 +261,7 @@ def test_adapter_delegates_run_without_replacing_aider_semantics():
     coder.run.assert_called_once_with("task")
 
 
-def adaptive_session(**settings):
+def adaptive_session(*, empty_query=None, **settings):
     calls = []
     sources = ("clean-architecture", "think-python", "httpx-timeouts")
 
@@ -275,6 +276,8 @@ def adaptive_session(**settings):
             )
         payload = json.loads(request.content)
         calls.append((payload["source"], payload["query"]))
+        if payload["query"] == empty_query:
+            return httpx.Response(200, json={"results": []})
         return httpx.Response(
             200,
             json={
@@ -298,15 +301,35 @@ def test_adaptive_foundations_are_required_and_cached_without_querying_user_task
     session.retrieve("Rename local variable", len)
     context = session.context_messages()[0]["content"]
     assert isinstance(session, OracleSession)
-    assert "required starting context" in context
-    assert "not project files" in context
+    assert context.startswith("\n\n" + oracle_prompts.POLICY)
     assert [source for source, query in calls] == ["catalog", "clean-architecture", "think-python"]
     assert all(query != "Rename local variable" for source, query in calls)
     assert "httpx-timeouts" in context
     before = list(calls)
-    assert "foundation remains" in session.retrieve("Next task", len)
+    assert session.retrieve("Next task", len) == oracle_prompts.REMINDER
     assert calls == before
     assert session.respond("This mechanical edit needs no extra lookup.", len) is None
+
+
+@pytest.mark.parametrize("require_search", [False, True])
+def test_trusted_oracle_protocol_counts_towards_context_budget(require_search):
+    session, _ = adaptive_session(require_search=require_search)
+    assert session.system_prompt() == ""
+    session.retrieve("Task", len)
+    policy = oracle_prompts.STRICT_SYSTEM_POLICY if require_search else oracle_prompts.SYSTEM_POLICY
+    assert session.system_prompt() == policy
+    prompt = session.context + policy + oracle_prompts.REMINDER + oracle_prompts.ACKNOWLEDGEMENT
+    if require_search:
+        prompt += oracle_prompts.NO_FOCUSED_RESULTS + oracle_prompts.REQUIRED_SEARCH_REMINDER
+        prompt += 2 * oracle_prompts.SEARCH_PENDING_REMINDER
+    used = len(prompt)
+    session.config = replace(session.config, max_context_tokens=used)
+    assert session.retrieve("Task", len)
+    session.config = replace(session.config, max_context_tokens=used - 1)
+    with pytest.raises(OracleBudgetError):
+        session.retrieve("Task", len)
+    session.config = replace(session.config, enabled=False)
+    assert session.system_prompt() == ""
 
 
 def test_adaptive_refresh_uses_focused_question_and_enforces_turn_limit():
@@ -325,6 +348,46 @@ def test_adaptive_refresh_uses_focused_question_and_enforces_turn_limit():
     assert session.respond(request, len)
 
 
+def test_required_search_accepts_only_focused_evidence_from_current_turn():
+    session, calls = adaptive_session(require_search=True, empty_query="missing evidence")
+    session.retrieve("First task", len)
+    ordinary_reply = "The local variable was already named correctly."
+    assert session.respond(ordinary_reply, len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
+    assert len(calls) == 3  # The catalog and foundations are not focused evidence.
+    empty_search = (
+        '<oracle_search>{"query":"missing evidence","source":"httpx-timeouts"}</oracle_search>'
+    )
+    assert session.respond(empty_search, len).startswith(oracle_prompts.NO_FOCUSED_RESULTS)
+    with pytest.raises(OracleResponseError, match="skipped the required Oracle search twice"):
+        session.respond(ordinary_reply, len)
+
+    session.retrieve("Second task", len)
+    assert session.respond(ordinary_reply, len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
+    valid_search = '<oracle_search>{"query":"q","source":"httpx-timeouts"}</oracle_search>'
+    assert "<passage>" in session.respond(valid_search, len)
+    assert session.respond(ordinary_reply, len) is None
+
+    session.retrieve("Third task", len)
+    assert session.respond(ordinary_reply, len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
+
+
+def test_required_search_ignores_overbudget_evidence_and_respects_search_limit():
+    session, _ = adaptive_session(require_search=True, max_searches=1)
+    session.retrieve("Task", len)
+    request = '<oracle_search>{"query":"q","source":"httpx-timeouts"}</oracle_search>'
+    with pytest.raises(OracleBudgetError, match="No complete"):
+        session.respond(request, lambda _: session.config.max_context_tokens + 1)
+    with pytest.raises(OracleResponseError, match="limit reached without evidence"):
+        session.respond("Here is my answer.", len)
+
+
+def test_disabled_oracle_does_not_enforce_search():
+    p = OracleContextProvider(OracleConfig(require_search=True))
+    session = OracleSession(p)
+    assert session.retrieve("Task", len) == ""
+    assert session.respond("Here is my answer.", len) is None
+
+
 @pytest.mark.parametrize(
     "envelope",
     [
@@ -335,12 +398,13 @@ def test_adaptive_refresh_uses_focused_question_and_enforces_turn_limit():
     ],
 )
 def test_invalid_model_requests_never_reach_http_or_edit_dispatch(envelope):
-    session, calls = adaptive_session()
+    session, calls = adaptive_session(require_search=True)
     session.retrieve("Task", len)
     before = list(calls)
     with pytest.raises(OracleResponseError):
         session.respond(envelope, len)
     assert calls == before
+    assert session.respond("Here is my answer.", len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
 
 
 def test_adaptive_source_limits_apply_to_refresh_catalog_not_required_foundations():
@@ -375,6 +439,9 @@ def test_always_mode_keeps_direct_retrieval_available():
         {"max_searches": 0},
         {"max_searches": 4},
         {"mode": "unbounded"},
+        {"require_search": "true"},
+        {"require_search": True, "mode": "always"},
+        {"require_search": True, "fail_open": True},
     ],
 )
 def test_invalid_adaptive_settings(settings):
