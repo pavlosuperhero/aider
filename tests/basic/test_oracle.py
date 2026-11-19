@@ -447,3 +447,62 @@ def test_always_mode_keeps_direct_retrieval_available():
 def test_invalid_adaptive_settings(settings):
     with pytest.raises(ValueError):
         OracleConfig(**settings)
+
+
+def test_session_tracks_returned_passage_evidence_and_validates_cited_ids():
+    ca_id = "a892b437bacbc32f4e64e3db"
+    tp_id = "37125e7b0eee4eebee434db3"
+    hx_id = "4d4d418905639aeba3a03277"
+    unknown_id = "deadbeefdeadbeefdeadbeef"
+    ids = {
+        "clean-architecture": ca_id,
+        "think-python": tp_id,
+        "httpx-timeouts": hx_id,
+    }
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"sources": [{"source": f"/data/{s}/doc.html"} for s in ids]},
+            )
+        payload = json.loads(request.content)
+        src = payload["source"]
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    passage(
+                        id=ids[src],
+                        source=f"/data/{src}/doc.html",
+                        source_uri=f"https://example.org/{src}",
+                        title=f"Title for {src}",
+                    )
+                ]
+            },
+        )
+
+    session = create_oracle_provider(
+        OracleConfig(enabled=True, max_context_tokens=12000),
+        transport=httpx.MockTransport(handle),
+    )
+    session.retrieve("Initial task", len)
+    assert set(session.evidence) == {ca_id, tp_id}
+    assert session.evidence[ca_id].source_uri == "https://example.org/clean-architecture"
+    assert session.evidence[ca_id].title == "Title for clean-architecture"
+
+    search = '<oracle_search>{"query":"timeout?","source":"httpx-timeouts"}</oracle_search>'
+    session.respond(search, len)
+    assert set(session.evidence) == {ca_id, tp_id, hx_id}
+    assert session.unknown_cited_ids(f"We used {hx_id} and foundation {ca_id}.") == ()
+    assert session.unknown_cited_ids(f"Cited {hx_id} and fabricated {unknown_id}.") == (unknown_id,)
+
+    rejected = session.respond(f"Report citing {hx_id} and {unknown_id}.", len)
+    assert rejected is not None
+    assert unknown_id in rejected
+    assert "never returned" in rejected
+    assert "valid passage identity does not prove semantic support" in rejected
+    assert (
+        session.respond(f"Report citing {hx_id} from https://example.org/httpx-timeouts.", len)
+        is None
+    )

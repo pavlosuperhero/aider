@@ -33,7 +33,7 @@ from aider.analytics import Analytics
 from aider.commands import Commands
 from aider.exceptions import LiteLLMExceptions
 from aider.history import ChatSummary
-from aider.hooks import ResponseHookResult
+from aider.hooks import EditProposal, ResponseHookResult
 from aider.io import ConfirmGroup, InputOutput
 from aider.linter import Linter
 from aider.llm import litellm
@@ -192,6 +192,8 @@ class Coder:
             kwargs["response_hooks"] = tuple(kwargs["response_hooks"])
         if "test_result_hooks" in kwargs:
             kwargs["test_result_hooks"] = tuple(kwargs["test_result_hooks"])
+        if "edit_hooks" in kwargs:
+            kwargs["edit_hooks"] = tuple(kwargs["edit_hooks"])
 
         for coder in coders.__all__:
             if hasattr(coder, "edit_format") and coder.edit_format == edit_format:
@@ -347,8 +349,10 @@ class Coder:
         oracle_provider=None,
         response_hooks=(),
         test_result_hooks=(),
+        edit_hooks=(),
     ):
         self.test_result_hooks = tuple(test_result_hooks)
+        self.edit_hooks = tuple(edit_hooks)
         self.test_hook_continuation = None
         self.oracle_provider = oracle_provider
         self.response_hooks = tuple(response_hooks)
@@ -928,6 +932,42 @@ class Coder:
             self.partial_response_function_call = None
             self.reflected_message = result.continuation
             self.response_hook_pending = result.continuation is not None
+            return True
+        return False
+
+    def handle_edit_hooks(self, edits, shell_commands_before):
+        """Offer the parsed edits to hooks before anything is written or committed.
+
+        Returns True if a hook vetoed them. Vetoed edits and the shell commands from the
+        same response are dropped and nothing has been written, committed or run.
+        """
+        paths = []
+        for edit in edits:
+            if edit[0] is None:
+                continue
+            path = os.path.normpath(str(edit[0]))
+            if os.path.isabs(path):
+                try:
+                    path = os.path.relpath(path, self.root)
+                except ValueError:
+                    pass
+            path = path.replace(os.sep, "/")
+            if path not in paths:
+                paths.append(path)
+        shell_commands = tuple(self.shell_commands[len(shell_commands_before) :])
+        if not paths and not shell_commands:
+            return False
+
+        proposal = EditProposal(tuple(paths), shell_commands)
+        for hook in self.edit_hooks:
+            result = hook(proposal, io=self.io)
+            if result is None:
+                continue
+            if not isinstance(result, ResponseHookResult):
+                raise TypeError("Edit hooks must return None or ResponseHookResult.")
+            self.shell_commands = list(shell_commands_before)
+            self.reflected_message = result.continuation
+            self.io.tool_warning("Edits rejected by a workflow hook; nothing was applied.")
             return True
         return False
 
@@ -2392,9 +2432,12 @@ class Coder:
 
     def apply_updates(self):
         edited = set()
+        shell_commands_before = list(self.shell_commands)
         try:
             edits = self.get_edits()
             edits = self.apply_edits_dry_run(edits)
+            if self.edit_hooks and self.handle_edit_hooks(edits, shell_commands_before):
+                return edited
             edits = self.prepare_to_edit(edits)
             edited = set(edit[0] for edit in edits)
 

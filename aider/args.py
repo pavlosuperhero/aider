@@ -117,6 +117,35 @@ def get_parser(default_config_files, git_root):
         help="Continue without evidence if Oracle retrieval fails (default: cancel the turn)",
     )
 
+    group = parser.add_argument_group("TDD workflow (opt-in)")
+    group.add_argument(
+        "--tdd",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enforce a test-first workflow (pytest only; needs --auto-test, --test-cmd and"
+            " the two --tdd-*-glob options)"
+        ),
+    )
+    group.add_argument(
+        "--tdd-test-glob",
+        action="append",
+        default=None,
+        help="Glob for test files, relative to the project root (repeatable)",
+    )
+    group.add_argument(
+        "--tdd-source-glob",
+        action="append",
+        default=None,
+        help="Glob for production files, relative to the project root (repeatable)",
+    )
+    group.add_argument(
+        "--tdd-doc-glob",
+        action="append",
+        default=None,
+        help="Optional glob for documentation files, relative to the project root (repeatable)",
+    )
+
     group = parser.add_argument_group("API Keys and settings")
     group.add_argument(
         "--openai-api-key",

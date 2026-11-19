@@ -132,6 +132,67 @@ auto-test flow only; `/test` just notifies hooks. If the continuation turn edits
 files, auto-test runs again; core does not retain earlier green results. Hooks do
 not enable tests: `--auto-test`/`--test-cmd` still decide that.
 
+### Generic edit hooks and TDD workflow
+
+`Coder.create(..., edit_hooks=(callback,))` runs before file creation, dirty commits,
+file writes, auto-commits or suggested shell commands. Each callback receives an
+immutable `aider.hooks.EditProposal(paths, shell_commands)` with normalized,
+project-relative paths and returns `None` or `ResponseHookResult`. A veto drops
+the response's edits and shell commands and reports that nothing was applied.
+
+`aider/tdd.py` composes `response_hooks`, `edit_hooks` and `test_result_hooks`
+into an optional test-first controller (`TddController`), enabled with `--tdd`
+(or `tdd: true` in `.aider.conf.yml`; override with `--no-tdd` or
+`AIDER_TDD=false`). Required options:
+
+- `--tdd` / `--no-tdd`: enable or disable the TDD workflow (default: false).
+- `--tdd-test-glob`: repeatable fnmatch glob for test files (required with `--tdd`).
+- `--tdd-source-glob`: repeatable fnmatch glob for production files (required with `--tdd`).
+- `--tdd-doc-glob`: optional repeatable fnmatch glob for documentation files in scope.
+- `--auto-test` and a pytest `--test-cmd` (not compatible with `--edit-format architect`).
+
+Observable phases (`TddState.phase`):
+
+1. `test_only_edit`: only paths matching `--tdd-test-glob` may be edited. Production/doc
+   edits, combined test+production patches, out-of-scope or ambiguous paths, and shell
+   commands before red are vetoed before any write.
+2. `red_observed`: reached only after an intended pytest red run (exit status 1, no
+   collection/setup errors, assertion-like `FAILED <node_id> - <reason>` lines in edited
+   test files). Passing runs, exit codes `>=2`, or failures outside edited tests are
+   rejected as invalid red.
+3. `implement`: production/doc edits after `red_observed` trigger the configured pytest
+   command. Further test edits invalidate red/green and start a new cycle.
+4. `report` and `refactor_recheck`: a passing pytest run after `implement` moves to
+   `report`. The continuation supplies the actual before (red) and after (green)
+   commands, exit statuses, failed test node IDs and reasons, and a visible completion
+   checklist reminder that regression coverage, documentation and the final report are
+   not satisfied by an old suite passing. Further production/doc edits move to
+   `refactor_recheck` and invalidate green until pytest passes again.
+5. `done` / `aborted`: a non-edit report response with all requirements met moves to
+   `done`. Early completion claims, stale green results, untouched `--tdd-doc-glob`
+   files, or fabricated passage citations report explicit unmet requirements. Exhausted
+   cycle, correction or refactor budgets (or a non-pytest runner) move to `aborted` with
+   an explicit `StopReason`.
+
+### Citation grounding and completion limits
+
+`OracleSession` records each returned foundation and focused passage in
+`session.evidence` (`PassageEvidence` with `id`, `title`, `source`, `source_uri`,
+`citation` and locators). `OracleSession.unknown_cited_ids(text)` detects 24-hex
+passage IDs cited in a model response that were never returned in the current
+session. Both `OracleSession.respond` and `TddController` (via an injected
+`citation_validator` callback composed in `aider/main.py`) reject responses that
+cite unknown or fabricated passage IDs.
+
+What is **not** enforced by code:
+
+- Valid passage identity proves that a passage ID was returned in the session; it
+  does **not** prove semantic support for the model's claim.
+- Touching a file matching `--tdd-doc-glob` proves the file was edited; it does
+  **not** prove that the documentation claims are accurate.
+- Observing a red-then-green assertion proves test execution sequence; it does
+  **not** guarantee that the test is meaningful or the implementation is bug-free.
+
 ### Concrete search decisions
 
 These examples express the intended policy, not guaranteed model decisions:

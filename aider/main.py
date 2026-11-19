@@ -975,6 +975,16 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             from aider.oracle import OracleConfig, create_oracle_provider
 
             oracle_kwargs["oracle_provider"] = create_oracle_provider(OracleConfig.from_args(args))
+        tdd_kwargs = {}
+        if args.tdd:
+            from aider.tdd import TddConfig, TddController
+
+            tdd_config = TddConfig.from_args(args, args.edit_format or main_model.edit_format)
+            provider = oracle_kwargs.get("oracle_provider")
+            citation_validator = getattr(provider, "unknown_cited_ids", None)
+            tdd_kwargs = TddController(
+                tdd_config, citation_validator=citation_validator
+            ).hook_kwargs()
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
@@ -1010,6 +1020,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             auto_accept_architect=args.auto_accept_architect,
             add_gitignore_files=args.add_gitignore_files,
             **oracle_kwargs,
+            **tdd_kwargs,
         )
     except UnknownEditFormat as err:
         io.tool_error(str(err))

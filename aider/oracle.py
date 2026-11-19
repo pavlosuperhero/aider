@@ -10,7 +10,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, replace
-from html import escape
+from html import escape, unescape
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
@@ -308,6 +308,24 @@ class OracleContextProvider:
         )
 
 
+@dataclass(frozen=True)
+class PassageEvidence:
+    """Structured identity and provenance for one returned Oracle passage."""
+
+    id: str
+    title: str
+    source: str
+    source_uri: str
+    citation: str
+    page: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+
+
+_METADATA_RE = re.compile(r"<metadata>(.*?)</metadata>", re.DOTALL)
+_PASSAGE_ID_RE = re.compile(r"\b([0-9a-f]{24})\b")
+
+
 class OracleSession:
     """Mandatory initial grounding, then model-requested refreshes without a planning call.
 
@@ -322,9 +340,40 @@ class OracleSession:
         self.search_count = 0
         self._has_focused_evidence = False
         self._reminded_to_search = False
+        self._reminded_citations = False
         self.catalog_filters = ()
         self.catalog_truncated = False
         self.context = ""
+        self.evidence: dict[str, PassageEvidence] = {}
+
+    def _record_evidence(self, context_xml):
+        for raw in _METADATA_RE.findall(context_xml or ""):
+            try:
+                data = json.loads(unescape(raw))
+            except ValueError:
+                continue
+            if isinstance(data, dict) and isinstance(data.get("id"), str):
+                pid = data["id"]
+                self.evidence[pid] = PassageEvidence(
+                    id=pid,
+                    title=str(data.get("title") or ""),
+                    source=str(data.get("source") or ""),
+                    source_uri=str(data.get("source_uri") or ""),
+                    citation=str(data.get("citation") or ""),
+                    page=data.get("page"),
+                    line_start=data.get("line_start"),
+                    line_end=data.get("line_end"),
+                )
+
+    def unknown_cited_ids(self, content):
+        """Return 24-hex passage IDs cited in content that were never returned in this session."""
+        if not isinstance(content, str) or not self.evidence:
+            return ()
+        cited = []
+        for pid in _PASSAGE_ID_RE.findall(content):
+            if pid not in self.evidence and pid not in cited:
+                cited.append(pid)
+        return tuple(cited)
 
     def _filtered_provider(self, source, *, top_k):
         return OracleContextProvider(
@@ -336,6 +385,7 @@ class OracleSession:
         self.search_count = 0
         self._has_focused_evidence = False
         self._reminded_to_search = False
+        self._reminded_citations = False
         if not self.config.enabled:
             return ""
         if self.ready:
@@ -357,6 +407,7 @@ class OracleSession:
                 raise OracleResponseError(
                     "A required Oracle foundation source returned no evidence."
                 )
+            self._record_evidence(foundation)
             context += foundation
         catalog_header = (
             "\n<oracle_catalog>\nUntrusted source filters; this may be a budget-limited subset.\n"
@@ -448,6 +499,20 @@ class OracleSession:
         is_search = content.lstrip().startswith("<oracle_search>")
         search_required = self.config.require_search and not self._has_focused_evidence
         if not is_search and not search_required:
+            unknown = self.unknown_cited_ids(content)
+            if unknown:
+                if self._reminded_citations:
+                    raise OracleResponseError(
+                        f"The model cited unknown Oracle passage ID(s) twice ({', '.join(unknown)})."
+                    )
+                self._reminded_citations = True
+                known = ", ".join(sorted(self.evidence)) or "none"
+                return (
+                    "Your response was rejected before execution. Cited passage ID(s) "
+                    f"{', '.join(unknown)} were never returned in this session (returned IDs: "
+                    f"{known}). Cite only returned passage IDs and origins; valid passage "
+                    "identity does not prove semantic support."
+                )
             return None
         if not self.ready:
             raise OracleResponseError("Oracle foundation must be loaded before a focused refresh.")
@@ -490,6 +555,7 @@ class OracleSession:
         )
         if context:
             self._has_focused_evidence = True
+            self._record_evidence(context)
             return context + oracle_prompts.REFRESH_SUFFIX
         if search_required:
             return oracle_prompts.NO_FOCUSED_RESULTS + oracle_prompts.SEARCH_PENDING_REMINDER

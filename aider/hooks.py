@@ -61,3 +61,16 @@ class TestRunObservation:
         if truncated:
             output = output[-limit:]
         return cls(str(command), str(cwd), int(exit_status), output, truncated)
+
+
+@dataclass(frozen=True)
+class EditProposal:
+    """Plain data describing the edits parsed from one model response.
+
+    paths are project-relative, normalized and unique, in first-seen order. They
+    are not checked for existence and may lie outside the project (a leading ..).
+    shell_commands are the shell blocks the response suggested, if any.
+    """
+
+    paths: tuple[str, ...] = ()
+    shell_commands: tuple[str, ...] = ()
