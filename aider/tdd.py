@@ -1,8 +1,8 @@
 """Optional TDD workflow controller, driven by generic hooks from aider/hooks.py.
 
-This module is policy only. It sees plain data (EditProposal, TestRunObservation,
-response text) and returns ResponseHookResult objects. It imports nothing from the
-Coder, Commands or IO layers; the core never imports it except where main composes it.
+The controller consumes plain data (EditProposal, TestRunObservation, response text)
+and returns ResponseHookResult objects. It imports nothing from the Coder, Commands
+or IO layers. CLI configuration and custom-script loading are composed by main.
 
 Phases (TddState.phase)::
 
@@ -20,8 +20,10 @@ Phases (TddState.phase)::
 
 Contract and limits: the only supported runner is pytest. Red/green evidence comes from
 the exit status and output of the one configured test command (focused and broader
-checks are not distinguished). Edits are judged by explicit path globs, never by file
-name guessing. Nothing here judges whether a test is meaningful or the code correct.
+checks are not distinguished). Green requires a PASSED result for every recorded red
+node; configure pytest with -rA (CLI setup does this automatically). Edits are judged
+by explicit path globs, never by file name guessing. Nothing here judges whether a
+test is meaningful or the code correct.
 """
 
 import fnmatch
@@ -29,9 +31,11 @@ import importlib.util
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from uuid import uuid4
 
 from aider.hooks import EditProposal, ResponseHookResult, TestRunObservation
 
@@ -87,8 +91,8 @@ def _normalize_relpath(path, root=None):
     return os.path.normpath(rel).replace(os.sep, "/")
 
 
-def _default_test_cmd():
-    if os.path.isfile(os.path.join(".venv", "bin", "python")):
+def _default_test_cmd(root):
+    if (Path(root) / ".venv" / "bin" / "python").is_file():
         return ".venv/bin/python -m pytest -q"
     return DEFAULT_TEST_CMD
 
@@ -125,8 +129,9 @@ class TddConfig:
                 raise ValueError(f"TDD {name} must be an integer of at least {minimum}.")
 
     @classmethod
-    def from_args(cls, args, edit_format=None, fnames=()):
+    def from_args(cls, args, edit_format=None, fnames=(), *, root=None):
         """Build the config from parsed CLI/YAML arguments, resolving defaults and overrides."""
+        root = root or os.getcwd()
         script_path = getattr(args, "tdd_script", None) or DEFAULT_TDD_SCRIPT_PATH
         test_globs = tuple(getattr(args, "tdd_test_glob", None) or DEFAULT_TEST_GLOBS)
         if getattr(args, "no_tdd_doc_glob", False):
@@ -141,7 +146,7 @@ class TddConfig:
             for fname in fnames or ():
                 if not isinstance(fname, str) or not fname.strip():
                     continue
-                rel = _normalize_relpath(fname)
+                rel = _normalize_relpath(fname, root)
                 if rel.startswith("../") or rel == "..":
                     continue
                 if any(fnmatch.fnmatchcase(rel, g) for g in test_globs):
@@ -152,12 +157,18 @@ class TddConfig:
                     sources.append(rel)
             source_globs = tuple(sources)
         if not getattr(args, "test_cmd", None):
-            args.test_cmd = _default_test_cmd()
+            args.test_cmd = _default_test_cmd(root)
         if not getattr(args, "auto_test", False):
             args.auto_test = True
         test_cmd = args.test_cmd
         if not isinstance(test_cmd, str) or not supports_pytest(test_cmd):
             raise ValueError("--tdd supports only a pytest --test-cmd (for example 'pytest -q').")
+        # Passing node IDs are needed to verify that the regression itself went green.
+        tokens = shlex.split(test_cmd)
+        end_of_options = tokens.index("--") if "--" in tokens else len(tokens)
+        if "-rA" not in tokens[:end_of_options]:
+            tokens.insert(end_of_options, "-rA")
+        args.test_cmd = shlex.join(tokens)
         if edit_format == "architect":
             raise ValueError("--tdd does not support the architect edit format.")
         return cls(
@@ -224,13 +235,19 @@ _CRASH_LINE = re.compile(r"^([^\s:][^:]*):(\d+):\s*([A-Za-z_][\w.]*(?::.*)?)$")
 
 def supports_pytest(command):
     """True if the command is recognisably a pytest invocation (the only supported runner)."""
-    if not isinstance(command, str):
+    if not isinstance(command, str) or re.search(r"[;&|<>\n\r`]|\$\(", command):
         return False
     try:
         tokens = shlex.split(command)
     except ValueError:
         return False
-    return any(os.path.basename(t) in ("pytest", "py.test") for t in tokens)
+    if not tokens:
+        return False
+    executable = os.path.basename(tokens[0])
+    return executable in ("pytest", "py.test") or (
+        re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable) is not None
+        and tokens[1:3] == ["-m", "pytest"]
+    )
 
 
 def parse_pytest_summary(output):
@@ -329,7 +346,7 @@ def _excerpt(output, limit=6):
 
 def classify_pytest_run(observation, edited_test_paths=()):
     """Classify one pytest run as intended red, passed or unexpected (never a valid red)."""
-    output = observation.output
+    output = re.sub(r"\x1b\[[0-9;]*m", "", observation.output)
     status = observation.exit_status
     summary = parse_pytest_summary(output)
     counts = summary or {}
@@ -372,6 +389,8 @@ def classify_pytest_run(observation, edited_test_paths=()):
         return unexpected("exit status 1 without any failed test.")
     if not failed:
         return unexpected("no 'FAILED <test id> - <reason>' lines found; run pytest with -rf.")
+    if len(failed) != counts["failed"]:
+        return unexpected("the output does not identify every failed test; use a focused run.")
     non_assertion = [f for f in failed if not f.assertion_like]
     if non_assertion:
         listing = "; ".join(f"{f.node_id} ({f.reason or 'no reason shown'})" for f in non_assertion)
@@ -413,7 +432,7 @@ class TddController:
     """State machine over generic hooks; one instance serves one session.
 
     Registered as three hooks (see hook_kwargs): the instance itself as a response hook
-    (only to notice the final report), check_edits as an edit hook and observe_test as a
+    (to retain the report text), check_edits as an edit hook and observe_test as a
     test-result hook. It deliberately has no prompt_reminder, so Aider's edit-format
     reminder is never replaced; guidance is carried by the literal continuations.
     """
@@ -424,8 +443,7 @@ class TddController:
         self.config = config
         self.citation_validator = citation_validator
         self.state = TddState()
-        self._serial = 0
-        self._done_serial = None
+        self._response_text = ""
 
     def hook_kwargs(self):
         return {
@@ -574,6 +592,8 @@ class TddController:
         s = self.state
         tdd = self.config
         unmet = []
+        if check_completion and not content.strip():
+            unmet.append("the final completion report is empty")
         if s.red is None:
             unmet.append(
                 f"no observed red test yet (edit only {', '.join(tdd.test_globs)} and observe an "
@@ -597,12 +617,7 @@ class TddController:
                     "session (cite only returned passage IDs and origins; valid passage identity "
                     "does not prove semantic support)"
                 )
-        if (
-            check_completion
-            and tdd.require_citation
-            and self.citation_validator is not None
-            and content
-        ):
+        if check_completion and tdd.require_citation and self.citation_validator is not None:
             if not re.search(r"\b[0-9a-f]{24}\b", content):
                 unmet.append(
                     "final report must cite at least one returned 24-hex Oracle passage ID"
@@ -611,33 +626,33 @@ class TddController:
 
     # -- response hook -------------------------------------------------------------------
 
+    def _complete_report(self, text, io):
+        unmet = self._unmet_requirements(text, check_completion=True)
+        if unmet:
+            if self._charge(io):
+                return ResponseHookResult()
+            items = "\n".join(f"- {item}" for item in unmet)
+            return ResponseHookResult(
+                "Workflow is NOT complete. Unmet requirements:\n"
+                f"{items}\n"
+                "Note: regression coverage, documentation and the final report are not "
+                "satisfied by an old suite passing; a changed docs file alone is not proof "
+                "its claims are correct; and valid passage identity does not prove semantic "
+                "support. Next action: satisfy the unmet requirements above before "
+                "submitting the final report."
+            )
+        self._move(Phase.DONE, "report response")
+        return None
+
     def __call__(self, content, *, token_count=None, io=None):
-        self._serial += 1
         s = self.state
         text = (content or "").strip()
+        self._response_text = text
         if text.startswith("<oracle_search>") or re.match(r"```\w*\s*<oracle_search>", text):
             return None
         if s.phase is Phase.REPORT:
-            # If the response contains code fences (an edit attempt), let check_edits handle it
-            # unless it's a pure report response.
-            if "```" in text:
-                return None
-            unmet = self._unmet_requirements(text, check_completion=True)
-            if unmet:
-                if self._charge(io):
-                    return ResponseHookResult()
-                items = "\n".join(f"- {item}" for item in unmet)
-                return ResponseHookResult(
-                    "Workflow is NOT complete. Unmet requirements:\n"
-                    f"{items}\n"
-                    "Note: regression coverage, documentation and the final report are not "
-                    "satisfied by an old suite passing; a changed docs file alone is not proof "
-                    "its claims are correct; and valid passage identity does not prove semantic "
-                    "support. Next action: satisfy the unmet requirements above before "
-                    "submitting the final report."
-                )
-            self._move(Phase.DONE, "report response")
-            self._done_serial = self._serial
+            # Completion is decided by check_edits after the core parser distinguishes
+            # actual edits from reports, including reports with fenced examples.
             return None
         if (
             s.phase
@@ -665,9 +680,7 @@ class TddController:
             self._report_stop(io)
             return ResponseHookResult()
         if s.phase is Phase.DONE and (proposal.paths or proposal.shell_commands):
-            if self._serial == self._done_serial:  # edits came with the report: reopen
-                self._move(Phase.REPORT, "edit in the report response")
-            elif not self._new_cycle("edit after the completed workflow", io):
+            if not self._new_cycle("edit after the completed workflow", io):
                 return ResponseHookResult()
 
         tests, sources, docs, bad = [], [], [], []
@@ -702,6 +715,8 @@ class TddController:
                 io,
             )
         if not tests and not sources and not docs:
+            if s.phase is Phase.REPORT and not proposal.shell_commands:
+                return self._complete_report(self._response_text, io)
             if s.phase in (Phase.TEST_ONLY_EDIT, Phase.RED_OBSERVED, Phase.IMPLEMENT):
                 return self._veto(
                     f"No file edits were found in your response during TDD phase "
@@ -799,6 +814,23 @@ class TddController:
             )
 
         if run.kind is RunKind.PASSED:
+            output = re.sub(r"\x1b\[[0-9;]*m", "", observation.output)
+            passed = {
+                line.strip()[len("PASSED ") :]
+                for line in output.splitlines()
+                if line.strip().startswith("PASSED ")
+            }
+            missing = [f.node_id for f in s.red.failed if f.node_id not in passed] if s.red else []
+            if missing:
+                if self._charge(io):
+                    return None
+                return ResponseHookResult(
+                    f"Green is unverified: {_run_line(run)} No PASSED result was observed for "
+                    f"previously failing test(s): {', '.join(missing)}. Keep these tests enabled "
+                    "and run pytest with -rA so their individual outcomes are included. Skipped, "
+                    "xfailed, xpassed or deselected regressions do not satisfy green. If output "
+                    "was truncated, use a focused test command that includes these tests."
+                )
             s.green = run
             self._move(Phase.REPORT, "green observed")
             before_line = _run_line(s.red) if s.red else "(none recorded)"
@@ -853,12 +885,20 @@ def load_tdd_controller_class(script_path=None):
         return TddController
     if not resolved.is_file():
         raise ValueError(f"TDD script not found: {script_path}")
-    spec = importlib.util.spec_from_file_location("aider_custom_tdd", str(resolved))
+    module_name = f"aider_custom_tdd_{uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, str(resolved))
     if spec is None or spec.loader is None:
         raise ValueError(f"Cannot load TDD script: {script_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    controller_cls = getattr(module, "TddController", None)
-    if not isinstance(controller_cls, type):
-        raise ValueError(f"TDD script {script_path} does not define a TddController class.")
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        controller_cls = getattr(module, "TddController", None)
+        if not isinstance(controller_cls, type):
+            raise ValueError(f"TDD script {script_path} does not define a TddController class.")
+    except BaseException:
+        # Failed imports must not leave half-initialized modules behind, including
+        # when the user interrupts the script while it is loading.
+        sys.modules.pop(module_name, None)
+        raise
     return controller_cls

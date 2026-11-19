@@ -545,27 +545,9 @@ def test_session_tracks_returned_passage_evidence_and_validates_cited_ids():
     )
 
 
-def test_oracle_doc_path_resolves_to_aider_repo_regardless_of_cwd(tmp_path, monkeypatch):
-    from pathlib import Path
-
-    import aider.oracle as oracle_mod
+def test_oracle_reference_document_has_no_implicit_checkout_path():
     from aider.args import get_parser
-    from aider.oracle import AIDER_REPO_ROOT, DEFAULT_ORACLE_DOC_PATH
 
-    monkeypatch.chdir(tmp_path)
-    expected_root = Path(oracle_mod.__file__).resolve().parent.parent
-    expected_doc = str(expected_root / "docs" / "oracle.md")
-    assert AIDER_REPO_ROOT == expected_root
-    assert DEFAULT_ORACLE_DOC_PATH == expected_doc
-    assert Path(DEFAULT_ORACLE_DOC_PATH).is_file()
-    assert not str(DEFAULT_ORACLE_DOC_PATH).startswith(str(tmp_path))
-
-    parser = get_parser([], None)
-    default_cfg = OracleConfig.from_args(parser.parse_args(["--oracle"]))
-    assert default_cfg.doc_path == expected_doc
-
-    custom_doc = str(tmp_path / "custom-oracle.md")
-    override_cfg = OracleConfig.from_args(
-        parser.parse_args(["--oracle", "--oracle-doc", custom_doc])
-    )
-    assert override_cfg.doc_path == custom_doc
+    args = get_parser([], None).parse_args(["--oracle"])
+    assert args.oracle_doc is None
+    assert not hasattr(OracleConfig.from_args(args), "doc_path")

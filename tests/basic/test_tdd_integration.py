@@ -31,7 +31,7 @@ from aider.tdd import (
     load_tdd_controller_class,
 )
 
-TEST_CMD = f"{sys.executable} -m pytest -q -p no:cacheprovider"
+TEST_CMD = f"{sys.executable} -m pytest -q -rA -p no:cacheprovider"
 
 CALC = "def add(a, b):\n    return a\n"
 TEST_CALC = "from calc import add\n\n\ndef test_add_zero():\n    assert add(0, 0) == 0\n"
@@ -334,7 +334,8 @@ def test_config_from_args_and_refusals(tmp_path, monkeypatch):
     assert default_config.test_globs == DEFAULT_TEST_GLOBS == ("tests/*",)
     assert default_config.source_globs == (*DEFAULT_SOURCE_GLOBS, "calc.py")
     assert default_config.doc_globs == ()
-    assert default_args.test_cmd == DEFAULT_TEST_CMD == "pytest -q"
+    assert DEFAULT_TEST_CMD == "pytest -q"
+    assert default_args.test_cmd == "pytest -q -rA"
     assert default_args.auto_test is True
 
     # Passing --tdd-doc-glob docs/oracle.md explicitly enables that doc glob
@@ -351,7 +352,7 @@ def test_config_from_args_and_refusals(tmp_path, monkeypatch):
     venv_python.write_text("#!/bin/sh\n")
     venv_args = parser.parse_args(["--tdd"])
     TddConfig.from_args(venv_args)
-    assert venv_args.test_cmd == ".venv/bin/python -m pytest -q"
+    assert venv_args.test_cmd == ".venv/bin/python -m pytest -q -rA"
 
     # Explicit CLI overrides including --tdd-script
     custom_script = tmp_path / "custom_tdd.py"
@@ -376,7 +377,7 @@ def test_config_from_args_and_refusals(tmp_path, monkeypatch):
     loaded_cls = load_tdd_controller_class(config.script_path)
     assert issubclass(loaded_cls, TddController)
     assert getattr(loaded_cls, "custom_loaded", False) is True
-    assert override_args.test_cmd == "python -m pytest -q"
+    assert override_args.test_cmd == "python -m pytest -q -rA"
 
     # Script missing TddController class raises ValueError
     bad_script = tmp_path / "bad_tdd.py"
@@ -440,7 +441,7 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     assert "calc.py" in default_hook.config.source_globs
     assert default_hook.config.doc_globs == ()
     assert coder_default_tdd.auto_test is True
-    assert coder_default_tdd.test_cmd == DEFAULT_TEST_CMD
+    assert coder_default_tdd.test_cmd == "pytest -q -rA"
 
     # Custom --tdd-script override loads the custom TddController in main()
     custom_script = project / "custom_tdd.py"
@@ -487,7 +488,10 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     assert main_module.main(base + ["--tdd", "--test-cmd", "npm test"], return_coder=True) == 1
 
 
-def test_completion_requires_doc_glob_and_rejects_unknown_citations_end_to_end(project):
+@pytest.mark.parametrize("fenced_report", [False, True])
+def test_completion_requires_doc_glob_and_rejects_unknown_citations_end_to_end(
+    project, fenced_report
+):
     (project / "docs").mkdir()
     (project / "docs" / "guide.md").write_text("# Guide\n")
     repo = git.Repo(project)
@@ -536,9 +540,14 @@ def test_completion_requires_doc_glob_and_rejects_unknown_citations_end_to_end(p
         [
             test_edit,
             src_edit,
-            f"Final report citing {unknown_id} before updating docs.",
+            (
+                f"Final report citing {unknown_id} before updating docs.\n```text\n2 passed\n```"
+                if fenced_report
+                else f"Final report citing {unknown_id} before updating docs."
+            ),
             doc_edit,
-            f"Final report citing {known_id}.",
+            f"Final report citing {known_id}."
+            + ("\n```text\n2 passed\n```" if fenced_report else ""),
         ],
     )
     coder.run("make add sum and document it")
@@ -569,5 +578,92 @@ def test_editless_talk_during_test_phase_is_vetoed_and_recovers(project):
     assert len(sends) == 4
     assert "No file edits were found in your response during TDD phase test_only_edit" in sends[1]
     assert controller.state.corrections == 1
+    assert controller.state.phase is Phase.DONE
+    assert read(project, "calc.py") == FIXED_CALC
+
+
+def test_custom_controller_supports_postponed_dataclass_annotations(tmp_path):
+    custom = tmp_path / "custom_tdd.py"
+    custom.write_text(
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "from aider.tdd import TddController as Base\n"
+        '@dataclass\nclass Settings:\n    label: str = "custom"\n'
+        "class TddController(Base):\n    settings = Settings()\n"
+    )
+    first = load_tdd_controller_class(str(custom))
+    second = load_tdd_controller_class(str(custom))
+    assert first.settings.label == second.settings.label == "custom"
+    assert sys.modules[first.__module__].TddController is first
+    assert sys.modules[second.__module__].TddController is second
+
+
+def test_custom_controller_failed_import_cleans_up_module(tmp_path):
+    custom = tmp_path / "broken_tdd.py"
+    custom.write_text('raise RuntimeError("broken controller")\n')
+    before = set(sys.modules)
+    with pytest.raises(RuntimeError, match="broken controller"):
+        load_tdd_controller_class(str(custom))
+    assert not set(sys.modules) - before
+
+
+def test_main_tdd_defaults_use_project_root_from_subdirectory(project, monkeypatch):
+    from aider import main as main_module
+
+    clean_env(monkeypatch)
+    home = project / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("OPENAI_API_KEY", "deadbeef")
+    nested = project / "feature"
+    nested.mkdir()
+    source = nested / "calc.py"
+    source.write_text(CALC)
+    git.Repo(project).index.add(["feature/calc.py"])
+    venv_python = project / ".venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.touch()
+    monkeypatch.chdir(nested)
+    coder = main_module.main(
+        [
+            "--model",
+            "gpt-3.5-turbo",
+            "--yes",
+            "--no-check-update",
+            "--no-show-release-notes",
+            "--no-analytics",
+            "--map-tokens",
+            "0",
+            "--tdd",
+            "calc.py",
+            "../tests/test_calc.py",
+        ],
+        return_coder=True,
+    )
+    assert Path(coder.root) == project
+    controller = coder.response_hooks[0]
+    assert controller._scope("feature/calc.py") == "source"
+    assert controller._scope("tests/test_calc.py") == "test"
+    assert coder.test_cmd == ".venv/bin/python -m pytest -q -rA"
+
+
+def test_skipped_regression_cannot_finish_workflow(project):
+    coder, controller = make_coder("whole")
+    skipped_source = (
+        "import pytest\n\ndef add(a, b):\n"
+        '    if b:\n        pytest.skip("not implemented")\n    return a\n'
+    )
+    sends = fake_send(
+        coder,
+        [
+            whole("tests/test_calc.py", FAILING_TEST),
+            whole("calc.py", skipped_source),
+            whole("calc.py", FIXED_CALC),
+            "Final report.",
+        ],
+    )
+    coder.run("make add sum its arguments")
+    assert len(sends) == 4
+    assert "previously failing" in sends[2]
     assert controller.state.phase is Phase.DONE
     assert read(project, "calc.py") == FIXED_CALC

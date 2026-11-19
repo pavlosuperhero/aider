@@ -11,7 +11,11 @@ module supplies to the coding model. This Markdown guide describes that policy;
 it is not automatically loaded as a model instruction or ingested into Oracle.
 The trial's `--message-file` explicitly supplies its task prompt. A Markdown
 file needed for another task can be added explicitly with Aider's `--read`
-option; reference documents remain read-only.
+option or `--oracle-doc path/to/reference.md`; reference documents remain read-only.
+`--oracle-doc` has no default file and adds reference context through the same
+read-only path as `--read`. It does not replace the versioned system policy.
+An explicitly supplied document must exist; its path is resolved from the
+current directory, with `~` expanded.
 
 The adaptive action policy is appended to Aider's system instructions after
 successful foundation initialization. Models without a system role receive it
@@ -152,10 +156,10 @@ YAML):
   `<aider-repo>/aider/tdd.py`, resolved via `Path(__file__).resolve()` from the
   installed Aider repository regardless of your terminal's current working
   directory; override with `--tdd-script /custom/path/to/my_tdd.py`).
-- `--oracle-doc`: path to the Oracle reference/policy markdown file (default:
-  `<aider-repo>/docs/oracle.md`, resolved via `Path(__file__).resolve()` from the
-  installed Aider repository regardless of your terminal's current working
-  directory; override with `--oracle-doc /custom/path/to/oracle.md`).
+- `--oracle-doc`: optional read-only reference document, equivalent to adding a
+  file with `--read` (default: none). Relative paths use the current directory;
+  missing files are refused. The file supplies reference context, not trusted
+  system instructions.
 - `--tdd-test-glob`: repeatable fnmatch glob for test files (default: `tests/*`;
   override with `--tdd-test-glob <glob>`).
 - `--tdd-source-glob`: repeatable fnmatch glob for production files (default:
@@ -165,10 +169,15 @@ YAML):
   documentation files in scope (default: `()`, disabled unless specified for the
   target project; enable with `--tdd-doc-glob <glob>` or disable any configured
   YAML glob with `--no-tdd-doc-glob`).
-- `--test-cmd`: pytest test command (default: `.venv/bin/python -m pytest -q`
-  when `.venv/bin/python` exists, otherwise `pytest -q`; override with
-  `--test-cmd <cmd>`). Non-pytest test runners and `--edit-format architect` are
-  refused.
+- `--test-cmd`: a direct `pytest` or `python -m pytest` invocation (default:
+  `.venv/bin/python -m pytest -q -rA` when the project root contains
+  `.venv/bin/python`, otherwise `pytest -q -rA`; override with `--test-cmd <cmd>`).
+  TDD adds `-rA` to include individual test outcomes. Shell pipelines and compound
+  commands, non-pytest runners and `--edit-format architect` are refused.
+
+Source-glob expansion and virtual-environment detection use the same project root
+as the edit/test runner, including when Aider starts in a nested directory. The
+custom TDD script path remains relative to the current directory unless absolute.
 
 Observable phases (`TddState.phase`):
 
@@ -182,16 +191,27 @@ Observable phases (`TddState.phase`):
 3. `implement`: production/doc edits after `red_observed` trigger the configured pytest
    command. Further test edits invalidate red/green and start a new cycle.
 4. `report` and `refactor_recheck`: a passing pytest run after `implement` moves to
-   `report`. The continuation supplies the actual before (red) and after (green)
+   `report` only when each previously failing node has an individual `PASSED`
+   result. Skipped, xfailed, xpassed, deselected or missing regression nodes do
+   not satisfy green; unrelated skipped tests are allowed. Missing node results
+   after output truncation leave green unverified; use a focused test command.
+   The continuation supplies the actual before (red) and after (green)
    commands, exit statuses, failed test node IDs and reasons, and a visible completion
    checklist reminder that regression coverage, documentation and the final report are
    not satisfied by an old suite passing. Further production/doc edits move to
    `refactor_recheck` and invalidate green until pytest passes again.
-5. `done` / `aborted`: a non-edit report response with all requirements met moves to
-   `done`. Early completion claims, stale green results, untouched `--tdd-doc-glob`
+5. `done` / `aborted`: after edit parsing, a non-edit report response with all
+   requirements met moves to `done`, including reports containing fenced examples.
+   Early completion claims, stale green results, untouched `--tdd-doc-glob`
    files, or fabricated passage citations report explicit unmet requirements. Exhausted
    cycle, correction or refactor budgets (or a non-pytest runner) move to `aborted` with
    an explicit `StopReason`.
+
+When composing `TddController.hook_kwargs()` through the scripting API, configure
+pytest with `-rA` as well. CLI setup adds this flag automatically. The controller
+reads the bounded observation output; it cannot verify outcomes that are absent
+from that output. These checks assume genuine pytest output and do not establish
+that a model-generated test is meaningful.
 
 ### Citation grounding and completion limits
 
@@ -306,7 +326,7 @@ No raw-token flag is provided.
 | `oracle-require-search` | false | Require successful nonempty focused retrieval each user turn; adaptive mode only, incompatible with fail-open |
 | `oracle-foundation-source` | clean-architecture, think-python | 1–4 required initial source filters, independently configured from refresh filters |
 | `oracle-max-searches` | 2 | 1–3 focused refreshes per user turn, also bounded by Aider's existing reflection limit |
-| `oracle-doc` | `<aider-repo>/docs/oracle.md` | Path to the Oracle reference/policy markdown file (resolved from the installed Aider repo, overridable via `--oracle-doc` or YAML) |
+| `oracle-doc` | none | Optional existing read-only reference document; same context path as `--read`, with relative paths resolved from the current directory |
 | `tdd-script` | `<aider-repo>/aider/tdd.py` | Path to the TDD controller Python script (resolved from the installed Aider repo, overridable via `--tdd-script` or YAML) |
 
 Source filters use Oracle's **source path substring** semantics, not an exact
@@ -340,12 +360,12 @@ and share a total candidate limit. Duplicate IDs are included once per retrieval
 3. Run with default TDD globs and test command from any repository, or override any default on the CLI:
 
    ```sh
-   # Uses Aider-repo defaults (<aider-repo>/docs/oracle.md and <aider-repo>/aider/tdd.py),
+   # Uses the installed Aider TDD controller, no extra reference document,
    # default test glob (tests/*), source globs (aider/*, src/*, ... + non-test chat files),
-   # empty doc glob (), auto-test, and pytest test-cmd:
+   # empty doc glob (), auto-test, and pytest with individual outcomes (-rA):
    aider --oracle --tdd calc.py tests/test_calc.py
 
-   # Override any default with explicit flags (e.g., enforce a doc glob or custom script/doc):
+   # Add a reference document and override scope, controller and test command:
    aider --oracle --tdd \
      --oracle-doc /custom/path/to/oracle.md \
      --tdd-script /custom/path/to/tdd.py \

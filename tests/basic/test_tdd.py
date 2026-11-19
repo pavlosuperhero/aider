@@ -41,7 +41,10 @@ RED = (
     "FAILED tests/test_calc.py::test_add - assert 3 == 4\n"
     "1 failed, 1 passed in 0.03s\n"
 )
-GREEN = "..   [100%]\n2 passed in 0.02s\n"
+GREEN = (
+    "..   [100%]\nPASSED tests/test_calc.py::test_add\n"
+    "PASSED tests/test_calc.py::test_zero\n2 passed in 0.02s\n"
+)
 COLLECTION_ERROR = (
     "==================================== ERRORS ====================================\n"
     "ERROR collecting tests/test_calc.py\n"
@@ -71,6 +74,11 @@ def red_stage(controller):
     result = controller.observe_test(obs(RED, 1))
     assert isinstance(result, ResponseHookResult)
     return result
+
+
+def finish_report(controller, text):
+    assert controller(text) is None
+    return controller.check_edits(EditProposal())
 
 
 def green_stage(controller):
@@ -379,8 +387,7 @@ def test_empty_edit_proposal_is_vetoed_during_edit_phases_and_accepted_in_report
     # In REPORT and DONE: empty proposal is accepted (final report has no file edits).
     assert controller.observe_test(obs(GREEN, 0)) is not None
     assert controller.state.phase is Phase.REPORT
-    assert controller.check_edits(EditProposal(())) is None
-    assert controller("final report") is None
+    assert finish_report(controller, "final report") is None
     assert controller.state.phase is Phase.DONE
     assert controller.check_edits(EditProposal(())) is None
 
@@ -449,7 +456,7 @@ def test_failure_after_implementation_stays_in_implement_with_failed_ids():
 def test_report_response_completes_workflow():
     controller = make_controller()
     green_stage(controller)
-    assert controller(" final report ", token_count=len, io=None) is None
+    assert finish_report(controller, " final report ") is None
     assert controller.state.phase is Phase.DONE
 
 
@@ -506,11 +513,11 @@ def test_production_edit_after_green_invalidates_green_and_requires_recheck():
     assert "final report" in result.continuation
 
 
-def test_edit_in_the_report_response_reopens_the_workflow_instead_of_done():
+def test_edit_in_the_report_response_requires_reverification_before_done():
     controller = make_controller()
     green_stage(controller)
     controller("refactor and report")
-    assert controller.state.phase is Phase.DONE
+    assert controller.state.phase is Phase.REPORT
     assert controller.check_edits(EditProposal((SRC_FILE,))) is None
     assert controller.state.phase is Phase.REFACTOR_RECHECK
 
@@ -518,7 +525,7 @@ def test_edit_in_the_report_response_reopens_the_workflow_instead_of_done():
 def test_edit_after_done_in_a_later_response_starts_a_new_cycle():
     controller = make_controller()
     green_stage(controller)
-    controller("report")
+    finish_report(controller, "report")
     controller("next user task")
     assert isinstance(controller.check_edits(EditProposal((SRC_FILE,))), ResponseHookResult)
     assert controller.state.phase is Phase.TEST_ONLY_EDIT
@@ -687,7 +694,7 @@ def test_optional_doc_glob_allows_doc_edit_and_rejects_report_when_docs_untouche
     )
     green_stage(controller)
     # Report while docs/* has never been touched -> unmet documentation requirement.
-    unmet = controller("Final report without touching docs.")
+    unmet = finish_report(controller, "Final report without touching docs.")
     assert isinstance(unmet, ResponseHookResult)
     assert "Unmet requirements" in unmet.continuation
     assert "docs/*" in unmet.continuation
@@ -699,7 +706,7 @@ def test_optional_doc_glob_allows_doc_edit_and_rejects_report_when_docs_untouche
     assert controller.state.docs_edited == ("docs/oracle.md",)
     assert controller.observe_test(obs(GREEN, 0)) is not None
     assert controller.state.phase is Phase.REPORT
-    assert controller("Final report after doc update.") is None
+    assert finish_report(controller, "Final report after doc update.") is None
     assert controller.state.phase is Phase.DONE
 
 
@@ -712,14 +719,16 @@ def test_report_rejects_unknown_cited_passage_ids_and_notes_identity_vs_semantic
         citation_validator=validator,
     )
     green_stage(controller)
-    rejected = controller(f"Final report citing {known_id} and fabricated {unknown_id}.")
+    rejected = finish_report(
+        controller, f"Final report citing {known_id} and fabricated {unknown_id}."
+    )
     assert isinstance(rejected, ResponseHookResult)
     assert unknown_id in rejected.continuation
     assert "never returned" in rejected.continuation
     assert "valid passage identity does not prove semantic support" in rejected.continuation
     assert controller.state.phase is Phase.REPORT
 
-    accepted = controller(f"Final report citing only {known_id}.")
+    accepted = finish_report(controller, f"Final report citing only {known_id}.")
     assert accepted is None
     assert controller.state.phase is Phase.DONE
 
@@ -736,7 +745,7 @@ def test_require_citation_flag_requires_final_report_to_contain_at_least_one_24h
 
     green_stage(controller)
 
-    unmet = controller("Final report with no citation.")
+    unmet = finish_report(controller, "Final report with no citation.")
     assert isinstance(unmet, ResponseHookResult)
     assert (
         "final report must cite at least one returned 24-hex Oracle passage ID"
@@ -744,7 +753,7 @@ def test_require_citation_flag_requires_final_report_to_contain_at_least_one_24h
     )
     assert controller.state.phase is Phase.REPORT
 
-    accepted = controller("Final report citing passage id 4d4d418905639aeba3a03277.")
+    accepted = finish_report(controller, "Final report citing passage id 4d4d418905639aeba3a03277.")
     assert accepted is None
     assert controller.state.phase is Phase.DONE
 
@@ -763,4 +772,114 @@ def test_fenced_edit_in_report_phase_does_not_move_to_done_prematurely():
     # Model responds with a fenced edit block in REPORT phase
     fenced_edit = "docs/oracle.md\n```markdown\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```"
     assert controller(fenced_edit) is None
+    assert controller.state.phase is Phase.REPORT
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "xfailed", "xpassed", "deselected"])
+def test_green_requires_the_previously_failing_node_to_pass(outcome):
+    controller = make_controller()
+    red_stage(controller)
+    controller.check_edits(EditProposal((SRC_FILE,)))
+    result = controller.observe_test(obs(f"1 passed, 1 {outcome} in 0.02s\n", 0))
+    assert controller.state.phase is Phase.IMPLEMENT
+    assert controller.state.green is None
+    assert "tests/test_calc.py::test_add" in result.continuation
+
+
+def test_green_rejects_missing_regression_even_when_all_collected_tests_pass():
+    controller = make_controller()
+    red_stage(controller)
+    controller.check_edits(EditProposal((SRC_FILE,)))
+    result = controller.observe_test(
+        obs("PASSED tests/test_calc.py::test_other\n1 passed in 0.02s\n", 0)
+    )
+    assert controller.state.green is None
+    assert "test_add" in result.continuation
+
+
+def test_green_allows_unrelated_skips_when_the_red_node_passed():
+    controller = make_controller()
+    red_stage(controller)
+    controller.check_edits(EditProposal((SRC_FILE,)))
+    controller.observe_test(
+        obs("PASSED tests/test_calc.py::test_add\n1 passed, 1 skipped in 0.02s\n", 0)
+    )
+    assert controller.state.phase is Phase.REPORT
+
+
+def test_fenced_final_report_checks_required_docs_after_parsing():
+    controller = make_controller(doc_globs=("docs/*",))
+    green_stage(controller)
+    assert controller("Results:\n```text\n2 passed\n```") is None
+    result = controller.check_edits(EditProposal())
+    assert isinstance(result, ResponseHookResult)
+    assert "documentation scope" in result.continuation
+    assert controller.state.phase is Phase.REPORT
+
+
+def test_fenced_final_report_requires_citation_after_parsing():
+    controller = TddController(
+        TddConfig(source_globs=("calc.py",), require_citation=True),
+        citation_validator=lambda text: (),
+    )
+    green_stage(controller)
+    assert controller("Results:\n```text\n2 passed\n```") is None
+    result = controller.check_edits(EditProposal())
+    assert isinstance(result, ResponseHookResult)
+    assert "cite at least one" in result.continuation
+
+
+def test_valid_fenced_final_report_finishes_after_parsing():
+    controller = make_controller()
+    green_stage(controller)
+    assert controller("Results:\n```text\n2 passed\n```") is None
+    assert controller.state.phase is Phase.REPORT
+    assert controller.check_edits(EditProposal()) is None
+    assert controller.state.phase is Phase.DONE
+
+
+@pytest.mark.parametrize(
+    "command", ["echo pytest", "pytest -q && true", "pytest -q | cat", 'python -c "pytest"']
+)
+def test_pytest_command_must_represent_one_direct_test_run(command):
+    assert not supports_pytest(command)
+
+
+def test_tdd_report_option_is_inserted_before_end_of_options_and_is_idempotent():
+    args = SimpleNamespace(test_cmd="python -m pytest -q -- tests/test_calc.py", auto_test=True)
+    TddConfig.from_args(args)
+    assert args.test_cmd == "python -m pytest -q -rA -- tests/test_calc.py"
+    TddConfig.from_args(args)
+    assert args.test_cmd.count("-rA") == 1
+
+
+def test_incomplete_red_output_cannot_release_production_edits():
+    controller = make_controller()
+    controller.check_edits(EditProposal((TEST_FILE,)))
+    result = controller.observe_test(
+        obs("FAILED tests/test_calc.py::test_add - assert 3 == 4\n2 failed in 0.02s\n", 1)
+    )
+    assert controller.state.phase is Phase.TEST_ONLY_EDIT
+    assert "every failed test" in result.continuation
+
+
+def test_green_requires_all_red_nodes_even_when_some_pass():
+    controller = make_controller()
+    controller.check_edits(EditProposal((TEST_FILE,)))
+    output = (
+        "FAILED tests/test_calc.py::test_add - assert 3 == 4\n"
+        "FAILED tests/test_calc.py::test_other - assert 1 == 2\n2 failed in 0.02s\n"
+    )
+    controller.observe_test(obs(output, 1))
+    controller.check_edits(EditProposal((SRC_FILE,)))
+    result = controller.observe_test(obs(GREEN, 0))
+    assert controller.state.green is None
+    assert "test_other" in result.continuation
+
+
+def test_empty_final_report_cannot_finish_workflow():
+    controller = make_controller()
+    green_stage(controller)
+    result = finish_report(controller, "")
+    assert "report is empty" in result.continuation
     assert controller.state.phase is Phase.REPORT

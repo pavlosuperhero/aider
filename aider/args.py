@@ -119,7 +119,7 @@ def get_parser(default_config_files, git_root):
     group.add_argument(
         "--oracle-doc",
         default=None,
-        help="Path to the Oracle reference/policy markdown file (default: <aider-repo>/docs/oracle.md)",
+        help="Load an additional read-only Oracle reference document, like --read (default: none)",
     )
 
     group = parser.add_argument_group("TDD workflow (opt-in)")

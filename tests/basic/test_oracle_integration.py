@@ -700,3 +700,35 @@ def test_custom_response_hook_can_stop_edits_and_shell_commands(project, model, 
     assert (root / "greeting.py").read_text() == 'print("before")\n'
     assert not repo.index.diff(None)
     shell.assert_not_called()
+
+
+def test_main_oracle_doc_loads_reference_without_changing_system_policy(
+    project, model, monkeypatch
+):
+    from aider import main as main_module
+
+    root, _ = project
+    reference = root / "custom-reference.md"
+    reference.write_text("Custom reference: keep the service boundary small.\n")
+    monkeypatch.setattr(main_module.models, "Model", lambda *a, **kw: model)
+    args = [
+        "--model",
+        "gpt-4",
+        "--yes",
+        "--no-check-update",
+        "--no-show-release-notes",
+        "--no-analytics",
+        "--no-stream",
+        "--map-tokens",
+        "0",
+        "greeting.py",
+    ]
+    coder = main_module.main(args + ["--oracle", "--oracle-doc", str(reference)], return_coder=True)
+    chunks = coder.format_chat_chunks()
+    readonly_text = "\n".join(m["content"] for m in chunks.readonly_files)
+    system_text = "\n".join(m["content"] for m in chunks.system)
+    assert reference.read_text().strip() in readonly_text
+    assert reference.read_text().strip() not in system_text
+    assert str(reference) in coder.abs_read_only_fnames
+    assert str(reference) not in coder.abs_fnames
+    assert main_module.main(args + ["--oracle-doc", "missing-reference.md"], return_coder=True) == 1
