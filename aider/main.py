@@ -979,7 +979,9 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         if args.tdd:
             from aider.tdd import TddConfig, TddController
 
-            tdd_config = TddConfig.from_args(args, args.edit_format or main_model.edit_format)
+            tdd_config = TddConfig.from_args(
+                args, args.edit_format or main_model.edit_format, fnames=fnames
+            )
             provider = oracle_kwargs.get("oracle_provider")
             citation_validator = getattr(provider, "unknown_cited_ids", None)
             tdd_controller = TddController(tdd_config, citation_validator=citation_validator)

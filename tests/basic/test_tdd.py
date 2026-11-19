@@ -9,6 +9,10 @@ import pytest
 
 from aider.hooks import EditProposal, ResponseHookResult, TestRunObservation
 from aider.tdd import (
+    DEFAULT_DOC_GLOBS,
+    DEFAULT_SOURCE_GLOBS,
+    DEFAULT_TEST_CMD,
+    DEFAULT_TEST_GLOBS,
     Phase,
     RunKind,
     StopReason,
@@ -245,6 +249,25 @@ def test_supported_runner_contract_is_pytest_only(command, expected):
 def test_config_rejects_unusable_scope_or_budgets(kwargs):
     with pytest.raises(ValueError):
         TddConfig(**kwargs)
+
+
+def test_tdd_config_default_constants():
+    config = TddConfig()
+    assert config.test_globs == DEFAULT_TEST_GLOBS == ("tests/*",)
+    assert (
+        config.source_globs
+        == DEFAULT_SOURCE_GLOBS
+        == (
+            "aider/*",
+            "src/*",
+            "lib/*",
+            "app/*",
+            "pkg/*",
+        )
+    )
+    assert config.doc_globs == ()
+    assert DEFAULT_DOC_GLOBS == ("docs/oracle.md",)
+    assert DEFAULT_TEST_CMD == "pytest -q"
 
 
 def test_scope_is_explicit_not_inferred_from_file_names():

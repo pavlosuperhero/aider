@@ -16,7 +16,17 @@ from aider.args import get_parser
 from aider.coders import Coder
 from aider.io import InputOutput
 from aider.models import Model
-from aider.tdd import Phase, RunKind, StopReason, TddConfig, TddController
+from aider.tdd import (
+    DEFAULT_DOC_GLOBS,
+    DEFAULT_SOURCE_GLOBS,
+    DEFAULT_TEST_CMD,
+    DEFAULT_TEST_GLOBS,
+    Phase,
+    RunKind,
+    StopReason,
+    TddConfig,
+    TddController,
+)
 
 TEST_CMD = f"{sys.executable} -m pytest -q -p no:cacheprovider"
 
@@ -303,12 +313,41 @@ def test_parser_defaults_to_off_and_supports_disable_override(tmp_path, monkeypa
     assert parser.parse_args([]).tdd is False
 
 
-def test_config_from_args_and_refusals(monkeypatch):
+def test_config_from_args_and_refusals(tmp_path, monkeypatch):
     clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
     parser = get_parser([], None)
-    config = TddConfig.from_args(tdd_args(parser, "--tdd"))
+
+    # Defaults when only --tdd is supplied (no .venv/bin/python in tmp_path)
+    default_args = parser.parse_args(["--tdd"])
+    default_config = TddConfig.from_args(
+        default_args, fnames=["calc.py", "tests/test_calc.py", "docs/oracle.md"]
+    )
+    assert default_config.test_globs == DEFAULT_TEST_GLOBS == ("tests/*",)
+    assert default_config.source_globs == (*DEFAULT_SOURCE_GLOBS, "calc.py")
+    assert default_config.doc_globs == DEFAULT_DOC_GLOBS == ("docs/oracle.md",)
+    assert default_args.test_cmd == DEFAULT_TEST_CMD == "pytest -q"
+    assert default_args.auto_test is True
+
+    # Smart .venv/bin/python default when .venv/bin/python exists
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n")
+    venv_args = parser.parse_args(["--tdd"])
+    TddConfig.from_args(venv_args)
+    assert venv_args.test_cmd == ".venv/bin/python -m pytest -q"
+
+    # Explicit CLI overrides
+    override_args = tdd_args(parser, "--tdd", "--tdd-doc-glob", "docs/*.md")
+    config = TddConfig.from_args(override_args)
     assert config.test_globs == ("tests/*",)
     assert config.source_globs == ("calc.py", "pkg/*")
+    assert config.doc_globs == ("docs/*.md",)
+    assert override_args.test_cmd == "python -m pytest -q"
+
+    # --no-tdd-doc-glob disables the default doc glob
+    no_doc_args = parser.parse_args(["--tdd", "--no-tdd-doc-glob"])
+    assert TddConfig.from_args(no_doc_args).doc_globs == ()
 
     def refused(*argv, edit_format=None):
         args = parser.parse_args(list(argv))
@@ -316,15 +355,8 @@ def test_config_from_args_and_refusals(monkeypatch):
             TddConfig.from_args(args, edit_format=edit_format)
         return str(err.value)
 
-    base = ["--tdd", "--tdd-test-glob", "tests/*", "--tdd-source-glob", "calc.py"]
-    assert "--tdd-test-glob" in refused("--tdd", "--tdd-source-glob", "calc.py")
-    assert "--tdd-source-glob" in refused("--tdd", "--tdd-test-glob", "tests/*")
-    assert "--test-cmd" in refused(*base, "--auto-test")
-    assert "--auto-test" in refused(*base, "--test-cmd", "python -m pytest")
-    assert "pytest" in refused(*base, "--auto-test", "--test-cmd", "npm test")
-    assert "architect" in refused(
-        *base, "--auto-test", "--test-cmd", "pytest", edit_format="architect"
-    )
+    assert "pytest" in refused("--tdd", "--test-cmd", "npm test")
+    assert "architect" in refused("--tdd", edit_format="architect")
 
 
 def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monkeypatch):
@@ -351,6 +383,22 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     ]
     coder = main_module.main(base, return_coder=True)
     assert (coder.response_hooks, coder.edit_hooks, coder.test_result_hooks) == ((), (), ())
+
+    # Default --tdd without explicit globs or --test-cmd succeeds with smart defaults
+    coder_default_tdd = main_module.main(base + ["--tdd"], return_coder=True)
+    assert (
+        len(coder_default_tdd.response_hooks)
+        == len(coder_default_tdd.edit_hooks)
+        == len(coder_default_tdd.test_result_hooks)
+        == 1
+    )
+    default_hook = coder_default_tdd.response_hooks[0]
+    assert isinstance(default_hook, TddController)
+    assert default_hook.config.test_globs == DEFAULT_TEST_GLOBS
+    assert "calc.py" in default_hook.config.source_globs
+    assert default_hook.config.doc_globs == DEFAULT_DOC_GLOBS
+    assert coder_default_tdd.auto_test is True
+    assert coder_default_tdd.test_cmd == DEFAULT_TEST_CMD
 
     tdd = [
         "--tdd",
@@ -381,7 +429,8 @@ def test_main_wires_hooks_only_when_enabled_and_refuses_bad_setup(project, monke
     coder = main_module.main(base + tdd + ["--no-tdd"], return_coder=True)
     assert coder.edit_hooks == ()
 
-    assert main_module.main(base + ["--tdd"], return_coder=True) == 1
+    # Invalid non-pytest --test-cmd is refused
+    assert main_module.main(base + ["--tdd", "--test-cmd", "npm test"], return_coder=True) == 1
 
 
 def test_completion_requires_doc_glob_and_rejects_unknown_citations_end_to_end(project):

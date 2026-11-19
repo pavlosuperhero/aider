@@ -143,13 +143,23 @@ the response's edits and shell commands and reports that nothing was applied.
 `aider/tdd.py` composes `response_hooks`, `edit_hooks` and `test_result_hooks`
 into an optional test-first controller (`TddController`), enabled with `--tdd`
 (or `tdd: true` in `.aider.conf.yml`; override with `--no-tdd` or
-`AIDER_TDD=false`). Required options:
+`AIDER_TDD=false`). Options and smart defaults (each overridable via CLI flag or
+YAML):
 
 - `--tdd` / `--no-tdd`: enable or disable the TDD workflow (default: false).
-- `--tdd-test-glob`: repeatable fnmatch glob for test files (required with `--tdd`).
-- `--tdd-source-glob`: repeatable fnmatch glob for production files (required with `--tdd`).
-- `--tdd-doc-glob`: optional repeatable fnmatch glob for documentation files in scope.
-- `--auto-test` and a pytest `--test-cmd` (not compatible with `--edit-format architect`).
+  Enabling `--tdd` automatically enables `--auto-test`.
+- `--tdd-test-glob`: repeatable fnmatch glob for test files (default: `tests/*`;
+  override with `--tdd-test-glob <glob>`).
+- `--tdd-source-glob`: repeatable fnmatch glob for production files (default:
+  `aider/*`, `src/*`, `lib/*`, `app/*`, `pkg/*`, plus any non-test/non-doc chat
+  files passed on the command line; override with `--tdd-source-glob <glob>`).
+- `--tdd-doc-glob` / `--no-tdd-doc-glob`: repeatable fnmatch glob for
+  documentation files in scope (default: `docs/oracle.md`; override with
+  `--tdd-doc-glob <glob>` or disable with `--no-tdd-doc-glob`).
+- `--test-cmd`: pytest test command (default: `.venv/bin/python -m pytest -q`
+  when `.venv/bin/python` exists, otherwise `pytest -q`; override with
+  `--test-cmd <cmd>`). Non-pytest test runners and `--edit-format architect` are
+  refused.
 
 Observable phases (`TddState.phase`):
 
@@ -296,6 +306,53 @@ trimmed to the reference budget. Missing required books or an insufficient
 foundation budget fail explicitly. A refresh chooses one displayed filter and
 at most `top_k` passages. In always mode filters are queried in configured order
 and share a total candidate limit. Duplicate IDs are included once per retrieval.
+
+## Setup on another PC and flag combinations
+
+1. Clone this repository and install the editable CLI tool with `uv`:
+
+   ```sh
+   git clone https://github.com/pavlosuperhero/aider.git
+   cd aider
+   uv tool install --editable . --with "tree-sitter-language-pack==0.13.0"
+   ```
+
+2. Create a minimal `~/.aider.conf.yml` for your local LM Studio and Oracle setup:
+
+   ```yaml
+   model: lm_studio/qwen/qwen3.5-9b
+   oracle: true
+   oracle-base-url: http://127.0.0.1:8742
+   oracle-require-search: true
+   ```
+
+3. Run with default TDD globs and test command, or override any default on the CLI:
+
+   ```sh
+   # Uses default test glob (tests/*), source globs (aider/*, src/*, ...),
+   # doc glob (docs/oracle.md), auto-test, and pytest test-cmd:
+   aider --tdd aider/oracle.py tests/basic/test_oracle.py docs/oracle.md
+
+   # Override any default with explicit flags:
+   aider --tdd \
+     --tdd-test-glob "tests/basic/test_oracle*.py" \
+     --tdd-source-glob "aider/oracle.py" \
+     --tdd-doc-glob "docs/oracle.md" \
+     --test-cmd ".venv/bin/python -m pytest -q tests/basic/test_oracle.py" \
+     aider/oracle.py tests/basic/test_oracle.py docs/oracle.md
+
+   # Disable the default docs/oracle.md requirement when no doc update is needed:
+   aider --tdd --no-tdd-doc-glob calc.py tests/test_calc.py
+   ```
+
+4. The four independent mode combinations work via CLI flags or `.aider.conf.yml`:
+
+   | Mode combination | Flags | Behavior |
+   | --- | --- | --- |
+   | Oracle + TDD | `--oracle --tdd` | Retrieval context + citation validation + red/green/doc TDD workflow |
+   | TDD only | `--no-oracle --tdd` | Red/green/doc TDD workflow without Oracle retrieval |
+   | Oracle only | `--oracle --no-tdd` | Oracle foundations and focused `<oracle_search>` without TDD phase gates |
+   | Standard Aider | `--no-oracle --no-tdd` | Stock Aider behavior with neither hook active |
 
 ## Local Qwen and Oracle
 

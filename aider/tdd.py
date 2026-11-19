@@ -57,6 +57,12 @@ class RunKind(str, Enum):
     UNEXPECTED = "unexpected"
 
 
+DEFAULT_TEST_GLOBS = ("tests/*",)
+DEFAULT_SOURCE_GLOBS = ("aider/*", "src/*", "lib/*", "app/*", "pkg/*")
+DEFAULT_DOC_GLOBS = ("docs/oracle.md",)
+DEFAULT_TEST_CMD = "pytest -q"
+
+
 def _globs(name, value, *, allow_empty=False):
     if isinstance(value, str) or not hasattr(value, "__iter__"):
         raise ValueError(f"TDD {name} must be a list of glob patterns.")
@@ -68,6 +74,22 @@ def _globs(name, value, *, allow_empty=False):
     return value
 
 
+def _normalize_relpath(path, root=None):
+    base = os.path.abspath(root or os.getcwd())
+    abs_path = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(abs_path, base)
+    except ValueError:
+        rel = path
+    return os.path.normpath(rel).replace(os.sep, "/")
+
+
+def _default_test_cmd():
+    if os.path.isfile(os.path.join(".venv", "bin", "python")):
+        return ".venv/bin/python -m pytest -q"
+    return DEFAULT_TEST_CMD
+
+
 @dataclass(frozen=True)
 class TddConfig:
     """Explicit scope (fnmatch globs on project-relative POSIX paths) and budgets.
@@ -75,8 +97,8 @@ class TddConfig:
     fnmatch semantics: * also matches /, so "tests/*" covers nested test files.
     """
 
-    test_globs: tuple[str, ...]
-    source_globs: tuple[str, ...]
+    test_globs: tuple[str, ...] = DEFAULT_TEST_GLOBS
+    source_globs: tuple[str, ...] = DEFAULT_SOURCE_GLOBS
     doc_globs: tuple[str, ...] = ()
     max_cycles: int = 3  # red cycles, including the first
     max_corrections: int = 6  # rejected edits, invalid reds and failing runs after a change
@@ -97,20 +119,36 @@ class TddConfig:
                 raise ValueError(f"TDD {name} must be an integer of at least {minimum}.")
 
     @classmethod
-    def from_args(cls, args, edit_format=None):
-        """Build the config from parsed CLI/YAML arguments, refusing unusable setups."""
-        test_globs = tuple(getattr(args, "tdd_test_glob", None) or ())
-        source_globs = tuple(getattr(args, "tdd_source_glob", None) or ())
-        doc_globs = tuple(getattr(args, "tdd_doc_glob", None) or ())
-        if not test_globs:
-            raise ValueError("--tdd requires at least one --tdd-test-glob.")
-        if not source_globs:
-            raise ValueError("--tdd requires at least one --tdd-source-glob.")
+    def from_args(cls, args, edit_format=None, fnames=()):
+        """Build the config from parsed CLI/YAML arguments, resolving defaults and overrides."""
+        test_globs = tuple(getattr(args, "tdd_test_glob", None) or DEFAULT_TEST_GLOBS)
+        if getattr(args, "no_tdd_doc_glob", False):
+            doc_globs = ()
+        else:
+            doc_globs = tuple(getattr(args, "tdd_doc_glob", None) or DEFAULT_DOC_GLOBS)
+        raw_sources = getattr(args, "tdd_source_glob", None)
+        if raw_sources:
+            source_globs = tuple(raw_sources)
+        else:
+            sources = list(DEFAULT_SOURCE_GLOBS)
+            for fname in fnames or ():
+                if not isinstance(fname, str) or not fname.strip():
+                    continue
+                rel = _normalize_relpath(fname)
+                if rel.startswith("../") or rel == "..":
+                    continue
+                if any(fnmatch.fnmatchcase(rel, g) for g in test_globs):
+                    continue
+                if any(fnmatch.fnmatchcase(rel, g) for g in doc_globs):
+                    continue
+                if not any(fnmatch.fnmatchcase(rel, g) for g in sources):
+                    sources.append(rel)
+            source_globs = tuple(sources)
+        if not getattr(args, "test_cmd", None):
+            args.test_cmd = _default_test_cmd()
+        if not getattr(args, "auto_test", False):
+            args.auto_test = True
         test_cmd = args.test_cmd
-        if not test_cmd:
-            raise ValueError("--tdd requires --test-cmd.")
-        if not args.auto_test:
-            raise ValueError("--tdd requires --auto-test so that every edit is followed by a run.")
         if not isinstance(test_cmd, str) or not supports_pytest(test_cmd):
             raise ValueError("--tdd supports only a pytest --test-cmd (for example 'pytest -q').")
         if edit_format == "architect":

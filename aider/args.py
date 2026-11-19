@@ -122,28 +122,31 @@ def get_parser(default_config_files, git_root):
         "--tdd",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help=(
-            "Enforce a test-first workflow (pytest only; needs --auto-test, --test-cmd and"
-            " the two --tdd-*-glob options)"
-        ),
+        help="Enforce a test-first workflow (pytest only; uses smart defaults when globs/test-cmd are omitted)",
     )
     group.add_argument(
         "--tdd-test-glob",
         action="append",
         default=None,
-        help="Glob for test files, relative to the project root (repeatable)",
+        help="Glob for test files, relative to the project root (repeatable; default: tests/*)",
     )
     group.add_argument(
         "--tdd-source-glob",
         action="append",
         default=None,
-        help="Glob for production files, relative to the project root (repeatable)",
+        help="Glob for production files, relative to the project root (repeatable; default: aider/*, src/*, lib/*, app/*, pkg/*)",
     )
     group.add_argument(
         "--tdd-doc-glob",
         action="append",
         default=None,
-        help="Optional glob for documentation files, relative to the project root (repeatable)",
+        help="Optional glob for documentation files, relative to the project root (repeatable; default: docs/oracle.md)",
+    )
+    group.add_argument(
+        "--no-tdd-doc-glob",
+        action="store_true",
+        default=False,
+        help="Disable the default TDD documentation glob requirement",
     )
 
     group = parser.add_argument_group("API Keys and settings")
