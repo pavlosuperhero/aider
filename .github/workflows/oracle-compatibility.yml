@@ -5,6 +5,9 @@ on:
     paths:
       - "aider/**"
       - "tests/basic/test_oracle*.py"
+      - "tests/basic/test_tdd*.py"
+      - "tests/basic/test_edit_hooks.py"
+      - "tests/basic/test_test_result_hooks.py"
       - "tests/basic/test_scripting.py"
       - "requirements*.txt"
       - "requirements/**"
@@ -41,4 +44,8 @@ jobs:
           python -m pytest -q
           tests/basic/test_oracle.py
           tests/basic/test_oracle_integration.py
+          tests/basic/test_tdd.py
+          tests/basic/test_tdd_integration.py
+          tests/basic/test_edit_hooks.py
+          tests/basic/test_test_result_hooks.py
           tests/basic/test_scripting.py

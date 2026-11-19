@@ -1,0 +1,904 @@
+"""Optional TDD workflow controller, driven by generic hooks from aider/hooks.py.
+
+The controller consumes plain data (EditProposal, TestRunObservation, response text)
+and returns ResponseHookResult objects. It imports nothing from the Coder, Commands
+or IO layers. CLI configuration and custom-script loading are composed by main.
+
+Phases (TddState.phase)::
+
+    TEST_ONLY_EDIT -> RED_OBSERVED -> IMPLEMENT -> REPORT -> DONE
+                          (REPORT -> REFACTOR_RECHECK -> REPORT)      ABORTED from anywhere
+
+- TEST_ONLY_EDIT: only test files may change. After a test edit the next test run must
+  be an intended red.
+- RED_OBSERVED: an intended red was observed; production edits are allowed.
+- IMPLEMENT: a production edit was accepted; the next test run must pass.
+- REPORT: a green run was observed after the last edit; the model is asked for a final
+  report (or a refactor). DONE: a response arrived in REPORT without edits.
+- REFACTOR_RECHECK: a production edit after green; green must be re-observed.
+- ABORTED: a budget ran out or the runner is unsupported (state.stop_reason says why).
+
+Contract and limits: the only supported runner is pytest. Red/green evidence comes from
+the exit status and output of the one configured test command (focused and broader
+checks are not distinguished). Green requires a PASSED result for every recorded red
+node; configure pytest with -rA (CLI setup does this automatically). Edits are judged
+by explicit path globs, never by file name guessing. Nothing here judges whether a
+test is meaningful or the code correct.
+"""
+
+import fnmatch
+import importlib.util
+import os
+import re
+import shlex
+import sys
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from uuid import uuid4
+
+from aider.hooks import EditProposal, ResponseHookResult, TestRunObservation
+
+
+class Phase(str, Enum):
+    TEST_ONLY_EDIT = "test_only_edit"
+    RED_OBSERVED = "red_observed"
+    IMPLEMENT = "implement"
+    REFACTOR_RECHECK = "refactor_recheck"
+    REPORT = "report"
+    DONE = "done"
+    ABORTED = "aborted"
+
+
+class StopReason(str, Enum):
+    CORRECTION_BUDGET = "correction_budget"
+    CYCLE_BUDGET = "cycle_budget"
+    REFACTOR_BUDGET = "refactor_budget"
+    UNSUPPORTED_RUNNER = "unsupported_runner"
+
+
+class RunKind(str, Enum):
+    INTENDED_RED = "intended_red"
+    PASSED = "passed"
+    UNEXPECTED = "unexpected"
+
+
+AIDER_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TDD_SCRIPT_PATH = str(Path(__file__).resolve())
+DEFAULT_TEST_GLOBS = ("tests/*",)
+DEFAULT_SOURCE_GLOBS = ("aider/*", "src/*", "lib/*", "app/*", "pkg/*")
+DEFAULT_TEST_CMD = "pytest -q"
+
+
+def _globs(name, value, *, allow_empty=False):
+    if isinstance(value, str) or not hasattr(value, "__iter__"):
+        raise ValueError(f"TDD {name} must be a list of glob patterns.")
+    value = tuple(value)
+    if (not value and not allow_empty) or any(
+        not isinstance(g, str) or not g.strip() for g in value
+    ):
+        raise ValueError(f"TDD needs at least one nonempty {name} glob.")
+    return value
+
+
+def _normalize_relpath(path, root=None):
+    base = os.path.abspath(root or os.getcwd())
+    abs_path = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(abs_path, base)
+    except ValueError:
+        rel = path
+    return os.path.normpath(rel).replace(os.sep, "/")
+
+
+def _default_test_cmd(root):
+    if (Path(root) / ".venv" / "bin" / "python").is_file():
+        return ".venv/bin/python -m pytest -q"
+    return DEFAULT_TEST_CMD
+
+
+@dataclass(frozen=True)
+class TddConfig:
+    """Explicit scope (fnmatch globs on project-relative POSIX paths) and budgets.
+
+    fnmatch semantics: * also matches /, so "tests/*" covers nested test files.
+    """
+
+    test_globs: tuple[str, ...] = DEFAULT_TEST_GLOBS
+    source_globs: tuple[str, ...] = DEFAULT_SOURCE_GLOBS
+    doc_globs: tuple[str, ...] = ()
+    max_cycles: int = 3  # red cycles, including the first
+    max_corrections: int = 6  # rejected edits, invalid reds and failing runs after a change
+    max_refactor_rechecks: int = 2
+    require_citation: bool = False
+    script_path: str = DEFAULT_TDD_SCRIPT_PATH
+
+    def __post_init__(self):
+        if not isinstance(self.script_path, str) or not self.script_path.strip():
+            raise ValueError("TDD script_path must be a nonempty file path.")
+        object.__setattr__(self, "test_globs", _globs("test", self.test_globs))
+        object.__setattr__(self, "source_globs", _globs("source", self.source_globs))
+        object.__setattr__(self, "doc_globs", _globs("doc", self.doc_globs, allow_empty=True))
+        for name, minimum in (
+            ("max_cycles", 1),
+            ("max_corrections", 0),
+            ("max_refactor_rechecks", 0),
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"TDD {name} must be an integer of at least {minimum}.")
+
+    @classmethod
+    def from_args(cls, args, edit_format=None, fnames=(), *, root=None):
+        """Build the config from parsed CLI/YAML arguments, resolving defaults and overrides."""
+        root = root or os.getcwd()
+        script_path = getattr(args, "tdd_script", None) or DEFAULT_TDD_SCRIPT_PATH
+        test_globs = tuple(getattr(args, "tdd_test_glob", None) or DEFAULT_TEST_GLOBS)
+        if getattr(args, "no_tdd_doc_glob", False):
+            doc_globs = ()
+        else:
+            doc_globs = tuple(getattr(args, "tdd_doc_glob", None) or ())
+        raw_sources = getattr(args, "tdd_source_glob", None)
+        if raw_sources:
+            source_globs = tuple(raw_sources)
+        else:
+            sources = list(DEFAULT_SOURCE_GLOBS)
+            for fname in fnames or ():
+                if not isinstance(fname, str) or not fname.strip():
+                    continue
+                rel = _normalize_relpath(fname, root)
+                if rel.startswith("../") or rel == "..":
+                    continue
+                if any(fnmatch.fnmatchcase(rel, g) for g in test_globs):
+                    continue
+                if any(fnmatch.fnmatchcase(rel, g) for g in doc_globs):
+                    continue
+                if not any(fnmatch.fnmatchcase(rel, g) for g in sources):
+                    sources.append(rel)
+            source_globs = tuple(sources)
+        if not getattr(args, "test_cmd", None):
+            args.test_cmd = _default_test_cmd(root)
+        if not getattr(args, "auto_test", False):
+            args.auto_test = True
+        test_cmd = args.test_cmd
+        if not isinstance(test_cmd, str) or not supports_pytest(test_cmd):
+            raise ValueError("--tdd supports only a pytest --test-cmd (for example 'pytest -q').")
+        # Passing node IDs are needed to verify that the regression itself went green.
+        tokens = shlex.split(test_cmd)
+        end_of_options = tokens.index("--") if "--" in tokens else len(tokens)
+        if "-rA" not in tokens[:end_of_options]:
+            tokens.insert(end_of_options, "-rA")
+        args.test_cmd = shlex.join(tokens)
+        if edit_format == "architect":
+            raise ValueError("--tdd does not support the architect edit format.")
+        return cls(
+            test_globs=test_globs,
+            source_globs=source_globs,
+            doc_globs=doc_globs,
+            script_path=script_path,
+        )
+
+
+@dataclass(frozen=True)
+class FailedTest:
+    node_id: str
+    reason: str
+
+    @property
+    def assertion_like(self):
+        reason = self.reason.strip()
+        return reason.startswith(("assert", "AssertionError", "Failed: DID NOT RAISE")) or (
+            reason.startswith("TypeError:") and "unexpected keyword argument" in reason
+        )
+
+
+@dataclass(frozen=True)
+class RunClassification:
+    kind: RunKind
+    detail: str
+    command: str
+    exit_status: int
+    counts: dict = field(default_factory=dict)
+    failed: tuple[FailedTest, ...] = ()
+    excerpt: str = ""
+
+    @property
+    def summary_text(self):
+        return ", ".join(f"{n} {name}" for name, n in self.counts.items()) or "no summary"
+
+
+@dataclass
+class TddState:
+    phase: Phase = Phase.TEST_ONLY_EDIT
+    cycles: int = 1
+    corrections: int = 0
+    refactor_rechecks: int = 0
+    tests_edited: tuple[str, ...] = ()
+    docs_edited: tuple[str, ...] = ()
+    red: RunClassification | None = None
+    green: RunClassification | None = None
+    stop_reason: StopReason | None = None
+    stop_detail: str = ""
+    history: list = field(default_factory=list)  # (from_phase, to_phase, why)
+
+
+# ---- pytest parsing -------------------------------------------------------------------------
+
+_COUNT_WORDS = {"errors": "error", "warnings": "warning"}
+_SUMMARY = re.compile(r"^(no tests ran|\d+ \w+(?:, \d+ \w+)*) in [\d.]+s(?: \(\d+:\d+:\d+\))?$")
+_FAILED_LINE = re.compile(r"^FAILED (.+?)(?: - (.*))?$")
+_FAILURE_HEADER = re.compile(r"^_+\s+(.+?)\s+_+$")
+_SECTION_SEP = re.compile(r"^={3,}\s+.+\s+={3,}$")
+_E_LINE = re.compile(r"^E\s+(.+)$")
+_CRASH_LINE = re.compile(r"^([^\s:][^:]*):(\d+):\s*([A-Za-z_][\w.]*(?::.*)?)$")
+
+
+def supports_pytest(command):
+    """True if the command is recognisably a pytest invocation (the only supported runner)."""
+    if not isinstance(command, str) or re.search(r"[;&|<>\n\r`]|\$\(", command):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    executable = os.path.basename(tokens[0])
+    return executable in ("pytest", "py.test") or (
+        re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable) is not None
+        and tokens[1:3] == ["-m", "pytest"]
+    )
+
+
+def parse_pytest_summary(output):
+    """Counts from pytest's final summary line, {} for 'no tests ran', None if absent."""
+    for line in reversed(output.splitlines()[-40:]):
+        match = _SUMMARY.match(line.strip().strip("=").strip())
+        if not match:
+            continue
+        counts = {}
+        for number, word in re.findall(r"(\d+) (\w+)", match.group(1)):
+            counts[_COUNT_WORDS.get(word, word)] = int(number)
+        return counts
+    return None
+
+
+def _parse_failure_reasons(output):
+    """Extract full failure reasons from pytest FAILURES traceback blocks."""
+    by_file_and_header = {}
+    by_header = {}
+    header = None
+    e_reason = ""
+    crash_file = ""
+    crash_exc = ""
+    in_e_block = False
+
+    def flush():
+        nonlocal header, e_reason, crash_file, crash_exc, in_e_block
+        if header is not None:
+            reason = (e_reason or crash_exc).strip()
+            if reason:
+                by_header[header] = reason
+                if crash_file:
+                    norm_file = os.path.normpath(crash_file).replace(os.sep, "/")
+                    by_file_and_header[(norm_file, header)] = reason
+        header = None
+        e_reason = ""
+        crash_file = ""
+        crash_exc = ""
+        in_e_block = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if _SECTION_SEP.match(line):
+            flush()
+            continue
+        header_match = _FAILURE_HEADER.match(line)
+        if header_match:
+            flush()
+            header = header_match.group(1).strip()
+            continue
+        if header is None:
+            continue
+        e_match = _E_LINE.match(raw_line.lstrip())
+        if e_match:
+            if not in_e_block:
+                e_reason = e_match.group(1).strip()
+                in_e_block = True
+            continue
+        in_e_block = False
+        crash_match = _CRASH_LINE.match(line)
+        if crash_match and not crash_match.group(3).startswith("in "):
+            crash_file = crash_match.group(1).strip()
+            crash_exc = crash_match.group(3).strip()
+
+    flush()
+    return by_file_and_header, by_header
+
+
+def parse_failed_tests(output):
+    by_file_and_header, by_header = _parse_failure_reasons(output)
+    failed = []
+    for line in output.splitlines():
+        match = _FAILED_LINE.match(line.strip())
+        if match:
+            node_id = match.group(1).strip()
+            reason = (match.group(2) or "").strip()
+            if not reason or reason.endswith("..."):
+                parts = node_id.split("::")
+                file_part = os.path.normpath(parts[0]).replace(os.sep, "/")
+                header = ".".join(parts[1:])
+                tb_reason = by_file_and_header.get((file_part, header)) or by_header.get(header)
+                if tb_reason:
+                    reason = tb_reason
+            failed.append(FailedTest(node_id, reason))
+    return tuple(failed)
+
+
+def _excerpt(output, limit=6):
+    lines = [
+        line.strip()[:200]
+        for line in output.splitlines()
+        if line.startswith("E ") or "Error" in line or "ERROR" in line
+    ]
+    return "\n".join(lines[:limit])
+
+
+def classify_pytest_run(observation, edited_test_paths=()):
+    """Classify one pytest run as intended red, passed or unexpected (never a valid red)."""
+    output = re.sub(r"\x1b\[[0-9;]*m", "", observation.output)
+    status = observation.exit_status
+    summary = parse_pytest_summary(output)
+    counts = summary or {}
+    failed = parse_failed_tests(output)
+
+    def result(kind, detail, failures=()):
+        return RunClassification(
+            kind,
+            detail,
+            observation.command,
+            status,
+            counts,
+            tuple(failures),
+            _excerpt(output) if kind is RunKind.UNEXPECTED else "",
+        )
+
+    def unexpected(detail):
+        return result(RunKind.UNEXPECTED, detail, failed)
+
+    if status == 0:
+        if counts.get("passed", 0) > 0:
+            return result(RunKind.PASSED, "pytest passed.")
+        return unexpected("pytest exited 0 but no test passed (skipped or deselected only).")
+    if status != 1:
+        reasons = {
+            2: "test execution was interrupted or a collection/import error occurred",
+            3: "pytest hit an internal error",
+            4: "pytest was invoked incorrectly (usage error)",
+            5: "no tests were collected",
+        }
+        reason = reasons.get(status, "abnormal exit (crash, signal or timeout)")
+        return unexpected(f"pytest exit status {status}: {reason}.")
+    if summary is None:
+        return unexpected("no pytest summary line was found, so failures cannot be told apart.")
+    if counts.get("error"):
+        return unexpected(
+            f"pytest reported {counts['error']} error(s); errors are not test failures."
+        )
+    if not counts.get("failed"):
+        return unexpected("exit status 1 without any failed test.")
+    if not failed:
+        return unexpected("no 'FAILED <test id> - <reason>' lines found; run pytest with -rf.")
+    if len(failed) != counts["failed"]:
+        return unexpected("the output does not identify every failed test; use a focused run.")
+    non_assertion = [f for f in failed if not f.assertion_like]
+    if non_assertion:
+        listing = "; ".join(f"{f.node_id} ({f.reason or 'no reason shown'})" for f in non_assertion)
+        return unexpected(f"failures that are not assertion failures: {listing}.")
+    edited = {os.path.normpath(p).replace(os.sep, "/") for p in edited_test_paths}
+    if not any(f.node_id.split("::")[0] in edited for f in failed):
+        ids = ", ".join(f.node_id for f in failed)
+        return unexpected(
+            f"failing tests ({ids}) are not in the test files you edited "
+            f"({', '.join(sorted(edited)) or 'none'}); they may fail for another reason."
+        )
+    return result(RunKind.INTENDED_RED, "assertion failure(s) in edited test files.", failed)
+
+
+# ---- continuation text ----------------------------------------------------------------------
+
+NOT_APPLIED = (
+    "Your previous response was rejected before execution. NOT applied: none of its edits or "
+    "shell commands were applied, and the project files are unchanged by that response; use "
+    "the supplied file contents, not the rejected patch, as the current state. "
+)
+
+
+_EARLY_COMPLETION_RE = re.compile(
+    r"\b(?:i am done|i'm done|all done|everything already works|final report)\b",
+    re.IGNORECASE,
+)
+
+
+def _failed_listing(failed):
+    return "\n".join(f"- {f.node_id}: {f.reason or 'no reason shown'}" for f in failed)
+
+
+def _run_line(run):
+    return f"`{run.command}` finished with exit status {run.exit_status} ({run.summary_text})."
+
+
+class TddController:
+    """State machine over generic hooks; one instance serves one session.
+
+    Registered as three hooks (see hook_kwargs): the instance itself as a response hook
+    (to retain the report text), check_edits as an edit hook and observe_test as a
+    test-result hook. It deliberately has no prompt_reminder, so Aider's edit-format
+    reminder is never replaced; guidance is carried by the literal continuations.
+    """
+
+    call_on_empty = True
+
+    def __init__(self, config, *, citation_validator=None):
+        self.config = config
+        self.citation_validator = citation_validator
+        self.state = TddState()
+        self._response_text = ""
+
+    def hook_kwargs(self):
+        return {
+            "response_hooks": (self,),
+            "edit_hooks": (self.check_edits,),
+            "test_result_hooks": (self.observe_test,),
+        }
+
+    def phase_guidance(self):
+        """Return explicit phase-specific TDD instructions for post-search or turn continuations."""
+        s = self.state
+        tdd = self.config
+        tests = ", ".join(tdd.test_globs)
+        sources = ", ".join(tdd.source_globs)
+        docs = ", ".join(tdd.doc_globs)
+        if s.phase is Phase.TEST_ONLY_EDIT:
+            forbidden = f"production source files ({sources})" + (
+                f" or documentation files ({docs})" if docs else ""
+            )
+            return (
+                f"TDD phase: test_only_edit. Your next response MUST edit ONLY test files "
+                f"matching {tests} to add a failing test for the requested behavior. Do NOT edit "
+                f"{forbidden} in this turn; any combined or production edit will be rejected "
+                "before execution."
+            )
+        if s.phase in (Phase.RED_OBSERVED, Phase.IMPLEMENT, Phase.REFACTOR_RECHECK):
+            doc_instruction = (
+                f" and required documentation files matching {docs}"
+                if docs and not s.docs_edited
+                else (f" (and optionally documentation files matching {docs})" if docs else "")
+            )
+            return (
+                f"TDD phase: {s.phase.value}. Intended red test failure observed. Now edit "
+                f"production source files matching {sources}{doc_instruction} to make the "
+                f"failing test pass. Do NOT edit test files ({tests}) in this step."
+            )
+        if s.phase is Phase.REPORT:
+            if docs and not s.docs_edited:
+                return (
+                    f"TDD phase: report. All tests passed (green observed), but required "
+                    f"documentation files matching {docs} have not been updated yet. Edit {docs} "
+                    "now (tests will re-run automatically) before submitting the final report."
+                )
+            return (
+                "TDD phase: report. All tests passed (green observed). Do NOT propose further "
+                "edits; provide the final completion report citing the returned Oracle passage "
+                "IDs and source URIs, plus before/after test results."
+            )
+        return ""
+
+    # -- plain-data view -----------------------------------------------------------------
+
+    def snapshot(self):
+        s = self.state
+
+        def run(r):
+            return r and {
+                "kind": r.kind.value,
+                "command": r.command,
+                "exit_status": r.exit_status,
+                "counts": dict(r.counts),
+                "failed_tests": [f.node_id for f in r.failed],
+            }
+
+        return {
+            "phase": s.phase.value,
+            "stop_reason": s.stop_reason.value if s.stop_reason else None,
+            "stop_detail": s.stop_detail,
+            "cycles": s.cycles,
+            "corrections": s.corrections,
+            "refactor_rechecks": s.refactor_rechecks,
+            "tests_edited": list(s.tests_edited),
+            "docs_edited": list(s.docs_edited),
+            "red": run(s.red),
+            "green": run(s.green),
+            "budgets": {
+                "max_cycles": self.config.max_cycles,
+                "max_corrections": self.config.max_corrections,
+                "max_refactor_rechecks": self.config.max_refactor_rechecks,
+            },
+        }
+
+    # -- transitions ---------------------------------------------------------------------
+
+    def _move(self, phase, why):
+        self.state.history.append((self.state.phase, phase, why))
+        self.state.phase = phase
+
+    def _abort(self, reason, detail, io=None):
+        s = self.state
+        s.stop_reason, s.stop_detail = reason, detail
+        self._move(Phase.ABORTED, reason.value)
+        self._report_stop(io)
+
+    def _report_stop(self, io):
+        if io is not None:
+            io.tool_error(
+                f"TDD workflow stopped ({self.state.stop_reason.value}): "
+                f"{self.state.stop_detail}"
+            )
+
+    def _charge(self, io=None):
+        """Count one correction; True if the budget is exhausted (workflow aborted)."""
+        s = self.state
+        s.corrections += 1
+        if s.corrections > self.config.max_corrections:
+            self._abort(
+                StopReason.CORRECTION_BUDGET,
+                f"more than {self.config.max_corrections} rejected edits or invalid runs.",
+                io,
+            )
+            return True
+        return False
+
+    def _new_cycle(self, why, io=None):
+        s = self.state
+        if s.cycles + 1 > self.config.max_cycles:
+            self._abort(
+                StopReason.CYCLE_BUDGET,
+                f"a new red cycle would exceed the limit of {self.config.max_cycles}.",
+                io,
+            )
+            return False
+        s.cycles += 1
+        s.red = s.green = None
+        s.tests_edited = ()
+        self._move(Phase.TEST_ONLY_EDIT, why)
+        return True
+
+    def _veto(self, text, io=None):
+        if self._charge(io):
+            return ResponseHookResult()
+        return ResponseHookResult(NOT_APPLIED + text)
+
+    def _scope(self, path):
+        if os.path.isabs(path) or path == ".." or path.startswith("../"):
+            return "outside"
+        is_test = any(fnmatch.fnmatchcase(path, g) for g in self.config.test_globs)
+        is_source = any(fnmatch.fnmatchcase(path, g) for g in self.config.source_globs)
+        is_doc = any(fnmatch.fnmatchcase(path, g) for g in self.config.doc_globs)
+        if (is_test + is_source + is_doc) > 1:
+            return "ambiguous"
+        return "test" if is_test else "source" if is_source else "doc" if is_doc else "outside"
+
+    def _unmet_requirements(self, content="", *, check_completion=False):
+        s = self.state
+        tdd = self.config
+        unmet = []
+        if check_completion and not content.strip():
+            unmet.append("the final completion report is empty")
+        if s.red is None:
+            unmet.append(
+                f"no observed red test yet (edit only {', '.join(tdd.test_globs)} and observe an "
+                "assertion failure first; regression coverage is not satisfied by an old suite passing)"
+            )
+        if s.green is None:
+            unmet.append(
+                "no current observed green test run after the latest edits (an old or stale "
+                "passing run does not satisfy verification)"
+            )
+        if check_completion and tdd.doc_globs and not s.docs_edited:
+            unmet.append(
+                f"configured documentation scope ({', '.join(tdd.doc_globs)}) has not been updated "
+                "(a changed docs file alone is not proof its claims are correct; verify every claim)"
+            )
+        if self.citation_validator is not None and content:
+            unknown = tuple(self.citation_validator(content) or ())
+            if unknown:
+                unmet.append(
+                    f"cited passage ID(s) {', '.join(unknown)} were never returned in this "
+                    "session (cite only returned passage IDs and origins; valid passage identity "
+                    "does not prove semantic support)"
+                )
+        if check_completion and tdd.require_citation and self.citation_validator is not None:
+            if not re.search(r"\b[0-9a-f]{24}\b", content):
+                unmet.append(
+                    "final report must cite at least one returned 24-hex Oracle passage ID"
+                )
+        return tuple(unmet)
+
+    # -- response hook -------------------------------------------------------------------
+
+    def _complete_report(self, text, io):
+        unmet = self._unmet_requirements(text, check_completion=True)
+        if unmet:
+            if self._charge(io):
+                return ResponseHookResult()
+            items = "\n".join(f"- {item}" for item in unmet)
+            return ResponseHookResult(
+                "Workflow is NOT complete. Unmet requirements:\n"
+                f"{items}\n"
+                "Note: regression coverage, documentation and the final report are not "
+                "satisfied by an old suite passing; a changed docs file alone is not proof "
+                "its claims are correct; and valid passage identity does not prove semantic "
+                "support. Next action: satisfy the unmet requirements above before "
+                "submitting the final report."
+            )
+        self._move(Phase.DONE, "report response")
+        return None
+
+    def __call__(self, content, *, token_count=None, io=None):
+        s = self.state
+        text = (content or "").strip()
+        self._response_text = text
+        if text.startswith("<oracle_search>") or re.match(r"```\w*\s*<oracle_search>", text):
+            return None
+        if s.phase is Phase.REPORT:
+            # Completion is decided by check_edits after the core parser distinguishes
+            # actual edits from reports, including reports with fenced examples.
+            return None
+        if (
+            s.phase
+            in (Phase.TEST_ONLY_EDIT, Phase.RED_OBSERVED, Phase.IMPLEMENT, Phase.REFACTOR_RECHECK)
+            and "```" not in text
+            and _EARLY_COMPLETION_RE.search(text)
+        ):
+            unmet = self._unmet_requirements(text, check_completion=True)
+            if unmet:
+                if self._charge(io):
+                    return ResponseHookResult()
+                items = "\n".join(f"- {item}" for item in unmet)
+                return ResponseHookResult(
+                    "Workflow is NOT complete. Unmet requirements:\n"
+                    f"{items}\n"
+                    "Next action: complete the required TDD steps before finishing."
+                )
+        return None
+
+    # -- edit hook -----------------------------------------------------------------------
+
+    def check_edits(self, proposal, *, io=None):
+        s = self.state
+        if s.phase is Phase.ABORTED:
+            self._report_stop(io)
+            return ResponseHookResult()
+        if s.phase is Phase.DONE and (proposal.paths or proposal.shell_commands):
+            if not self._new_cycle("edit after the completed workflow", io):
+                return ResponseHookResult()
+
+        tests, sources, docs, bad = [], [], [], []
+        for path in proposal.paths:
+            scope = self._scope(path)
+            {"test": tests, "source": sources, "doc": docs}.get(scope, bad).append(path)
+        tdd = self.config
+        if bad:
+            doc_info = f" Doc globs: {', '.join(tdd.doc_globs)}." if tdd.doc_globs else ""
+            return self._veto(
+                f"These paths are outside the configured TDD scope or match multiple scopes: "
+                f"{', '.join(bad)}. Test globs: {', '.join(tdd.test_globs)}. Source globs: "
+                f"{', '.join(tdd.source_globs)}.{doc_info} Next action: edit only files in those scopes.",
+                io,
+            )
+        if tests and (sources or docs):
+            other = sources + docs
+            return self._veto(
+                f"Combined test and production edits are not allowed (tests: "
+                f"{', '.join(tests)}; production/docs: {', '.join(other)}). Next action: send "
+                "the test-only edit in this response, and make production changes in a separate "
+                "response after the failing test has been observed.",
+                io,
+            )
+        in_test_phase = s.phase is Phase.TEST_ONLY_EDIT
+        if proposal.shell_commands and in_test_phase:
+            commands = "; ".join(c.strip() for c in proposal.shell_commands)
+            return self._veto(
+                f"Shell commands ({commands}) are not allowed before a failing test has been "
+                "observed; the configured test command runs automatically after each edit. "
+                "Next action: reply with the test-only edit and no shell commands.",
+                io,
+            )
+        if not tests and not sources and not docs:
+            if s.phase is Phase.REPORT and not proposal.shell_commands:
+                return self._complete_report(self._response_text, io)
+            if s.phase in (Phase.TEST_ONLY_EDIT, Phase.RED_OBSERVED, Phase.IMPLEMENT):
+                return self._veto(
+                    f"No file edits were found in your response during TDD phase "
+                    f"{s.phase.value}. {self.phase_guidance()}",
+                    io,
+                )
+            return None
+
+        if tests:
+            if not in_test_phase and not self._new_cycle("test edit invalidates red/green", io):
+                return ResponseHookResult()
+            s.green = None
+            s.tests_edited = tuple(dict.fromkeys(s.tests_edited + tuple(tests)))
+            return None
+
+        if in_test_phase:
+            targets = sources + docs
+            return self._veto(
+                f"Production edit to {', '.join(targets)} is not allowed yet: the phase is "
+                "test_only_edit and no failing test has been observed. Next action: edit only "
+                f"test files ({', '.join(tdd.test_globs)}) to add a test that fails with an "
+                "assertion against the current implementation; do not touch production files "
+                "in that response.",
+                io,
+            )
+        if docs:
+            s.docs_edited = tuple(dict.fromkeys(s.docs_edited + tuple(docs)))
+        if s.phase is Phase.REPORT:
+            if sources:
+                if s.refactor_rechecks + 1 > tdd.max_refactor_rechecks:
+                    self._abort(
+                        StopReason.REFACTOR_BUDGET,
+                        f"more than {tdd.max_refactor_rechecks} refactor rechecks.",
+                        io,
+                    )
+                    return ResponseHookResult()
+                s.refactor_rechecks += 1
+            self._move(Phase.REFACTOR_RECHECK, "production edit after green")
+        elif s.phase is Phase.RED_OBSERVED:
+            self._move(Phase.IMPLEMENT, "production edit after observed red")
+        s.green = None
+        return None
+
+    # -- test-result hook ----------------------------------------------------------------
+
+    def observe_test(self, observation, *, io=None):
+        s = self.state
+        if s.phase is Phase.TEST_ONLY_EDIT and s.tests_edited:
+            expect_red = True
+        elif s.phase in (Phase.IMPLEMENT, Phase.REFACTOR_RECHECK):
+            expect_red = False
+        else:
+            return None  # a manual run outside any expectation
+        if not supports_pytest(observation.command):
+            self._abort(
+                StopReason.UNSUPPORTED_RUNNER,
+                f"only pytest test commands are supported, but the test command is "
+                f"{observation.command!r}; red and green cannot be classified.",
+                io,
+            )
+            return None
+        run = classify_pytest_run(observation, s.tests_edited)
+        tdd = self.config
+
+        if expect_red:
+            if run.kind is RunKind.INTENDED_RED:
+                s.red = run
+                self._move(Phase.RED_OBSERVED, "intended red observed")
+                doc_note = (
+                    f" Also update required documentation ({', '.join(tdd.doc_globs)}) in this "
+                    "step or immediately after green."
+                    if tdd.doc_globs and not s.docs_edited
+                    else ""
+                )
+                return ResponseHookResult(
+                    f"Observed red: {_run_line(run)} Failed tests:\n{_failed_listing(run.failed)}\n"
+                    "This is the expected red. Next action: make the smallest production change "
+                    f"({', '.join(tdd.source_globs)}) that makes these tests pass.{doc_note} Do not "
+                    "edit test files in this step; the test command runs automatically afterwards."
+                )
+            if self._charge(io):
+                return None
+            if run.kind is RunKind.PASSED:
+                return ResponseHookResult(
+                    f"Test did not fail: not valid red. {_run_line(run)} The new test must fail "
+                    "against the current implementation. Next action: edit only test files "
+                    f"({', '.join(tdd.test_globs)}) so a test fails with an assertion; do not "
+                    "change production code."
+                )
+            return ResponseHookResult(
+                f"Unexpected result, not a valid red: {_run_line(run)} {run.detail}\n"
+                f"Relevant output:\n{run.excerpt or '(none)'}\n"
+                "Next action: edit only test files so the test runs and fails with an assertion "
+                "(no import, collection or syntax errors); do not change production code."
+            )
+
+        if run.kind is RunKind.PASSED:
+            output = re.sub(r"\x1b\[[0-9;]*m", "", observation.output)
+            passed = {
+                line.strip()[len("PASSED ") :]
+                for line in output.splitlines()
+                if line.strip().startswith("PASSED ")
+            }
+            missing = [f.node_id for f in s.red.failed if f.node_id not in passed] if s.red else []
+            if missing:
+                if self._charge(io):
+                    return None
+                return ResponseHookResult(
+                    f"Green is unverified: {_run_line(run)} No PASSED result was observed for "
+                    f"previously failing test(s): {', '.join(missing)}. Keep these tests enabled "
+                    "and run pytest with -rA so their individual outcomes are included. Skipped, "
+                    "xfailed, xpassed or deselected regressions do not satisfy green. If output "
+                    "was truncated, use a focused test command that includes these tests."
+                )
+            s.green = run
+            self._move(Phase.REPORT, "green observed")
+            before_line = _run_line(s.red) if s.red else "(none recorded)"
+            earlier = _failed_listing(s.red.failed) if s.red else "(none recorded)"
+            doc_req = (
+                f"- Documentation scope ({', '.join(tdd.doc_globs)}): "
+                f"{'updated (' + ', '.join(s.docs_edited) + ')' if s.docs_edited else 'UNMET (not yet updated)'}. "
+                "A changed docs file alone is not proof its claims are correct.\n"
+                if tdd.doc_globs
+                else "- Documentation: update any in-scope docs if requested; a changed docs file "
+                "alone is not proof its claims are correct.\n"
+            )
+            next_action = (
+                f"Next action: required documentation ({', '.join(tdd.doc_globs)}) is still UNMET. "
+                f"Edit {', '.join(tdd.doc_globs)} now to document the change accurately (tests "
+                "will re-run automatically), and only provide the final report after "
+                "documentation is updated."
+                if tdd.doc_globs and not s.docs_edited
+                else "Next action: review the change for refactoring or remaining doc updates. If "
+                "you refactor or update docs, edit production/doc files only (tests re-run "
+                "automatically). Otherwise reply without edits with the final report: what "
+                "changed, which test was red then green, and any skipped tests."
+            )
+            return ResponseHookResult(
+                f"Observed green: {_run_line(run)}\n"
+                f"Before (observed red): {before_line}\n"
+                f"Previously failing tests:\n{earlier}\n"
+                f"After (observed green): {_run_line(run)}\n"
+                "Task completion checklist (regression coverage, documentation and final report "
+                "are not satisfied by an old suite passing):\n"
+                f"- Regression coverage: new/updated test observed red then green.\n"
+                f"{doc_req}"
+                "- Grounded citations & report: cite only passage IDs and origins actually "
+                "returned in this session (valid passage identity does not prove semantic support).\n"
+                f"{next_action}"
+            )
+        if self._charge(io):
+            return None
+        failures = _failed_listing(run.failed) if run.failed else f"Relevant output:\n{run.excerpt}"
+        return ResponseHookResult(
+            f"Tests are not passing after your change: {_run_line(run)} {run.detail}\n{failures}\n"
+            "Next action: fix the production code so the test command passes; do not edit tests."
+        )
+
+
+def load_tdd_controller_class(script_path=None):
+    """Load TddController from the default Aider module or a custom --tdd-script path."""
+    if not script_path:
+        return TddController
+    resolved = Path(script_path).expanduser().resolve()
+    if str(resolved) == DEFAULT_TDD_SCRIPT_PATH:
+        return TddController
+    if not resolved.is_file():
+        raise ValueError(f"TDD script not found: {script_path}")
+    module_name = f"aider_custom_tdd_{uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, str(resolved))
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Cannot load TDD script: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        controller_cls = getattr(module, "TddController", None)
+        if not isinstance(controller_cls, type):
+            raise ValueError(f"TDD script {script_path} does not define a TddController class.")
+    except BaseException:
+        # Failed imports must not leave half-initialized modules behind, including
+        # when the user interrupts the script while it is loading.
+        sys.modules.pop(module_name, None)
+        raise
+    return controller_cls

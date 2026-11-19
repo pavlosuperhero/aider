@@ -99,6 +99,12 @@ def get_parser(default_config_files, git_root):
         help="Maximum model-requested refreshes per turn (1–3; shares the reflection limit)",
     )
     group.add_argument(
+        "--oracle-require-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require a nonempty focused search result each turn with adaptive Oracle",
+    )
+    group.add_argument(
         "--oracle-source",
         action="append",
         default=[],
@@ -109,6 +115,48 @@ def get_parser(default_config_files, git_root):
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Continue without evidence if Oracle retrieval fails (default: cancel the turn)",
+    )
+    group.add_argument(
+        "--oracle-doc",
+        default=None,
+        help="Load an additional read-only Oracle reference document, like --read (default: none)",
+    )
+
+    group = parser.add_argument_group("TDD workflow (opt-in)")
+    group.add_argument(
+        "--tdd",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enforce a test-first workflow (pytest only; uses smart defaults when globs/test-cmd are omitted)",
+    )
+    group.add_argument(
+        "--tdd-script",
+        default=None,
+        help="Path to the TDD controller Python script (default: <aider-repo>/aider/tdd.py)",
+    )
+    group.add_argument(
+        "--tdd-test-glob",
+        action="append",
+        default=None,
+        help="Glob for test files, relative to the project root (repeatable; default: tests/*)",
+    )
+    group.add_argument(
+        "--tdd-source-glob",
+        action="append",
+        default=None,
+        help="Glob for production files, relative to the project root (repeatable; default: aider/*, src/*, lib/*, app/*, pkg/*)",
+    )
+    group.add_argument(
+        "--tdd-doc-glob",
+        action="append",
+        default=None,
+        help="Optional glob for documentation files, relative to the project root (repeatable; default: none)",
+    )
+    group.add_argument(
+        "--no-tdd-doc-glob",
+        action="store_true",
+        default=False,
+        help="Disable any configured TDD documentation glob requirement",
     )
 
     group = parser.add_argument_group("API Keys and settings")

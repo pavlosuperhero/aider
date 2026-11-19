@@ -11,10 +11,17 @@ module supplies to the coding model. This Markdown guide describes that policy;
 it is not automatically loaded as a model instruction or ingested into Oracle.
 The trial's `--message-file` explicitly supplies its task prompt. A Markdown
 file needed for another task can be added explicitly with Aider's `--read`
-option; reference documents remain read-only.
+option or `--oracle-doc path/to/reference.md`; reference documents remain read-only.
+`--oracle-doc` has no default file and adds reference context through the same
+read-only path as `--read`. It does not replace the versioned system policy.
+An explicitly supplied document must exist; its path is resolved from the
+current directory, with `~` expanded.
 
-The model receives the policy, bounded cited foundation passages and an allowed
-source catalog, alongside the project context Aider already supplies. It then
+The adaptive action policy is appended to Aider's system instructions after
+successful foundation initialization. Models without a system role receive it
+through Aider's existing instruction fallback. Retrieved passages and the source
+catalog stay in read-only reference messages; they are never promoted into the
+system instructions. The model receives these alongside the project context. It then
 produces either an ordinary coding response or an exact focused-search request.
 The adapter validates the latter before any edit processing.
 
@@ -32,21 +39,200 @@ The default `adaptive` mode combines mandatory foundations with focused refreshe
    reuse it without repeating HTTP queries or duplicating it in chat history.
    It still occupies model context. Start a new Aider session to reload these
    references after changing the Oracle index or available source catalog.
-3. Aider supplies the project code normally. The model reads it and requests
-   additional knowledge only for unresolved architecture, unfamiliar APIs or
-   PEPs, uncertain documented behavior, or a debugging hypothesis needing
-   external evidence. Mechanical edits need no additional search.
+3. Aider supplies the project code normally. Before proposing a change that
+   depends on a dependency, API or standard's documented behavior, the policy
+   instructs the model to refresh the relevant contract even when it feels
+   confident. Applicable evidence already retrieved for the same question and
+   version can be reused. Unresolved architecture decisions and debugging
+   hypotheses may also need external evidence. Mechanical edits supported by
+   the existing context need no additional search.
 4. The model can emit one exact `<oracle_search>` envelope containing a JSON
    `query` and catalog `source`. Aider validates it, queries Oracle and supplies
    the cited evidence in a continuation before applying any edits. This is a
    text protocol handled by the module, not a shell command or a LiteLLM plugin.
    There is no separate planning-model call on every turn.
 
-The policy explicitly explains that books supply general principles rather
-than project files. It asks the model to connect relevant principles to actual
-code and identify a real mismatch instead of dismissing a source merely for
-not mentioning the repository. The model may still choose poor queries or
-misapply a principle; the mechanism does not guarantee better reasoning.
+The policy asks the model to connect relevant principles to actual code and
+report evidence gaps. By default this is a model-followed action protocol; an
+ordinary response can still omit a lookup. For tasks that require fresh evidence,
+enable `--oracle-require-search` as described below. Neither mode verifies that
+the model chose a relevant passage or applied it correctly. Tests and review
+remain necessary.
+
+### Require retrieval before accepting a response
+
+Use `--oracle --oracle-require-search` for an adaptive session where each normal
+user turn must include a successful focused lookup. This uses the existing
+response interception point before Aider parses edits or dispatches commands;
+it is not a Git hook or a user-supplied shell hook.
+
+Required foundations alone do not satisfy this condition. If the model skips
+the lookup, the module holds its response and sends one corrective continuation.
+A second skipped lookup stops the turn without applying those responses.
+Empty results and failed lookups do not satisfy the condition. The existing
+search and reflection limits still bound the interaction. The condition resets
+for the next user turn, while internal reflections share its state.
+
+While a lookup is pending, Oracle replaces the normal edit reminder with the
+search protocol through a generic hook method. This uses Aider's configured
+reminder channel and token checks, so ordinary edit instructions no longer
+follow the search correction. Once focused evidence arrives, the normal edit
+reminder returns. A rejected response explicitly reports that none of its
+proposed edits or commands were applied; the model must use the actual supplied
+file contents rather than assume its previous patch was accepted.
+
+This setting defaults to false and requires adaptive mode with fail-open
+disabled. Use it explicitly for evidence-dependent work; ordinary adaptive mode
+still permits mechanical edits without another lookup. A successful lookup
+proves that reference material was returned, not that it supports the patch.
+The guard does not establish task completion, citation accuracy or test quality.
+
+The placement follows the existing module boundaries: `OracleSession` owns the
+retrieval precondition and `OracleResponseHook` translates its result. Aider only
+dispatches generic response hooks before applying edits. Oracle's *Think Python*, PDF p. 58, passage
+`37125e7b0eee4eebee434db3`, defines interface preconditions and postconditions;
+p. 81, `0284bd306f4d5bc7d5237220`, describes guardian checks. The *Clean
+Architecture* blog, passage `a892b437bacbc32f4e64e3db` (no page/line locator),
+separates use-case orchestration from external-service adapters. *Cosmic Python*,
+"Our First Use Case: Flask API and Service Layer", passage
+`354853d1e08d13856ad0eb16` (no page/line locator), supports testing orchestration
+in memory. These principles inform the implementation; they do not establish
+that retrieval improves a model's reasoning.
+
+### Generic response hooks
+
+The scripting API accepts `Coder.create(..., response_hooks=(callback,))`.
+A callback receives `content` and keyword-only `token_count` and `io` arguments.
+Return `None` to let the next hook run, or
+`aider.hooks.ResponseHookResult(continuation="...")` to hold the response and
+ask the model to continue. `ResponseHookResult()` stops the turn. The first
+interception ends dispatch for that response; ordinary reflection limits bound
+continuations. Held responses do not reach edit or command processing.
+
+A callable hook may optionally implement `prompt_reminder()`. Return literal
+text to replace the edit reminder, or `None` to keep the default. The first
+override wins; literal JSON braces are preserved. This method supplies
+instructions only: it does not retrieve evidence or satisfy a response guard.
+
+Oracle registers its callback only for an enabled adaptive provider. Aider
+without Oracle has no Oracle callback; other callers may register their own
+callbacks independently. Coder clones preserve callbacks and Oracle's shared
+session state. This is an in-process extension point, not arbitrary shell-hook
+execution. The Oracle lookup requirement, error handling and corrective prompt
+all live in the Oracle module.
+
+### Generic test-result hooks
+
+`Coder.create(..., test_result_hooks=(callback,))` lets an optional module observe
+each `/test` or auto-test run, passing or failing. A callback is called as
+`callback(observation, io=io)` with an immutable `aider.hooks.TestRunObservation`
+(`command`, `cwd`, `exit_status`, `output`, `truncated`). `output` keeps the last
+20,000 characters. Return `None` for no change, or
+`ResponseHookResult(continuation="...")` to send that text as the next reflected
+message, even when tests passed. The first continuation wins and counts against
+`max_reflections`; no new loop exists. Hooks never change what `/test` prints or
+returns, and without hooks behavior is unchanged. A continuation is applied by the
+auto-test flow only; `/test` just notifies hooks. If the continuation turn edits
+files, auto-test runs again; core does not retain earlier green results. Hooks do
+not enable tests: `--auto-test`/`--test-cmd` still decide that.
+
+### Generic edit hooks and TDD workflow
+
+`Coder.create(..., edit_hooks=(callback,))` runs before file creation, dirty commits,
+file writes, auto-commits or suggested shell commands. Each callback receives an
+immutable `aider.hooks.EditProposal(paths, shell_commands)` with normalized,
+project-relative paths and returns `None` or `ResponseHookResult`. A veto drops
+the response's edits and shell commands and reports that nothing was applied.
+
+`aider/tdd.py` composes `response_hooks`, `edit_hooks` and `test_result_hooks`
+into an optional test-first controller (`TddController`), enabled with `--tdd`
+(or `tdd: true` in `.aider.conf.yml`; override with `--no-tdd` or
+`AIDER_TDD=false`). Options and smart defaults (each overridable via CLI flag or
+YAML):
+
+- `--tdd` / `--no-tdd`: enable or disable the TDD workflow (default: false).
+  Enabling `--tdd` automatically enables `--auto-test`.
+- `--tdd-script`: path to the TDD controller Python script (default:
+  `<aider-repo>/aider/tdd.py`, resolved via `Path(__file__).resolve()` from the
+  installed Aider repository regardless of your terminal's current working
+  directory; override with `--tdd-script /custom/path/to/my_tdd.py`).
+- `--oracle-doc`: optional read-only reference document, equivalent to adding a
+  file with `--read` (default: none). Relative paths use the current directory;
+  missing files are refused. The file supplies reference context, not trusted
+  system instructions.
+- `--tdd-test-glob`: repeatable fnmatch glob for test files (default: `tests/*`;
+  override with `--tdd-test-glob <glob>`).
+- `--tdd-source-glob`: repeatable fnmatch glob for production files (default:
+  `aider/*`, `src/*`, `lib/*`, `app/*`, `pkg/*`, plus any non-test/non-doc chat
+  files passed on the command line; override with `--tdd-source-glob <glob>`).
+- `--tdd-doc-glob` / `--no-tdd-doc-glob`: repeatable fnmatch glob for
+  documentation files in scope (default: `()`, disabled unless specified for the
+  target project; enable with `--tdd-doc-glob <glob>` or disable any configured
+  YAML glob with `--no-tdd-doc-glob`).
+- `--test-cmd`: a direct `pytest` or `python -m pytest` invocation (default:
+  `.venv/bin/python -m pytest -q -rA` when the project root contains
+  `.venv/bin/python`, otherwise `pytest -q -rA`; override with `--test-cmd <cmd>`).
+  TDD adds `-rA` to include individual test outcomes. Shell pipelines and compound
+  commands, non-pytest runners and `--edit-format architect` are refused.
+
+Source-glob expansion and virtual-environment detection use the same project root
+as the edit/test runner, including when Aider starts in a nested directory. The
+custom TDD script path remains relative to the current directory unless absolute.
+
+Observable phases (`TddState.phase`):
+
+1. `test_only_edit`: only paths matching `--tdd-test-glob` may be edited. Production/doc
+   edits, combined test+production patches, out-of-scope or ambiguous paths, and shell
+   commands before red are vetoed before any write.
+2. `red_observed`: reached only after an intended pytest red run (exit status 1, no
+   collection/setup errors, assertion-like `FAILED <node_id> - <reason>` lines in edited
+   test files). Passing runs, exit codes `>=2`, or failures outside edited tests are
+   rejected as invalid red.
+3. `implement`: production/doc edits after `red_observed` trigger the configured pytest
+   command. Further test edits invalidate red/green and start a new cycle.
+4. `report` and `refactor_recheck`: a passing pytest run after `implement` moves to
+   `report` only when each previously failing node has an individual `PASSED`
+   result. Skipped, xfailed, xpassed, deselected or missing regression nodes do
+   not satisfy green; unrelated skipped tests are allowed. Missing node results
+   after output truncation leave green unverified; use a focused test command.
+   The continuation supplies the actual before (red) and after (green)
+   commands, exit statuses, failed test node IDs and reasons, and a visible completion
+   checklist reminder that regression coverage, documentation and the final report are
+   not satisfied by an old suite passing. Further production/doc edits move to
+   `refactor_recheck` and invalidate green until pytest passes again.
+5. `done` / `aborted`: after edit parsing, a non-edit report response with all
+   requirements met moves to `done`, including reports containing fenced examples.
+   Early completion claims, stale green results, untouched `--tdd-doc-glob`
+   files, or fabricated passage citations report explicit unmet requirements. Exhausted
+   cycle, correction or refactor budgets (or a non-pytest runner) move to `aborted` with
+   an explicit `StopReason`.
+
+When composing `TddController.hook_kwargs()` through the scripting API, configure
+pytest with `-rA` as well. CLI setup adds this flag automatically. The controller
+reads the bounded observation output; it cannot verify outcomes that are absent
+from that output. These checks assume genuine pytest output and do not establish
+that a model-generated test is meaningful.
+
+### Citation grounding and completion limits
+
+`OracleSession` records each returned foundation and focused passage in
+`session.evidence` (`PassageEvidence` with `id`, `title`, `source`, `source_uri`,
+`citation` and locators). `OracleSession.unknown_cited_ids(text)` detects 24-hex
+passage IDs cited in a model response that were never returned in the current
+session. Both `OracleSession.respond` and `TddController` (via an injected
+`citation_validator` callback composed in `aider/main.py`) reject responses that
+cite unknown or fabricated passage IDs. Setting `TddConfig(require_citation=True)`
+additionally requires the final completion report to cite at least one returned
+24-hex Oracle passage ID when a `citation_validator` is present.
+
+What is **not** enforced by code:
+
+- Valid passage identity proves that a passage ID was returned in the session; it
+  does **not** prove semantic support for the model's claim.
+- Touching a file matching `--tdd-doc-glob` proves the file was edited; it does
+  **not** prove that the documentation claims are accurate.
+- Observing a red-then-green assertion proves test execution sequence; it does
+  **not** guarantee that the test is meaningful or the implementation is bug-free.
 
 ### Concrete search decisions
 
@@ -77,13 +263,21 @@ user message. Commands and internal editor messages do not trigger a new
 initial retrieval; architect/editor clones still receive pinned foundations.
 
 The routing instructions live in `aider/oracle_prompts.py`, version
-`foundation-refresh-v2`. Oracle's retrieved *Google Prompt Engineering*, PDF pp. 18–19, passages
+`foundation-refresh-v5`. Oracle's retrieved *Google Prompt Engineering*, PDF pp. 18–19, passages
 `8421356d1139085ef9e033ec` and `772852df727c4d9b3f1c5c00`, supports providing
 clear purpose, task context and output instructions; it does not establish
 the correctness of these particular routing decisions. Its p. 65, passage
 `90595d98465d965c36f7c6b0`, supports testing prompt changes and tracking RAG
 settings. Tests verify mandatory initialization, request validation and
 continuation behavior; a real-model trial is needed to assess query quality.
+Its p. 37, passage `a6d4e6e89737d00ed31c0eac`, describes the tool
+action/observation loop; p. 56, passage `bac1d6367a4987d87c1f7f18`, supports
+specific output instructions. These informed v3's pre-edit search example and
+normal-edit continuation. They do not establish that v3 improves this model's
+behavior; compare fresh trials with the recorded v2 checkpoints.
+Version v5 applies the same action/observation principle to explicit rejection
+feedback and a pending-search reminder. Tests verify outgoing message order;
+they do not establish that a live model will follow the corrected instructions.
 
 ## Flags and configuration
 
@@ -129,8 +323,11 @@ No raw-token flag is provided.
 | `oracle-source` | none | Repeatable path substring filters, at most eight |
 | `oracle-fail-open` | false | On failure, cancel the turn; true warns and continues without the failed lookup |
 | `oracle-mode` | adaptive | Required foundations plus focused requests; `always` retrieves each user message |
+| `oracle-require-search` | false | Require successful nonempty focused retrieval each user turn; adaptive mode only, incompatible with fail-open |
 | `oracle-foundation-source` | clean-architecture, think-python | 1–4 required initial source filters, independently configured from refresh filters |
 | `oracle-max-searches` | 2 | 1–3 focused refreshes per user turn, also bounded by Aider's existing reflection limit |
+| `oracle-doc` | none | Optional existing read-only reference document; same context path as `--read`, with relative paths resolved from the current directory |
+| `tdd-script` | `<aider-repo>/aider/tdd.py` | Path to the TDD controller Python script (resolved from the installed Aider repo, overridable via `--tdd-script` or YAML) |
 
 Source filters use Oracle's **source path substring** semantics, not an exact
 catalog identity. In adaptive mode they restrict the refresh catalog; required
@@ -140,6 +337,53 @@ trimmed to the reference budget. Missing required books or an insufficient
 foundation budget fail explicitly. A refresh chooses one displayed filter and
 at most `top_k` passages. In always mode filters are queried in configured order
 and share a total candidate limit. Duplicate IDs are included once per retrieval.
+
+## Setup on another PC and flag combinations
+
+1. Clone this repository and install the editable CLI tool with `uv`:
+
+   ```sh
+   git clone https://github.com/pavlosuperhero/aider.git
+   cd aider
+   uv tool install --editable . --with "tree-sitter-language-pack==0.13.0"
+   ```
+
+2. Create a minimal `~/.aider.conf.yml` for your local LM Studio and Oracle setup:
+
+   ```yaml
+   model: lm_studio/qwen/qwen3.5-9b
+   oracle: true
+   oracle-base-url: http://127.0.0.1:8742
+   oracle-require-search: true
+   ```
+
+3. Run with default TDD globs and test command from any repository, or override any default on the CLI:
+
+   ```sh
+   # Uses the installed Aider TDD controller, no extra reference document,
+   # default test glob (tests/*), source globs (aider/*, src/*, ... + non-test chat files),
+   # empty doc glob (), auto-test, and pytest with individual outcomes (-rA):
+   aider --oracle --tdd calc.py tests/test_calc.py
+
+   # Add a reference document and override scope, controller and test command:
+   aider --oracle --tdd \
+     --oracle-doc /custom/path/to/oracle.md \
+     --tdd-script /custom/path/to/tdd.py \
+     --tdd-test-glob "tests/basic/test_oracle*.py" \
+     --tdd-source-glob "aider/oracle.py" \
+     --tdd-doc-glob "docs/oracle.md" \
+     --test-cmd ".venv/bin/python -m pytest -q tests/basic/test_oracle.py" \
+     aider/oracle.py tests/basic/test_oracle.py docs/oracle.md
+   ```
+
+4. The four independent mode combinations work via CLI flags or `.aider.conf.yml`:
+
+   | Mode combination | Flags | Behavior |
+   | --- | --- | --- |
+   | Oracle + TDD | `--oracle --tdd` | Retrieval context + citation validation + red/green/doc TDD workflow |
+   | TDD only | `--no-oracle --tdd` | Red/green/doc TDD workflow without Oracle retrieval |
+   | Oracle only | `--oracle --no-tdd` | Oracle foundations and focused `<oracle_search>` without TDD phase gates |
+   | Standard Aider | `--no-oracle --no-tdd` | Stock Aider behavior with neither hook active |
 
 ## Local Qwen and Oracle
 

@@ -14,8 +14,10 @@ import git
 import httpx
 import pytest
 
+from aider import oracle_prompts
 from aider.args import get_parser
 from aider.coders import Coder
+from aider.hooks import ResponseHookResult
 from aider.io import InputOutput
 from aider.models import Model
 from aider.oracle import (
@@ -69,10 +71,10 @@ def project(tmp_path, monkeypatch):
     return tmp_path, repo
 
 
-def make_coder(model, provider=None, **kwargs):
+def make_coder(model, provider=None, *, edit_format="whole", **kwargs):
     return Coder.create(
         main_model=model,
-        edit_format="whole",
+        edit_format=edit_format,
         fnames=["greeting.py"],
         io=InputOutput(
             yes=True, pretty=False, fancy_input=False, dry_run=kwargs.get("dry_run", False)
@@ -247,11 +249,14 @@ def test_cli_yaml_environment_and_disable_override(tmp_path, monkeypatch):
         if name.startswith("AIDER_ORACLE"):
             monkeypatch.delenv(name)
     parser = get_parser([], None)
-    assert OracleConfig.from_args(parser.parse_args([])).enabled is False
+    settings = OracleConfig.from_args(parser.parse_args([]))
+    assert settings.enabled is False
+    assert settings.require_search is False
+    assert OracleConfig.from_args(parser.parse_args(["--oracle-require-search"])).require_search
     config = tmp_path / ".aider.conf.yml"
     config.write_text(
         "oracle: true\noracle-top-k: 2\noracle-timeout-seconds: 1.5\n"
-        "oracle-source:\n  - clean-architecture\n  - cosmic-python\n"
+        "oracle-source:\n  - clean-architecture\n  - cosmic-python\noracle-require-search: true\n"
     )
     parser = get_parser([str(config)], None)
     args = parser.parse_args([])
@@ -259,10 +264,14 @@ def test_cli_yaml_environment_and_disable_override(tmp_path, monkeypatch):
     assert settings.enabled and settings.top_k == 2
     assert settings.timeout_seconds == 1.5
     assert settings.source_ids == ("clean-architecture", "cosmic-python")
+    assert settings.require_search is True
+    assert parser.parse_args(["--no-oracle-require-search"]).oracle_require_search is False
     assert parser.parse_args(["--no-oracle"]).oracle is False
     assert parser.parse_args(["--oracle-top-k", "4"]).oracle_top_k == 4
     monkeypatch.setenv("AIDER_ORACLE", "false")
+    monkeypatch.setenv("AIDER_ORACLE_REQUIRE_SEARCH", "false")
     assert parser.parse_args([]).oracle is False
+    assert parser.parse_args([]).oracle_require_search is False
 
 
 def test_main_wires_provider_only_when_enabled(project, model, monkeypatch):
@@ -285,13 +294,15 @@ def test_main_wires_provider_only_when_enabled(project, model, monkeypatch):
     coder = main_module.main(args, return_coder=True)
     assert coder.oracle_provider is None
     coder = main_module.main(
-        args + ["--oracle", "--oracle-source", "cosmic-python"], return_coder=True
+        args + ["--oracle", "--oracle-source", "cosmic-python", "--oracle-require-search"],
+        return_coder=True,
     )
     assert isinstance(coder.oracle_provider, OracleSession)
     assert coder.oracle_provider.config.source_ids == ("cosmic-python",)
+    assert coder.oracle_provider.config.require_search is True
 
 
-def adaptive_provider():
+def adaptive_provider(*, empty_query=None, **settings):
     requests = []
     sources = ("clean-architecture", "think-python", "httpx-timeouts")
 
@@ -304,6 +315,8 @@ def adaptive_provider():
             )
         payload = json.loads(request.content)
         requests.append(payload["source"])
+        if payload["query"] == empty_query:
+            return httpx.Response(200, json={"results": []})
         return httpx.Response(
             200,
             json={
@@ -325,7 +338,7 @@ def adaptive_provider():
 
     return (
         create_oracle_provider(
-            OracleConfig(enabled=True, max_context_tokens=12000),
+            OracleConfig(enabled=True, max_context_tokens=12000, **settings),
             transport=httpx.MockTransport(handle),
         ),
         requests,
@@ -387,6 +400,138 @@ def test_model_cannot_mix_oracle_requests_with_edits(project, model, monkeypatch
     assert requests == ["catalog", "clean-architecture", "think-python"]
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_required_search_intercepts_edits_and_shell_commands_before_retrieval(
+    project, model, monkeypatch, streaming
+):
+    root, repo = project
+    greeting = root / "greeting.py"
+    provider, requests = adaptive_provider(require_search=True)
+    coder = make_coder(model, provider, edit_format="diff")
+    shell = Mock(side_effect=AssertionError("A rejected response dispatched a shell command"))
+    monkeypatch.setattr(coder, "handle_shell_commands", shell)
+    sends = []
+
+    def send(messages, functions=None):
+        sends.append(messages[-1]["content"])
+        assert greeting.read_text() == 'print("before")\n'
+        assert not repo.index.diff(None)
+        if len(sends) == 2:
+            assert sends[-1].startswith(oracle_prompts.REQUIRED_SEARCH_REMINDER)
+            assert "No proposed edits or shell commands were applied" in sends[-1]
+            assert sends[-1].endswith(oracle_prompts.SEARCH_PENDING_REMINDER)
+            assert requests == ["catalog", "clean-architecture", "think-python"]
+            coder.partial_response_content = (
+                '<oracle_search>{"query":"What is a read timeout?",'
+                '"source":"httpx-timeouts"}</oracle_search>'
+            )
+        else:
+            grounded = len(sends) == 3
+            replacement = "grounded" if grounded else "premature"
+            coder.partial_response_content = (
+                'greeting.py\n```python\n<<<<<<< SEARCH\nprint("before")\n=======\n'
+                f'print("{replacement}")\n>>>>>>> REPLACE\n```\n'
+            )
+            if grounded:
+                assert "httpx-timeouts-passage" in sends[-1]
+            else:
+                assert oracle_prompts.STRICT_SYSTEM_POLICY in messages[0]["content"]
+                coder.partial_response_content += "\n```bash\ntouch shell-marker\n```\n"
+        coder.partial_response_function_call = None
+        return iter(())
+
+    monkeypatch.setattr(coder, "send", send)
+    if streaming:
+        list(coder.run_stream("Improve greeting.py"))
+    else:
+        coder.run("Improve greeting.py")
+    assert len(sends) == 3
+    assert requests == ["catalog", "clean-architecture", "think-python", "httpx-timeouts"]
+    assert greeting.read_text() == 'print("grounded")\n'
+    shell.assert_not_called()
+    assert not (root / "shell-marker").exists()
+
+
+@pytest.mark.parametrize("empty_first", [False, True])
+def test_required_search_aborts_after_repeated_skips(project, model, monkeypatch, empty_first):
+    root, repo = project
+    provider, requests = adaptive_provider(require_search=True, empty_query="missing")
+    coder = make_coder(model, provider)
+    error = Mock()
+    monkeypatch.setattr(coder.io, "tool_error", error)
+    completed = Mock(side_effect=AssertionError("A rejected response reached reply_completed"))
+    monkeypatch.setattr(coder, "reply_completed", completed)
+    sends = []
+
+    def send(messages, functions=None):
+        sends.append(messages[-1]["content"])
+        coder.partial_response_function_call = None
+        if empty_first and len(sends) == 1:
+            coder.partial_response_content = (
+                '<oracle_search>{"query":"missing","source":"httpx-timeouts"}</oracle_search>'
+            )
+        elif sends[-1].startswith(oracle_prompts.REQUIRED_SEARCH_REMINDER):
+            coder.partial_response_content = None
+            coder.partial_response_function_call = {"arguments": '{"explanation":"Done"}'}
+        else:
+            if empty_first:
+                assert sends[-1].startswith(oracle_prompts.NO_FOCUSED_RESULTS)
+            # A no-op edit is an ordinary response and needs the same evidence.
+            coder.partial_response_content = 'greeting.py\n```python\nprint("before")\n```\n'
+        return iter(())
+
+    monkeypatch.setattr(coder, "send", send)
+    assert coder.run("Improve greeting.py") is None
+    assert len(sends) == (3 if empty_first else 2)
+    assert requests == ["catalog", "clean-architecture", "think-python"] + (
+        ["httpx-timeouts"] if empty_first else []
+    )
+    assert "skipped the required Oracle search twice" in error.call_args.args[0]
+    assert coder.partial_response_function_call is None
+    completed.assert_not_called()
+    assert (root / "greeting.py").read_text() == 'print("before")\n'
+    assert not repo.index.diff(None)
+
+
+def test_required_search_clone_keeps_evidence_for_editor_handoff_and_resets_next_turn(
+    project, model, monkeypatch
+):
+    root, _ = project
+    provider, requests = adaptive_provider(require_search=True)
+    coder = make_coder(model, provider)
+    sends = []
+
+    def send(messages, functions=None):
+        sends.append(messages[-1]["content"])
+        coder.partial_response_content = (
+            '<oracle_search>{"query":"What is a read timeout?","source":"httpx-timeouts"}'
+            "</oracle_search>"
+            if len(sends) == 1
+            else "A grounded editor plan."
+        )
+        coder.partial_response_function_call = None
+        return iter(())
+
+    monkeypatch.setattr(coder, "send", send)
+    assert coder.run("Plan the change") == "A grounded editor plan."
+    assert requests == ["catalog", "clean-architecture", "think-python", "httpx-timeouts"]
+
+    clone = coder.clone()
+    assert clone.oracle_provider is provider
+
+    def editor_send(messages, functions=None):
+        clone.partial_response_content = 'greeting.py\n```python\nprint("editor")\n```\n'
+        clone.partial_response_function_call = None
+        return iter(())
+
+    monkeypatch.setattr(clone, "send", editor_send)
+    original_requests = list(requests)
+    clone.run("Apply the grounded editor plan", preproc=False)
+    assert (root / "greeting.py").read_text() == 'print("editor")\n'
+    assert clone.run("A new user turn") is None
+    assert requests == original_requests
+
+
 def test_foundations_survive_history_compaction_without_duplicate_retrieval(project, model):
     p, requests = adaptive_provider()
     coder = make_coder(model, p)
@@ -399,3 +544,191 @@ def test_foundations_survive_history_compaction_without_duplicate_retrieval(proj
     assert text.count("clean-architecture-passage") == 1
     assert text.count("think-python-passage") == 1
     assert requests == before
+
+
+@pytest.mark.parametrize("use_system_prompt", [False, True])
+def test_oracle_protocol_is_trusted_but_reference_text_is_not(project, model, use_system_prompt):
+    model.use_system_prompt = use_system_prompt
+    provider, requests = adaptive_provider()
+    coder = make_coder(model, provider)
+    # No action protocol before successful foundation initialization.
+    assert oracle_prompts.SYSTEM_POLICY not in coder.format_chat_chunks().system[0]["content"]
+    coder.get_oracle_message("Change dependency timeout behavior")
+    chunks = coder.format_chat_chunks()
+    system_text = chunks.system[0]["content"]
+    assert oracle_prompts.SYSTEM_POLICY in system_text
+    assert chunks.system[0]["role"] == ("system" if use_system_prompt else "user")
+    assert "clean-architecture-passage" not in system_text
+    assert "think-python-passage" not in system_text
+    assert "https://example.org/reference" not in system_text
+    assert "<oracle_catalog>" not in system_text
+    assert "clean-architecture-passage" in chunks.readonly_files[0]["content"]
+    before = list(requests)
+    clone = coder.clone()
+    assert oracle_prompts.SYSTEM_POLICY in clone.format_chat_chunks().system[0]["content"]
+    assert requests == before
+
+
+def test_always_mode_and_disabled_oracle_do_not_add_adaptive_protocol(project, model):
+    providers = (
+        None,
+        create_oracle_provider(OracleConfig(enabled=True, mode="always")),
+        create_oracle_provider(OracleConfig(require_search=True)),
+    )
+    for provider in providers:
+        coder = make_coder(model, provider)
+        text = coder.format_chat_chunks().system[0]["content"]
+        assert oracle_prompts.SYSTEM_POLICY not in text
+        assert not coder.response_hooks
+
+
+@pytest.mark.parametrize("reminder_role", ["user", "sys"])
+def test_required_search_uses_action_reminder_until_evidence_arrives(project, model, reminder_role):
+    model.reminder = reminder_role
+    provider, requests = adaptive_provider(require_search=True)
+    coder = make_coder(model, provider, edit_format="diff")
+    normal_reminder = coder.fmt_system_prompt(coder.gpt_prompts.system_reminder)
+    coder.get_oracle_message("Improve timeout diagnostics")
+    coder.cur_messages = [{"role": "user", "content": "Implement the task."}]
+    before = list(requests)
+    messages = coder.format_chat_chunks().all_messages()
+    assert messages[-1]["content"].endswith(oracle_prompts.SEARCH_PENDING_REMINDER)
+    assert messages[-1]["role"] == ("system" if reminder_role == "sys" else "user")
+    assert normal_reminder not in "\n".join(m["content"] for m in messages)
+    assert requests == before  # Formatting cannot perform or satisfy retrieval.
+
+    empty_provider, _ = adaptive_provider(require_search=True, empty_query="missing")
+    empty_coder = make_coder(model, empty_provider, edit_format="diff")
+    empty_coder.get_oracle_message("Task")
+    empty_provider.respond(
+        '<oracle_search>{"query":"missing","source":"httpx-timeouts"}</oracle_search>', len
+    )
+    empty_coder.cur_messages = [{"role": "user", "content": "Continue."}]
+    assert (
+        empty_coder.format_chat_chunks()
+        .all_messages()[-1]["content"]
+        .endswith(oracle_prompts.SEARCH_PENDING_REMINDER)
+    )
+
+    provider.respond(
+        '<oracle_search>{"query":"Read timeout?","source":"httpx-timeouts"}</oracle_search>',
+        len,
+    )
+    messages = coder.format_chat_chunks().all_messages()
+    assert messages[-1]["content"].endswith(normal_reminder)
+    assert oracle_prompts.SEARCH_PENDING_REMINDER not in messages[-1]["content"]
+    coder.get_oracle_message("A new user task")
+    assert (
+        coder.format_chat_chunks()
+        .all_messages()[-1]["content"]
+        .endswith(oracle_prompts.SEARCH_PENDING_REMINDER)
+    )
+
+
+def test_generic_hook_can_supply_a_literal_prompt_reminder_without_oracle(project, model):
+    class NextAction:
+        def __call__(self, content, *, token_count, io):
+            return None
+
+        def prompt_reminder(self):
+            return 'Reply with {"action":"inspect"}.'
+
+    model.reminder = "user"
+    coder = make_coder(model, response_hooks=(NextAction(),))
+    coder.cur_messages = [{"role": "user", "content": "Task"}]
+    assert coder.oracle_provider is None
+    assert (
+        coder.format_chat_chunks()
+        .all_messages()[-1]["content"]
+        .endswith('Reply with {"action":"inspect"}.')
+    )
+
+
+def test_custom_response_hook_can_intercept_and_continue_without_oracle(
+    project, model, monkeypatch
+):
+    root, repo = project
+    greeting = root / "greeting.py"
+    original = 'print("before")\n'
+    reminder = "Use the normal file format to update greeting.py."
+    replies = [
+        'greeting.py\n```python\nprint("first")\n```',
+        'greeting.py\n```python\nprint("second")\n```',
+    ]
+    before_response = Mock(side_effect=[ResponseHookResult(reminder), None])
+    coder = make_coder(model, response_hooks=iter((before_response,))).clone()
+    assert coder.oracle_provider is None
+    assert coder.response_hooks == (before_response,)
+    sends = []
+
+    def send(messages, functions=None):
+        sends.append(messages[-1]["content"])
+        assert greeting.read_text() == original
+        assert not repo.index.diff(None)
+        coder.partial_response_content = replies[len(sends) - 1]
+        coder.partial_response_function_call = None
+        return iter(())
+
+    monkeypatch.setattr(coder, "send", send)
+    coder.run("Update greeting.py")
+    assert len(sends) == 2
+    assert sends[0].startswith("Update greeting.py")
+    assert sends[1].startswith(reminder)
+    assert [call.args[0] for call in before_response.call_args_list] == replies
+    assert greeting.read_text() == 'print("second")\n'
+
+
+def test_custom_response_hook_can_stop_edits_and_shell_commands(project, model, monkeypatch):
+    root, repo = project
+    before_response = Mock(return_value=ResponseHookResult())
+    coder = make_coder(model, edit_format="diff", response_hooks=(before_response,))
+    shell = Mock(side_effect=AssertionError("A stopped response dispatched a shell command"))
+    monkeypatch.setattr(coder, "handle_shell_commands", shell)
+
+    def send(messages, functions=None):
+        coder.partial_response_content = (
+            'greeting.py\n```python\n<<<<<<< SEARCH\nprint("before")\n=======\n'
+            'print("unapproved")\n>>>>>>> REPLACE\n```\n'
+            "\n```bash\ntouch shell-marker\n```\n"
+        )
+        coder.partial_response_function_call = None
+        return iter(())
+
+    monkeypatch.setattr(coder, "send", send)
+    assert coder.run("Update greeting.py") is None
+    assert before_response.call_count == 1
+    assert (root / "greeting.py").read_text() == 'print("before")\n'
+    assert not repo.index.diff(None)
+    shell.assert_not_called()
+
+
+def test_main_oracle_doc_loads_reference_without_changing_system_policy(
+    project, model, monkeypatch
+):
+    from aider import main as main_module
+
+    root, _ = project
+    reference = root / "custom-reference.md"
+    reference.write_text("Custom reference: keep the service boundary small.\n")
+    monkeypatch.setattr(main_module.models, "Model", lambda *a, **kw: model)
+    args = [
+        "--model",
+        "gpt-4",
+        "--yes",
+        "--no-check-update",
+        "--no-show-release-notes",
+        "--no-analytics",
+        "--no-stream",
+        "--map-tokens",
+        "0",
+        "greeting.py",
+    ]
+    coder = main_module.main(args + ["--oracle", "--oracle-doc", str(reference)], return_coder=True)
+    chunks = coder.format_chat_chunks()
+    readonly_text = "\n".join(m["content"] for m in chunks.readonly_files)
+    system_text = "\n".join(m["content"] for m in chunks.system)
+    assert reference.read_text().strip() in readonly_text
+    assert reference.read_text().strip() not in system_text
+    assert str(reference) in coder.abs_read_only_fnames
+    assert str(reference) not in coder.abs_fnames
+    assert main_module.main(args + ["--oracle-doc", "missing-reference.md"], return_coder=True) == 1

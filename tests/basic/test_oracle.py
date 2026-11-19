@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from aider import oracle_prompts
 from aider.oracle import (
     CONTEXT_PREFIX,
     AiderOracleAdapter,
@@ -260,7 +261,7 @@ def test_adapter_delegates_run_without_replacing_aider_semantics():
     coder.run.assert_called_once_with("task")
 
 
-def adaptive_session(**settings):
+def adaptive_session(*, empty_query=None, **settings):
     calls = []
     sources = ("clean-architecture", "think-python", "httpx-timeouts")
 
@@ -275,6 +276,8 @@ def adaptive_session(**settings):
             )
         payload = json.loads(request.content)
         calls.append((payload["source"], payload["query"]))
+        if payload["query"] == empty_query:
+            return httpx.Response(200, json={"results": []})
         return httpx.Response(
             200,
             json={
@@ -298,15 +301,35 @@ def test_adaptive_foundations_are_required_and_cached_without_querying_user_task
     session.retrieve("Rename local variable", len)
     context = session.context_messages()[0]["content"]
     assert isinstance(session, OracleSession)
-    assert "required starting context" in context
-    assert "not project files" in context
+    assert context.startswith("\n\n" + oracle_prompts.POLICY)
     assert [source for source, query in calls] == ["catalog", "clean-architecture", "think-python"]
     assert all(query != "Rename local variable" for source, query in calls)
     assert "httpx-timeouts" in context
     before = list(calls)
-    assert "foundation remains" in session.retrieve("Next task", len)
+    assert session.retrieve("Next task", len) == oracle_prompts.REMINDER
     assert calls == before
     assert session.respond("This mechanical edit needs no extra lookup.", len) is None
+
+
+@pytest.mark.parametrize("require_search", [False, True])
+def test_trusted_oracle_protocol_counts_towards_context_budget(require_search):
+    session, _ = adaptive_session(require_search=require_search)
+    assert session.system_prompt() == ""
+    session.retrieve("Task", len)
+    policy = oracle_prompts.STRICT_SYSTEM_POLICY if require_search else oracle_prompts.SYSTEM_POLICY
+    assert session.system_prompt() == policy
+    prompt = session.context + policy + oracle_prompts.REMINDER + oracle_prompts.ACKNOWLEDGEMENT
+    if require_search:
+        prompt += oracle_prompts.NO_FOCUSED_RESULTS + oracle_prompts.REQUIRED_SEARCH_REMINDER
+        prompt += 2 * oracle_prompts.SEARCH_PENDING_REMINDER
+    used = len(prompt)
+    session.config = replace(session.config, max_context_tokens=used)
+    assert session.retrieve("Task", len)
+    session.config = replace(session.config, max_context_tokens=used - 1)
+    with pytest.raises(OracleBudgetError):
+        session.retrieve("Task", len)
+    session.config = replace(session.config, enabled=False)
+    assert session.system_prompt() == ""
 
 
 def test_adaptive_refresh_uses_focused_question_and_enforces_turn_limit():
@@ -325,6 +348,62 @@ def test_adaptive_refresh_uses_focused_question_and_enforces_turn_limit():
     assert session.respond(request, len)
 
 
+def test_required_search_accepts_only_focused_evidence_from_current_turn():
+    session, calls = adaptive_session(require_search=True, empty_query="missing evidence")
+    session.retrieve("First task", len)
+    ordinary_reply = "The local variable was already named correctly."
+    assert session.respond(ordinary_reply, len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
+    assert len(calls) == 3  # The catalog and foundations are not focused evidence.
+    empty_search = (
+        '<oracle_search>{"query":"missing evidence","source":"httpx-timeouts"}</oracle_search>'
+    )
+    assert session.respond(empty_search, len).startswith(oracle_prompts.NO_FOCUSED_RESULTS)
+    with pytest.raises(OracleResponseError, match="skipped the required Oracle search twice"):
+        session.respond(ordinary_reply, len)
+
+    session.retrieve("Second task", len)
+    assert session.respond(ordinary_reply, len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
+    valid_search = '<oracle_search>{"query":"q","source":"httpx-timeouts"}</oracle_search>'
+    assert "<passage>" in session.respond(valid_search, len)
+    assert session.respond(ordinary_reply, len) is None
+
+    session.retrieve("Third task", len)
+    assert session.respond(ordinary_reply, len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
+
+
+def test_required_search_ignores_overbudget_evidence_and_respects_search_limit():
+    session, _ = adaptive_session(require_search=True, max_searches=1)
+    session.retrieve("Task", len)
+    request = '<oracle_search>{"query":"q","source":"httpx-timeouts"}</oracle_search>'
+    with pytest.raises(OracleBudgetError, match="No complete"):
+        session.respond(request, lambda _: session.config.max_context_tokens + 1)
+    with pytest.raises(OracleResponseError, match="limit reached without evidence"):
+        session.respond("Here is my answer.", len)
+
+
+def test_disabled_oracle_does_not_enforce_search():
+    p = OracleContextProvider(OracleConfig(require_search=True))
+    session = OracleSession(p)
+    assert session.retrieve("Task", len) == ""
+    assert session.respond("Here is my answer.", len) is None
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        '<oracle_search>{"query":"Read timeout versus total deadline?","source":"httpx-timeouts"}\n```',
+        '```xml\n<oracle_search>{"query":"Read timeout versus total deadline?","source":"httpx-timeouts"}\n```',
+        '```\n<oracle_search>{"query":"Read timeout versus total deadline?","source":"httpx-timeouts"}</oracle_search>\n```',
+    ],
+)
+def test_adaptive_refresh_tolerates_unclosed_tag_or_fence_wrappers_on_pure_search(envelope):
+    session, calls = adaptive_session()
+    session.retrieve("Fix timeout handling", len)
+    context = session.respond(envelope, len)
+    assert context is not None and "httpx-timeouts" in context
+    assert calls[-1] == ("httpx-timeouts", "Read timeout versus total deadline?")
+
+
 @pytest.mark.parametrize(
     "envelope",
     [
@@ -332,15 +411,17 @@ def test_adaptive_refresh_uses_focused_question_and_enforces_turn_limit():
         '<oracle_search>{"query":"q","source":"unknown"}</oracle_search>',
         '<oracle_search>{"query":"q","source":"httpx-timeouts","command":"run"}</oracle_search>',
         '<oracle_search>{"query":"q","source":"httpx-timeouts"}</oracle_search>\nfile.py\n```edit```',
+        '<oracle_search>{"query":"q","source":"httpx-timeouts"}\nfile.py\n```edit```',
     ],
 )
 def test_invalid_model_requests_never_reach_http_or_edit_dispatch(envelope):
-    session, calls = adaptive_session()
+    session, calls = adaptive_session(require_search=True)
     session.retrieve("Task", len)
     before = list(calls)
     with pytest.raises(OracleResponseError):
         session.respond(envelope, len)
     assert calls == before
+    assert session.respond("Here is my answer.", len) == oracle_prompts.REQUIRED_SEARCH_REMINDER
 
 
 def test_adaptive_source_limits_apply_to_refresh_catalog_not_required_foundations():
@@ -375,8 +456,98 @@ def test_always_mode_keeps_direct_retrieval_available():
         {"max_searches": 0},
         {"max_searches": 4},
         {"mode": "unbounded"},
+        {"require_search": "true"},
+        {"require_search": True, "mode": "always"},
+        {"require_search": True, "fail_open": True},
     ],
 )
 def test_invalid_adaptive_settings(settings):
     with pytest.raises(ValueError):
         OracleConfig(**settings)
+
+
+def test_session_tracks_returned_passage_evidence_and_validates_cited_ids():
+    ca_id = "a892b437bacbc32f4e64e3db"
+    tp_id = "37125e7b0eee4eebee434db3"
+    hx_id = "4d4d418905639aeba3a03277"
+    unknown_id = "deadbeefdeadbeefdeadbeef"
+    ids = {
+        "clean-architecture": ca_id,
+        "think-python": tp_id,
+        "httpx-timeouts": hx_id,
+    }
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"sources": [{"source": f"/data/{s}/doc.html"} for s in ids]},
+            )
+        payload = json.loads(request.content)
+        src = payload["source"]
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    passage(
+                        id=ids[src],
+                        source=f"/data/{src}/doc.html",
+                        source_uri=f"https://example.org/{src}",
+                        title=f"Title for {src}",
+                    )
+                ]
+            },
+        )
+
+    session = create_oracle_provider(
+        OracleConfig(enabled=True, max_context_tokens=12000),
+        transport=httpx.MockTransport(handle),
+    )
+    session.retrieve("Initial task", len)
+    assert set(session.evidence) == {ca_id, tp_id}
+    assert session.evidence[ca_id].source_uri == "https://example.org/clean-architecture"
+    assert session.evidence[ca_id].title == "Title for clean-architecture"
+
+    search = '<oracle_search>{"query":"timeout?","source":"httpx-timeouts"}</oracle_search>'
+    session.respond(search, len)
+    assert set(session.evidence) == {ca_id, tp_id, hx_id}
+    assert session.unknown_cited_ids(f"We used {hx_id} and foundation {ca_id}.") == ()
+    assert session.unknown_cited_ids(f"Cited {hx_id} and fabricated {unknown_id}.") == (unknown_id,)
+
+    rejected = session.respond(f"Report citing {hx_id} and {unknown_id}.", len)
+    assert rejected is not None
+    assert unknown_id in rejected
+    assert "never returned" in rejected
+    assert "valid passage identity does not prove semantic support" in rejected
+    assert (
+        session.respond(f"Report citing {hx_id} from https://example.org/httpx-timeouts.", len)
+        is None
+    )
+
+    code_reply = (
+        f"Updated test fixtures using {hx_id}:\n\n"
+        "tests/basic/test_tdd.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        f'unknown_id = "{unknown_id}"\n'
+        'other_id = "badc0ffeebadc0ffeebadc0f"\n'
+        ">>>>>>> REPLACE\n"
+        "```\n"
+        "````python\n"
+        f'quad_id = "{unknown_id}"\n'
+        "````"
+    )
+    assert session.unknown_cited_ids(code_reply) == ()
+    assert session.respond(code_reply, len) is None
+    assert session.unknown_cited_ids(code_reply + f"\nAlso cited {unknown_id} in prose.") == (
+        unknown_id,
+    )
+
+
+def test_oracle_reference_document_has_no_implicit_checkout_path():
+    from aider.args import get_parser
+
+    args = get_parser([], None).parse_args(["--oracle"])
+    assert args.oracle_doc is None
+    assert not hasattr(OracleConfig.from_args(args), "doc_path")

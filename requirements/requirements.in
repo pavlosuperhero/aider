@@ -8,6 +8,8 @@ backoff
 pathspec
 diskcache
 grep_ast
+# Keep bundled grammars: newer releases fetch parsers during repository scans.
+tree-sitter-language-pack==0.13.0
 packaging
 sounddevice
 soundfile

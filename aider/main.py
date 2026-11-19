@@ -679,7 +679,14 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     all_files = args.files + (args.file or [])
     fnames = [str(Path(fn).resolve()) for fn in all_files]
     read_only_fnames = []
-    for fn in args.read or []:
+    reference_files = list(args.read or [])
+    if args.oracle_doc:
+        oracle_doc = Path(args.oracle_doc).expanduser().resolve()
+        if not oracle_doc.is_file():
+            io.tool_error(f"Oracle reference document not found: {args.oracle_doc}")
+            return 1
+        reference_files.append(str(oracle_doc))
+    for fn in reference_files:
         path = Path(fn).expanduser().resolve()
         if path.is_dir():
             read_only_fnames.extend(str(f) for f in path.rglob("*") if f.is_file())
@@ -975,6 +982,23 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             from aider.oracle import OracleConfig, create_oracle_provider
 
             oracle_kwargs["oracle_provider"] = create_oracle_provider(OracleConfig.from_args(args))
+        tdd_kwargs = {}
+        if args.tdd:
+            from aider.tdd import TddConfig, load_tdd_controller_class
+
+            tdd_config = TddConfig.from_args(
+                args,
+                args.edit_format or main_model.edit_format,
+                fnames=fnames,
+                root=git_root if args.git and git_root else utils.find_common_root(fnames),
+            )
+            controller_cls = load_tdd_controller_class(tdd_config.script_path)
+            provider = oracle_kwargs.get("oracle_provider")
+            citation_validator = getattr(provider, "unknown_cited_ids", None)
+            tdd_controller = controller_cls(tdd_config, citation_validator=citation_validator)
+            if hasattr(provider, "post_search_guidance"):
+                provider.post_search_guidance = tdd_controller.phase_guidance
+            tdd_kwargs = tdd_controller.hook_kwargs()
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
@@ -1010,7 +1034,10 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             auto_accept_architect=args.auto_accept_architect,
             add_gitignore_files=args.add_gitignore_files,
             **oracle_kwargs,
+            **tdd_kwargs,
         )
+        if args.tdd:
+            coder.max_reflections = max(coder.max_reflections, 8)
     except UnknownEditFormat as err:
         io.tool_error(str(err))
         io.offer_url(urls.edit_formats, "Open documentation about edit formats?")
