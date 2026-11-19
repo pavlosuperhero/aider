@@ -523,3 +523,23 @@ def test_session_tracks_returned_passage_evidence_and_validates_cited_ids():
         session.respond(f"Report citing {hx_id} from https://example.org/httpx-timeouts.", len)
         is None
     )
+
+    code_reply = (
+        f"Updated test fixtures using {hx_id}:\n\n"
+        "tests/basic/test_tdd.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        f'unknown_id = "{unknown_id}"\n'
+        'other_id = "badc0ffeebadc0ffeebadc0f"\n'
+        ">>>>>>> REPLACE\n"
+        "```\n"
+        "````python\n"
+        f'quad_id = "{unknown_id}"\n'
+        "````"
+    )
+    assert session.unknown_cited_ids(code_reply) == ()
+    assert session.respond(code_reply, len) is None
+    assert session.unknown_cited_ids(code_reply + f"\nAlso cited {unknown_id} in prose.") == (
+        unknown_id,
+    )

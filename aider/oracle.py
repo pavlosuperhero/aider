@@ -372,11 +372,13 @@ class OracleSession:
                 )
 
     def unknown_cited_ids(self, content):
-        """Return 24-hex passage IDs cited in content that were never returned in this session."""
+        """Return 24-hex passage IDs cited in prose outside fenced code blocks that were never returned in this session."""
         if not isinstance(content, str) or not self.evidence:
             return ()
+        prose = re.sub(r"(`{3,}).*?\1", "", content, flags=re.DOTALL)
+        prose = re.sub(r"`{3,}.*\Z", "", prose, flags=re.DOTALL)
         cited = []
-        for pid in _PASSAGE_ID_RE.findall(content):
+        for pid in _PASSAGE_ID_RE.findall(prose):
             if pid not in self.evidence and pid not in cited:
                 cited.append(pid)
         return tuple(cited)

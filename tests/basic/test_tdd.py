@@ -129,7 +129,12 @@ def test_non_assertion_or_unexplained_failures_are_not_intended(line):
 
 
 @pytest.mark.parametrize(
-    "reason", ["AssertionError: boom", "Failed: DID NOT RAISE <class 'ValueError'>"]
+    "reason",
+    [
+        "AssertionError: boom",
+        "Failed: DID NOT RAISE <class 'ValueError'>",
+        "TypeError: TddConfig.__init__() got an unexpected keyword argument 'require_citation'",
+    ],
 )
 def test_assertion_style_reasons_are_intended(reason):
     output = f"FAILED tests/test_calc.py::test_add - {reason}\n1 failed in 0.01s\n"
@@ -683,3 +688,45 @@ def test_report_rejects_unknown_cited_passage_ids_and_notes_identity_vs_semantic
     accepted = controller(f"Final report citing only {known_id}.")
     assert accepted is None
     assert controller.state.phase is Phase.DONE
+
+
+def test_require_citation_flag_requires_final_report_to_contain_at_least_one_24hex_id():
+    controller = TddController(
+        TddConfig(
+            test_globs=("tests/*",),
+            source_globs=("calc.py",),
+            require_citation=True,
+        ),
+        citation_validator=lambda text: (),
+    )
+
+    green_stage(controller)
+
+    unmet = controller("Final report with no citation.")
+    assert isinstance(unmet, ResponseHookResult)
+    assert (
+        "final report must cite at least one returned 24-hex Oracle passage ID"
+        in unmet.continuation
+    )
+    assert controller.state.phase is Phase.REPORT
+
+    accepted = controller("Final report citing passage id 4d4d418905639aeba3a03277.")
+    assert accepted is None
+    assert controller.state.phase is Phase.DONE
+
+
+def test_fenced_edit_in_report_phase_does_not_move_to_done_prematurely():
+    controller = TddController(
+        TddConfig(
+            test_globs=("tests/*",),
+            source_globs=("calc.py",),
+            doc_globs=("docs/*",),
+        )
+    )
+    green_stage(controller)
+    assert controller.state.phase is Phase.REPORT
+
+    # Model responds with a fenced edit block in REPORT phase
+    fenced_edit = "docs/oracle.md\n```markdown\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```"
+    assert controller(fenced_edit) is None
+    assert controller.state.phase is Phase.REPORT

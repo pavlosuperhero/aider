@@ -1905,6 +1905,13 @@ class Coder:
         return mentioned_rel_fnames
 
     def check_for_file_mentions(self, content):
+        if "<<<<<<< SEARCH" in content:
+            content = re.sub(
+                r"<<<<<<< SEARCH.*?>>>>>>> REPLACE",
+                "",
+                content,
+                flags=re.DOTALL,
+            )
         mentioned_rel_fnames = self.get_file_mentions(content)
 
         new_mentions = mentioned_rel_fnames - self.ignore_mentions

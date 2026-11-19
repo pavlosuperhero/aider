@@ -81,6 +81,7 @@ class TddConfig:
     max_cycles: int = 3  # red cycles, including the first
     max_corrections: int = 6  # rejected edits, invalid reds and failing runs after a change
     max_refactor_rechecks: int = 2
+    require_citation: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "test_globs", _globs("test", self.test_globs))
@@ -125,7 +126,9 @@ class FailedTest:
     @property
     def assertion_like(self):
         reason = self.reason.strip()
-        return reason.startswith(("assert", "AssertionError", "Failed: DID NOT RAISE"))
+        return reason.startswith(("assert", "AssertionError", "Failed: DID NOT RAISE")) or (
+            reason.startswith("TypeError:") and "unexpected keyword argument" in reason
+        )
 
 
 @dataclass(frozen=True)
@@ -544,6 +547,16 @@ class TddController:
                     "session (cite only returned passage IDs and origins; valid passage identity "
                     "does not prove semantic support)"
                 )
+        if (
+            check_completion
+            and tdd.require_citation
+            and self.citation_validator is not None
+            and content
+        ):
+            if not re.search(r"\b[0-9a-f]{24}\b", content):
+                unmet.append(
+                    "final report must cite at least one returned 24-hex Oracle passage ID"
+                )
         return tuple(unmet)
 
     # -- response hook -------------------------------------------------------------------
@@ -557,21 +570,22 @@ class TddController:
         if s.phase is Phase.REPORT:
             # If the response contains code fences (an edit attempt), let check_edits handle it
             # unless it's a pure report response.
-            if "```" not in text:
-                unmet = self._unmet_requirements(text, check_completion=True)
-                if unmet:
-                    if self._charge(io):
-                        return ResponseHookResult()
-                    items = "\n".join(f"- {item}" for item in unmet)
-                    return ResponseHookResult(
-                        "Workflow is NOT complete. Unmet requirements:\n"
-                        f"{items}\n"
-                        "Note: regression coverage, documentation and the final report are not "
-                        "satisfied by an old suite passing; a changed docs file alone is not proof "
-                        "its claims are correct; and valid passage identity does not prove semantic "
-                        "support. Next action: satisfy the unmet requirements above before "
-                        "submitting the final report."
-                    )
+            if "```" in text:
+                return None
+            unmet = self._unmet_requirements(text, check_completion=True)
+            if unmet:
+                if self._charge(io):
+                    return ResponseHookResult()
+                items = "\n".join(f"- {item}" for item in unmet)
+                return ResponseHookResult(
+                    "Workflow is NOT complete. Unmet requirements:\n"
+                    f"{items}\n"
+                    "Note: regression coverage, documentation and the final report are not "
+                    "satisfied by an old suite passing; a changed docs file alone is not proof "
+                    "its claims are correct; and valid passage identity does not prove semantic "
+                    "support. Next action: satisfy the unmet requirements above before "
+                    "submitting the final report."
+                )
             self._move(Phase.DONE, "report response")
             self._done_serial = self._serial
             return None

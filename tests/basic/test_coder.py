@@ -151,6 +151,33 @@ class TestCoder(unittest.TestCase):
 
             self.assertEqual(coder.abs_fnames, expected_files)
 
+    def test_check_for_file_mentions_ignores_search_replace_blocks(self):
+        with GitTemporaryDirectory():
+            repo = git.Repo()
+            mock_io = MagicMock()
+
+            fname1 = Path("file1.txt")
+            fname2 = Path("file2.py")
+            fname1.write_text("one\n")
+            fname2.write_text("two\n")
+            repo.git.add(str(fname1))
+            repo.git.add(str(fname2))
+            repo.git.commit("-m", "new")
+
+            coder = Coder.create(self.GPT35, None, mock_io, fnames=[str(fname1)])
+
+            # file2.py appears only inside a SEARCH/REPLACE block for file1.txt
+            edit_content = (
+                "file1.txt\n"
+                "<<<<<<< SEARCH\n"
+                "one\n"
+                "=======\n"
+                "see file2.py for details\n"
+                ">>>>>>> REPLACE\n"
+            )
+            self.assertIsNone(coder.check_for_file_mentions(edit_content))
+            self.assertEqual(coder.abs_fnames, {str(Path(coder.root) / fname1)})
+
     def test_check_for_ambiguous_filename_mentions_of_longer_paths(self):
         with GitTemporaryDirectory():
             io = InputOutput(pretty=False, yes=True)

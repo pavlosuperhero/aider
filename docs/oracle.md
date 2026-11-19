@@ -182,7 +182,9 @@ Observable phases (`TddState.phase`):
 passage IDs cited in a model response that were never returned in the current
 session. Both `OracleSession.respond` and `TddController` (via an injected
 `citation_validator` callback composed in `aider/main.py`) reject responses that
-cite unknown or fabricated passage IDs.
+cite unknown or fabricated passage IDs. Setting `TddConfig(require_citation=True)`
+additionally requires the final completion report to cite at least one returned
+24-hex Oracle passage ID when a `citation_validator` is present.
 
 What is **not** enforced by code:
 
