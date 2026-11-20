@@ -3126,3 +3126,24 @@
   use_repo_map: true
   use_temperature: false
   accepts_settings: ["reasoning_effort"]
+
+- name: bedrock/us.anthropic.claude-sonnet-5-5
+  edit_format: diff
+  weak_model_name: bedrock/us.anthropic.claude-haiku-5-5
+  use_repo_map: true
+  examples_as_sys_msg: false
+  extra_params:
+    max_tokens: 64000
+  cache_control: true
+  editor_model_name: bedrock/us.anthropic.claude-sonnet-5-5
+  editor_edit_format: editor-diff
+  accepts_settings: ["thinking_tokens"]
+
+- name: bedrock/us.anthropic.claude-haiku-5-5
+  edit_format: diff
+  weak_model_name: bedrock/us.anthropic.claude-haiku-5-5
+  use_repo_map: false
+  extra_params:
+    max_tokens: 16000
+  cache_control: true
+  accepts_settings: ["thinking_tokens"]
