@@ -797,6 +797,12 @@ class Model(ModelSettings):
                 if "extra_body" not in self.extra_params:
                     self.extra_params["extra_body"] = {}
                 self.extra_params["extra_body"]["reasoning"] = {"effort": effort}
+            elif self.name.startswith("bedrock/"):
+                if not self.extra_params:
+                    self.extra_params = {}
+                # LiteLLM maps this option to the model's native Bedrock fields.
+                # An extra_body wrapper is forwarded literally by Converse.
+                self.extra_params["reasoning_effort"] = effort
             else:
                 if not self.extra_params:
                     self.extra_params = {}
@@ -914,6 +920,8 @@ class Model(ModelSettings):
                     and "effort" in self.extra_params["extra_body"]["reasoning"]
                 ):
                     return self.extra_params["extra_body"]["reasoning"]["effort"]
+            elif "reasoning_effort" in self.extra_params:
+                return self.extra_params["reasoning_effort"]
             # Check for standard reasoning_effort format (e.g. in extra_body)
             elif (
                 "extra_body" in self.extra_params
