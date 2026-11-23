@@ -732,3 +732,23 @@ def test_main_oracle_doc_loads_reference_without_changing_system_policy(
     assert str(reference) in coder.abs_read_only_fnames
     assert str(reference) not in coder.abs_fnames
     assert main_module.main(args + ["--oracle-doc", "missing-reference.md"], return_coder=True) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_local_caller_stays_out_of_oracle_query(project, model, monkeypatch, enabled):
+    root, repo = project
+    (root / "greeting.py").write_text("def greet(): return 1\n")
+    (root / "other.py").write_text("from greeting import greet\nresult = greet() + 73\n")
+    repo.index.add(["other.py", "greeting.py"])
+    repo.index.commit("Call the public function")
+    provider = make_provider(lambda _: httpx.Response(500))
+    coder = make_coder(model, provider, local_callers=enabled)
+    retrieve = Mock(return_value="fix greet\nOracle reference")
+    monkeypatch.setattr("aider.oracle.add_oracle_context", retrieve)
+    message = coder.get_oracle_message("fix greet")
+    assert retrieve.call_args.args[0] == "fix greet"
+    assert "Oracle reference" in message
+    assert ("result = greet() + 73" in message) == enabled
+    assert coder.get_inchat_relative_files() == ["greeting.py"]
+    retrieve.return_value = None
+    assert coder.get_oracle_message("fix greet") is None

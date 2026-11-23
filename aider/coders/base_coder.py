@@ -346,17 +346,16 @@ class Coder:
         file_watcher=None,
         auto_copy_context=False,
         auto_accept_architect=True,
-        local_callers=False,
         oracle_provider=None,
         response_hooks=(),
         test_result_hooks=(),
         edit_hooks=(),
+        local_callers=False,
     ):
         self.test_result_hooks = tuple(test_result_hooks)
         self.edit_hooks = tuple(edit_hooks)
         self.test_hook_continuation = None
         self.local_callers = local_callers
-        self.caller_excerpt = ""
         self.oracle_provider = oracle_provider
         self.response_hooks = tuple(response_hooks)
         if oracle_provider is not None:
@@ -900,24 +899,33 @@ class Coder:
             user_message = self.reflected_message
 
     def get_oracle_message(self, message):
+        if not message:
+            return message
+        task = message
+        if self.oracle_provider is not None:
+            from aider.oracle import add_oracle_context
+
+            message = add_oracle_context(
+                message, self.oracle_provider, self.main_model.token_count, self.io
+            )
+            if message is None:
+                self.partial_response_content = None
+                return None
         if self.local_callers and self.repo:
             from aider.local_callers import related_callers
 
-            self.caller_excerpt = related_callers(
-                Path(self.root), message or "", self.get_inchat_relative_files(),
+            excerpt = related_callers(
+                Path(self.root),
+                task,
+                self.get_inchat_relative_files(),
                 self.get_addable_relative_files(),
             )
-            if self.caller_excerpt:
-                self.io.tool_output("Local caller evidence: " + self.caller_excerpt.splitlines()[0])
-        if not message or self.oracle_provider is None:
-            return message
-        from aider.oracle import add_oracle_context
-
-        message = add_oracle_context(
-            message, self.oracle_provider, self.main_model.token_count, self.io
-        )
-        if message is None:
-            self.partial_response_content = None
+            if excerpt:
+                self.io.tool_output("Local caller evidence: " + excerpt.splitlines()[0])
+                message += (
+                    "\n\nRead-only caller snapshot for this task. Check how the caller uses "
+                    "the return value before choosing the implementation.\n" + excerpt
+                )
         return message
 
     def init_before_message(self):
@@ -1442,11 +1450,6 @@ class Coder:
         provider = self.oracle_provider
         if provider is not None and callable(getattr(type(provider), "context_messages", None)):
             chunks.readonly_files = provider.context_messages() + chunks.readonly_files
-        if self.caller_excerpt:
-            chunks.readonly_files.extend([
-                dict(role="user", content="Read-only Python call sites:\n" + self.caller_excerpt),
-                dict(role="assistant", content="I will use these call sites as reference."),
-            ])
         chunks.chat_files = self.get_chat_files_messages()
 
         if system_reminder:

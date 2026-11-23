@@ -8,7 +8,12 @@ from pathlib import Path
 def read_python(root, name):
     path = root / name
     try:
-        if path.suffix != ".py" or path.resolve() != path or not path.is_relative_to(root):
+        if (
+            path.suffix != ".py"
+            or path.resolve() != path
+            or not path.is_relative_to(root)
+            or not path.is_file()
+        ):
             return ""
         with path.open("rb") as stream:
             data = stream.read(131073)
@@ -44,12 +49,18 @@ def related_callers(root, message, editable, candidates):
             continue
         aliases = {
             alias.asname or alias.name
-            for node in tree.body if isinstance(node, ast.ImportFrom) and not node.level
-            for alias in node.names if (node.module, alias.name) in targets
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and not node.level
+            for alias in node.names
+            if (node.module, alias.name) in targets
         }
         lines = source.splitlines()
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in aliases:
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in aliases
+            ):
                 start = max(0, node.lineno - 3)
                 excerpt = "\n".join(lines[start : node.lineno + 3])
                 excerpts.append(f"{name}:{start + 1}\n{excerpt[:700]}")
