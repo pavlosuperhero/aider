@@ -1008,6 +1008,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             read_only_fnames=read_only_fnames,
             local_callers=args.local_callers,
             local_callers_hint=args.local_callers_hint,
+            local_callers_mode=args.local_callers_mode,
+            local_callers_audit=args.local_callers_audit,
             show_diffs=args.show_diffs,
             auto_commits=args.auto_commits,
             dirty_commits=args.dirty_commits,

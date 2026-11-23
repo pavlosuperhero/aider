@@ -352,12 +352,23 @@ class Coder:
         edit_hooks=(),
         local_callers=False,
         local_callers_hint=None,
+        local_callers_mode="passive",
+        local_callers_audit=False,
     ):
+        if local_callers_mode not in ("passive", "contract"):
+            raise ValueError(
+                f"Invalid local_callers_mode {local_callers_mode!r};"
+                " expected 'passive' or 'contract'."
+            )
+        from aider.caller_audit import CallerContractHook, IsolatedCallerAuditor
+
         self.test_result_hooks = tuple(test_result_hooks)
         self.edit_hooks = tuple(edit_hooks)
         self.test_hook_continuation = None
         self.local_callers_hint = local_callers_hint
         self.local_callers = local_callers
+        self.local_callers_mode = local_callers_mode
+        self.local_callers_audit = local_callers_audit
         self.oracle_provider = oracle_provider
         self.response_hooks = tuple(response_hooks)
         if oracle_provider is not None:
@@ -366,6 +377,20 @@ class Coder:
             hook = create_oracle_response_hook(oracle_provider)
             if hook is not None:
                 self.response_hooks += (hook,)
+        self.local_caller_contract_hook = CallerContractHook(
+            enabled=bool(self.local_callers and self.local_callers_mode == "contract")
+        )
+        if self.local_caller_contract_hook.enabled:
+            self.response_hooks += (self.local_caller_contract_hook,)
+        self.local_caller_auditor = (
+            IsolatedCallerAuditor(
+                lambda messages: self.main_model.simple_send_with_retries(messages)
+            )
+            if self.local_callers and self.local_callers_audit
+            else None
+        )
+        if self.local_callers_audit or self.local_callers_mode == "contract":
+            self.max_reflections = max(self.max_reflections, 4)
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
 
@@ -900,8 +925,37 @@ class Coder:
             self.num_reflections += 1
             user_message = self.reflected_message
 
+    def _reset_local_caller_state(self, excerpts, task=""):
+        self._local_caller_task = task or ""
+        self.local_caller_contract_hook.begin_turn(excerpts)
+        if self.local_caller_auditor is not None:
+            self.local_caller_auditor.begin_turn(excerpts)
+
+    def _get_local_caller_audit_files(self, edited):
+        updated = {}
+        root = Path(self.root).resolve()
+        for rel_path in sorted(edited):
+            try:
+                full_path = (root / rel_path).resolve()
+                if full_path.is_relative_to(root) and full_path.is_file():
+                    updated[rel_path] = full_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+        return updated
+
+    def _get_local_caller_audit_diff(self, edited):
+        base_ref = (
+            self.commit_before_message[-1] if self.commit_before_message else None
+        ) or "HEAD"
+        try:
+            return self.repo.repo.git.diff(base_ref, "--", *sorted(edited))
+        except Exception:
+            return ""
+
     def get_oracle_message(self, message):
         if not message:
+            if self.local_callers:
+                self._reset_local_caller_state(())
             return message
         task = message
         if self.oracle_provider is not None:
@@ -911,26 +965,33 @@ class Coder:
                 message, self.oracle_provider, self.main_model.token_count, self.io
             )
             if message is None:
+                if self.local_callers:
+                    self._reset_local_caller_state(())
                 self.partial_response_content = None
                 return None
         if self.local_callers and self.repo:
-            from aider.local_callers import DEFAULT_CALLER_HINT, related_callers
+            from aider.local_callers import find_related_callers, format_caller_context
 
-            excerpt = related_callers(
+            excerpts = find_related_callers(
                 Path(self.root),
                 task,
                 self.get_inchat_relative_files(),
                 self.get_addable_relative_files(),
             )
-            if excerpt:
-                self.io.tool_output("Local caller evidence: " + excerpt.splitlines()[0])
-                hint = self.local_callers_hint
-                if hint is None:
-                    hint = DEFAULT_CALLER_HINT
-                heading = "Read-only caller snapshot for this task."
-                if hint.strip():
-                    heading += " " + hint.strip()
-                message += f"\n\n{heading}\n{excerpt}"
+            self._reset_local_caller_state(excerpts, task=task)
+            if excerpts:
+                self.io.tool_output(
+                    "Local caller evidence: " + excerpts[0].format().splitlines()[0]
+                )
+                formatted = format_caller_context(
+                    excerpts,
+                    hint=self.local_callers_hint,
+                    mode=self.local_callers_mode,
+                )
+                if formatted:
+                    message += f"\n\n{formatted}"
+        elif self.local_callers:
+            self._reset_local_caller_state(())
         return message
 
     def init_before_message(self):
@@ -942,6 +1003,8 @@ class Coder:
         self.test_outcome = None
         self.shell_commands = []
         self.message_cost = 0
+        if self.local_callers:
+            self._reset_local_caller_state(())
 
         if self.repo:
             self.commit_before_message.append(self.repo.get_head_commit_sha())
@@ -1779,6 +1842,7 @@ class Coder:
                 dict(role="assistant", content="Ok"),
             ]
 
+        test_errors = None
         if edited and self.auto_test:
             self.test_hook_continuation = None
             test_errors = self.commands.cmd_test(self.test_cmd)
@@ -1792,6 +1856,19 @@ class Coder:
                 if ok:
                     self.reflected_message = test_errors
                     return
+
+        if edited and not test_errors and self.local_caller_auditor is not None and self.repo:
+            diff_text = self._get_local_caller_audit_diff(edited)
+            updated_files = self._get_local_caller_audit_files(edited)
+            verdict = self.local_caller_auditor.audit(
+                diff_text,
+                task=getattr(self, "_local_caller_task", ""),
+                updated_files=updated_files,
+                io=self.io,
+            )
+            if verdict and not verdict.passed:
+                self.reflected_message = self.local_caller_auditor.build_continuation(verdict)
+                return
 
     def reply_completed(self):
         pass
@@ -1940,6 +2017,10 @@ class Coder:
         mentioned_rel_fnames = self.get_file_mentions(content)
 
         new_mentions = mentioned_rel_fnames - self.ignore_mentions
+        if self.local_callers and (
+            "<<<<<<< SEARCH" in content or "CALLER_CONTRACT:" in content.upper()
+        ):
+            new_mentions -= self.local_caller_contract_hook.attached_paths
 
         if not new_mentions:
             return
