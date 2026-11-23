@@ -5,6 +5,9 @@ import re
 from pathlib import Path
 
 
+DEFAULT_CALLER_HINT = "Check how the caller uses the return value before choosing the implementation."
+
+
 def read_python(root, name):
     path = root / name
     try:

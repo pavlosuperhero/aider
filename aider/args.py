@@ -122,11 +122,18 @@ def get_parser(default_config_files, git_root):
         help="Load an additional read-only Oracle reference document, like --read (default: none)",
     )
 
+    group = parser.add_argument_group("Local Python context (opt-in)")
     group.add_argument(
         "--local-callers",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Include short read-only excerpts from Python callers of named functions",
+    )
+
+    group.add_argument(
+        "--local-callers-hint",
+        metavar="TEXT",
+        help="Override the hint accompanying caller excerpts. Pass an empty string for code only.",
     )
 
     group = parser.add_argument_group("TDD workflow (opt-in)")

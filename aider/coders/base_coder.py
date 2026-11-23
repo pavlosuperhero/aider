@@ -351,10 +351,12 @@ class Coder:
         test_result_hooks=(),
         edit_hooks=(),
         local_callers=False,
+        local_callers_hint=None,
     ):
         self.test_result_hooks = tuple(test_result_hooks)
         self.edit_hooks = tuple(edit_hooks)
         self.test_hook_continuation = None
+        self.local_callers_hint = local_callers_hint
         self.local_callers = local_callers
         self.oracle_provider = oracle_provider
         self.response_hooks = tuple(response_hooks)
@@ -912,7 +914,7 @@ class Coder:
                 self.partial_response_content = None
                 return None
         if self.local_callers and self.repo:
-            from aider.local_callers import related_callers
+            from aider.local_callers import DEFAULT_CALLER_HINT, related_callers
 
             excerpt = related_callers(
                 Path(self.root),
@@ -922,10 +924,13 @@ class Coder:
             )
             if excerpt:
                 self.io.tool_output("Local caller evidence: " + excerpt.splitlines()[0])
-                message += (
-                    "\n\nRead-only caller snapshot for this task. Check how the caller uses "
-                    "the return value before choosing the implementation.\n" + excerpt
-                )
+                hint = self.local_callers_hint
+                if hint is None:
+                    hint = DEFAULT_CALLER_HINT
+                heading = "Read-only caller snapshot for this task."
+                if hint.strip():
+                    heading += " " + hint.strip()
+                message += f"\n\n{heading}\n{excerpt}"
         return message
 
     def init_before_message(self):
