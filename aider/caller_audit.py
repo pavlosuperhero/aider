@@ -8,14 +8,15 @@ tree_sitter, git, or aider.local_callers.
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 import re
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable, Literal, Protocol
 
 from aider.hooks import ResponseHookResult
 
-_VERDICT_RE = re.compile(r"VERDICT\s*:\s*\*{0,2}(PASS|FAIL)\*{0,2}\b", re.IGNORECASE)
+_VERDICT_RE = re.compile(r"(?:4\. )?VERDICT: (PASS|FAIL|UNKNOWN)(?:: ([^\n]{1,600}))?", re.I)
+_VERDICT_DECLARATION = re.compile(r"^\s*(?:(?:\d+[.)]|[-*])\s+)?\**VERDICT\s*:", re.I)
+_MAX_PATCH_CHARS = 16000
 _CONTRACT_RE = re.compile(r"\bCALLER_CONTRACT\s*:", re.IGNORECASE)
 _TRACE_RE = re.compile(r"\bTRACE\s*:", re.IGNORECASE)
-_REASON_PREFIX_RE = re.compile(r"^[\s:\-\u2013\u2014*]+")
 _MAX_REASON_CHARS = 600
 
 _AUDITOR_SYSTEM_PROMPT = """\
@@ -40,7 +41,8 @@ caller's exact variable names AND evaluate the caller's final output expression.
 what its variable name and downstream expression require (e.g., unpacked items \
 are not swapped, numeric values use the caller's expected unit, types and \
 null/sentinel checks match, and the caller's final output is valid).
-4. End with one final line:
+4. Put your verdict on a separate final line in plain text, without numbering or Markdown.
+If evidence is insufficient, use VERDICT: UNKNOWN: <reason>. For a verified match use:
 VERDICT: PASS
 or, ONLY if you proved a concrete input where a caller variable or caller result \
 is wrong:
@@ -56,9 +58,13 @@ class CallerExcerptLike(Protocol):
 
 @dataclass(frozen=True)
 class AuditVerdict:
-    passed: bool
+    status: Literal["PASS", "FAIL", "UNKNOWN", "ERROR"]
     reason: str
-    raw_response: str
+    raw_response: str = ""
+
+    @property
+    def passed(self):
+        return self.status == "PASS"
 
 
 def _format_excerpt(excerpt: CallerExcerptLike) -> str:
@@ -87,48 +93,35 @@ def _excerpt_references(excerpts: Iterable[CallerExcerptLike]) -> list[str]:
 
 
 def parse_audit_verdict(raw: str | None) -> AuditVerdict:
-    """Parse an auditor model response into an AuditVerdict (fail-open)."""
-    if raw is None or not raw.strip():
-        return AuditVerdict(
-            passed=True,
-            reason="empty audit response",
-            raw_response=raw or "",
-        )
-
-    matches = list(_VERDICT_RE.finditer(raw))
-    if not matches:
-        return AuditVerdict(
-            passed=True,
-            reason="no verdict token found",
-            raw_response=raw,
-        )
-
-    last = matches[-1]
-    token = last.group(1).upper()
-    tail = _REASON_PREFIX_RE.sub("", raw[last.end() :]).strip()
-
-    if token == "FAIL":
-        reason = tail[:_MAX_REASON_CHARS] if tail else raw.strip()[:_MAX_REASON_CHARS]
-        return AuditVerdict(passed=False, reason=reason, raw_response=raw)
-
-    reason = tail[:_MAX_REASON_CHARS] if tail else "PASS"
-    return AuditVerdict(passed=True, reason=reason, raw_response=raw)
+    """Require one final, unambiguous verdict line."""
+    raw = raw or ""
+    lines = raw.strip().splitlines()
+    candidates = [line for line in lines if _VERDICT_DECLARATION.match(line)]
+    match = _VERDICT_RE.fullmatch(lines[-1].strip()) if lines else None
+    if len(candidates) != 1 or not match:
+        return AuditVerdict("UNKNOWN", "Missing or malformed final verdict", raw[-2000:])
+    status, reason = match.groups()
+    status = status.upper()
+    if status == "PASS" and reason:
+        return AuditVerdict("UNKNOWN", "Qualified PASS verdict", raw[-2000:])
+    return AuditVerdict(status, reason or status, raw[-2000:])
 
 
 class CallerContractHook:
-    """Pre-apply response hook enforcing CALLER_CONTRACT + TRACE before edits."""
+    """Check the format of the editor's explanation before applying a proposal."""
 
-    def __init__(self, *, enabled: bool = False, max_rejections: int = 2):
+    def __init__(self, *, enabled: bool = False, max_rejections: int = 2, advisory=False):
+        self.advisory = advisory
         self.enabled = bool(enabled)
         self.max_rejections = max_rejections
         self._excerpts: tuple = ()
         self.rejections: int = 0
-        self._satisfied: bool = False
+        self.format_present = False
 
     def begin_turn(self, excerpts: Iterable[CallerExcerptLike]) -> None:
         self._excerpts = tuple(excerpts or ())
         self.rejections = 0
-        self._satisfied = False
+        self.format_present = False
 
     @property
     def attached_paths(self) -> frozenset[str]:
@@ -145,28 +138,34 @@ class CallerContractHook:
         token_count=None,
         io=None,
     ) -> ResponseHookResult | None:
-        if (
-            not self.enabled
-            or self._satisfied
-            or not self._excerpts
-            or self.rejections >= self.max_rejections
-        ):
+        self.format_present = False
+        if not self.enabled or not content:
             return None
-        if not content:
+        edit_marker = re.search(
+            r"<<<<<<< SEARCH|```|^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
+            content,
+            re.M,
+        )
+        if not edit_marker:
             return None
-        if "<<<<<<< SEARCH" not in content and "```" not in content:
+        if not self._excerpts:
+            if io:
+                io.tool_output("Local caller contract check: NO_EVIDENCE")
+            return None if self.advisory else ResponseHookResult()
+
+        pre_edit = content[: edit_marker.start()]
+        contract = _CONTRACT_RE.search(pre_edit)
+        trace = _TRACE_RE.search(pre_edit, contract.end()) if contract else None
+        if trace and any(ref in pre_edit for ref in _excerpt_references(self._excerpts)):
+            self.format_present = True
+            if io:
+                io.tool_output("Local caller contract format present; semantics unverified")
             return None
 
-        has_contract = bool(_CONTRACT_RE.search(content))
-        has_trace = bool(_TRACE_RE.search(content))
-
-        pre_edit = content.split("<<<<<<< SEARCH", 1)[0] if "<<<<<<< SEARCH" in content else content
-        refs = _excerpt_references(self._excerpts)
-        has_caller_ref = any(ref in pre_edit for ref in refs)
-
-        if has_contract and has_trace and has_caller_ref:
-            self._satisfied = True
-            return None
+        if self.rejections >= self.max_rejections:
+            if io:
+                io.tool_output("Local caller contract check: ENFORCEMENT_EXHAUSTED")
+            return None if self.advisory else ResponseHookResult()
 
         self.rejections += 1
         if io is not None:
@@ -227,16 +226,11 @@ class IsolatedCallerAuditor:
         if task and task.strip():
             sections.append(f"## Task\n{task.strip()}")
         sections.append(f"## Caller snippets\n{caller_section}")
-        if updated_files:
-            file_blocks = [
-                f"### {path}\n{code[:4000]}"
-                for path, code in sorted(updated_files.items())
-                if code
-            ]
-            if file_blocks:
-                sections.append("## Updated implementation\n" + "\n\n".join(file_blocks))
-        elif diff_text:
-            sections.append(f"## Proposed diff\n{diff_text}")
+        if diff_text:
+            patch = diff_text[:_MAX_PATCH_CHARS]
+            if len(diff_text) > _MAX_PATCH_CHARS:
+                patch += "\n[remaining patch omitted]"
+            sections.append(f"## Proposed diff\n{patch}")
         user_content = "\n\n".join(sections)
         return [
             {"role": "system", "content": _AUDITOR_SYSTEM_PROMPT},
@@ -250,36 +244,30 @@ class IsolatedCallerAuditor:
         task: str = "",
         updated_files: dict[str, str] | None = None,
         io=None,
-    ) -> AuditVerdict | None:
-        has_code = bool(updated_files) or bool(diff_text and diff_text.strip())
-        if not self._excerpts or not has_code or self.audits_run >= self.max_audits:
-            return None
-
-        self.audits_run += 1
-        messages = self.build_messages(diff_text, task=task, updated_files=updated_files)
-        try:
-            raw = self._complete_fn(messages)
-        except Exception as exc:
-            if io is not None:
-                io.tool_warning(f"Local caller audit failed ({exc}); continuing.")
-            return AuditVerdict(
-                passed=True,
-                reason=f"audit error: {exc}",
-                raw_response="",
-            )
-
-        verdict = parse_audit_verdict(raw)
+    ) -> AuditVerdict:
+        if not self._excerpts:
+            verdict = AuditVerdict("UNKNOWN", "NO_EVIDENCE")
+        elif not diff_text.strip() or len(diff_text) > _MAX_PATCH_CHARS:
+            verdict = AuditVerdict("UNKNOWN", "INCOMPLETE: patch missing or truncated")
+        elif any(getattr(e, "incomplete", False) for e in self._excerpts):
+            verdict = AuditVerdict("UNKNOWN", "INCOMPLETE: caller evidence")
+        elif self.audits_run >= self.max_audits:
+            verdict = AuditVerdict("UNKNOWN", "Audit budget exhausted")
+        else:
+            self.audits_run += 1
+            messages = self.build_messages(diff_text, task=task)
+            try:
+                verdict = parse_audit_verdict(self._complete_fn(messages))
+            except Exception as exc:
+                verdict = AuditVerdict("ERROR", str(exc)[:_MAX_REASON_CHARS])
         if io is not None:
-            if verdict.passed:
-                io.tool_output("Local caller audit: PASS")
-            else:
-                io.tool_output(f"Local caller audit: FAIL - {verdict.reason}")
+            detail = "" if verdict.passed else f" - {verdict.reason}"
+            io.tool_output(f"Local caller audit: {verdict.status}{detail}")
         return verdict
 
     def build_continuation(self, verdict: AuditVerdict) -> str:
         return (
-            "An independent caller-contract audit found a mismatch between your "
-            "proposed edit and the attached caller snippet(s):\n\n"
+            f"The caller audit returned {verdict.status}. The edits remain in the working tree.\n"
             f"{verdict.reason}\n\n"
             "Please revise the implementation so that every caller works as expected "
             "for both normal and edge-case inputs."

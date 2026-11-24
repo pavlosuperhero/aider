@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -12,7 +13,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL = "lm_studio/qwen3-coder-30b-a3b-instruct-mlx"
+MODEL = "lm_studio/qwen/qwen3.6-35b-a3b"
 
 ARM_FLAGS: dict[str, list[str]] = {
     "baseline": ["--no-local-callers"],
@@ -115,6 +116,7 @@ class CaseSpec:
     test_cmd: str
     hidden_cmd: list[str]
     kind: str = "caller"
+    additional_editable: tuple[str, ...] = ()
 
 
 def py_case(
@@ -231,6 +233,7 @@ def run_spec(
     map_tokens: int,
     spec: str = "vague",
     run_tag: str | None = None,
+    model: str = MODEL,
 ) -> dict:
     """Run a single Aider trial for case_spec under the requested arm."""
     if spec not in ("vague", "explicit"):
@@ -248,13 +251,17 @@ def run_spec(
     write_fixture_files(repo, case_spec.files)
     init_git_repo(repo)
 
-    env = dict(os.environ, PYTHONPATH=str(ROOT), AIDER_ANALYTICS="false")
+    env = dict(os.environ, PYTHONPATH=str(ROOT), AIDER_ANALYTICS="false", AIDER_TRIAL_USAGE="1")
+    targets = (case_spec.editable_file, *case_spec.additional_editable)
+    # A real fixture can contain a dependency of Aider itself (e.g. requests).
+    # Keep the fixture on the smoke/hidden check import path only.
     command = [
         sys.executable,
-        "-m",
-        "aider",
+        "-c",
+        "import runpy, sys; sys.path[:] = [entry for entry in sys.path if entry]; "
+        "runpy.run_module('aider', run_name='__main__', alter_sys=True)",
         "--model",
-        MODEL,
+        model,
         "--edit-format",
         "diff",
         "--oracle",
@@ -275,8 +282,8 @@ def run_spec(
         case_spec.test_cmd,
         *arm_flags,
         "--message",
-        f"{task} Edit only {case_spec.editable_file}.",
-        case_spec.editable_file,
+        f"{task} Edit only {', '.join(targets)}.",
+        *targets,
     ]
     start = time.monotonic()
     with (folder / "aider.log").open("w") as log_file:
@@ -294,12 +301,18 @@ def run_spec(
             code = 124
 
     log_text = (folder / "aider.log").read_text()
-    evidence = "Local caller evidence:" in log_text
+    evidence = bool(re.search(r"^Local caller evidence: (SELECTED|INCOMPLETE)", log_text, re.M))
     oracle = "required foundations loaded" in log_text
     contract_rejected = "Local caller contract check:" in log_text
-    audit_passed = "Local caller audit: PASS" in log_text
-    audit_failed = "Local caller audit: FAIL" in log_text
-    audit_ran = audit_passed or audit_failed
+    verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
+    usage = re.findall(r"^Trial usage: (editor|audit) (\d+|None)$", log_text, re.M)
+    if not any(kind == "editor" for kind, _ in usage):
+        raise RuntimeError(f"No editor completion recorded. See {folder / 'aider.log'}")
+    tokens = (
+        sum(int(value) for _, value in usage)
+        if usage and all(value.isdecimal() for _, value in usage)
+        else None
+    )
 
     verified, diagnostic = run_verification(repo, case_spec)
     gitdiff = subprocess.check_output(["git", "diff", "HEAD"], cwd=repo, text=True)
@@ -308,9 +321,10 @@ def run_spec(
         ["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo, text=True
     )
     (folder / "verification.txt").write_bytes(diagnostic)
-    only_target_modified = changed.splitlines() == [f" M {case_spec.editable_file}"]
+    only_target_modified = set(changed.splitlines()) == {f" M {target}" for target in targets}
 
     return dict(
+        model=model,
         round=round_id,
         spec=spec,
         kind=case_spec.kind,
@@ -322,8 +336,15 @@ def run_spec(
         oracle=oracle,
         evidence=evidence,
         contract_rejected=contract_rejected,
-        audit_ran=audit_ran,
-        audit_failed=audit_failed,
+        audit_ran=bool(verdicts),
+        audit_verdicts=verdicts,
+        audit_calls=sum(kind == "audit" for kind, _ in usage),
+        audit_failed="FAIL" in verdicts,
+        unknowns=verdicts.count("UNKNOWN"),
+        errors=verdicts.count("ERROR"),
+        false_approval=bool(verdicts and verdicts[-1] == "PASS" and not verified),
+        extra_calls=max(0, len(usage) - 1),
+        tokens=tokens,
         passed=verified and only_target_modified,
         seconds=round(time.monotonic() - start, 1),
         patch=gitdiff,

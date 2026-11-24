@@ -15,7 +15,7 @@ import ast
 import posixpath
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 from typing import Iterable, Protocol, Sequence
@@ -41,7 +41,7 @@ CONTRACT_CALLER_INSTRUCTIONS = (
     "variables are not swapped, numeric values use the caller's unit, and return types or "
     "missing-value sentinels match the caller's checks). If your draft puts values in the wrong "
     "order, unit, or type, fix the logic before writing the edit.\n"
-    "3. Output the edit block implementing the verified contract."
+    "3. Output the edit block implementing the described contract."
 )
 
 _WORD_RE = re.compile(r"\b[A-Za-z_]\w*\b")
@@ -146,10 +146,32 @@ class CallerExcerpt:
     start_line: int
     symbol: str
     code: str
+    limitations: tuple[str, ...] = ()
+
+    @property
+    def incomplete(self):
+        return bool(self.limitations)
 
     def format(self) -> str:
         """Render the caller excerpt with its 1-based file:line header."""
-        return f"{self.path}:{self.start_line}\n{self.code}"
+        marker = f" [INCOMPLETE: {', '.join(self.limitations)}]" if self.limitations else ""
+        return f"{self.path}:{self.start_line}{marker}\n{self.code}"
+
+
+@dataclass
+class CallerEvidenceReport:
+    definitions: set[tuple[str, str]] = field(default_factory=set)
+
+    def describe(self, excerpts):
+        status = "SELECTED" if excerpts else "NO_EVIDENCE"
+        if any(e.incomplete for e in excerpts):
+            status = "INCOMPLETE"
+        definitions = sorted(self.definitions)
+        targets = ", ".join(f"{path}:{symbol}" for path, symbol in definitions[:8]) or "none"
+        if len(definitions) > 8:
+            targets += ", [additional definitions omitted]"
+        sources = ", ".join(e.format().splitlines()[0] for e in excerpts) or "none"
+        return f"{status} (first direct calls only). Definitions: {targets}. Sources: {sources}"
 
 
 class CallerFinder(Protocol):
@@ -269,6 +291,7 @@ class PythonAstCallerFinder:
         max_files: int = 3,
         max_chars: int = 700,
         context_lines: int = 3,
+        report: CallerEvidenceReport | None = None,
     ) -> tuple[CallerExcerpt, ...]:
         if max_files <= 0 or max_chars <= 0:
             return ()
@@ -297,6 +320,8 @@ class PythonAstCallerFinder:
             for node in definitions:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if node.name in words:
+                        if report is not None:
+                            report.definitions.add((name, node.name))
                         target_funcs.add((module, node.name))
                         target_modules.add(module)
                 elif isinstance(node, ast.ClassDef):
@@ -305,6 +330,8 @@ class PythonAstCallerFinder:
                             isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
                             and item.name in words
                         ):
+                            if report is not None:
+                                report.definitions.add((name, item.name))
                             target_methods.add((module, node.name, item.name))
                             target_modules.add(module)
 
@@ -400,13 +427,21 @@ class PythonAstCallerFinder:
             call_node, symbol = matched_call
             lines = source.splitlines()
             start = max(0, call_node.lineno - ctx)
-            snippet = "\n".join(lines[start : call_node.lineno + ctx])[:max_chars]
+            snippet = "\n".join(lines[start : call_node.lineno + ctx])
+            limitations = []
+            if len(snippet) > max_chars:
+                limitations.append("excerpt truncated")
+            if call_node.end_lineno and call_node.end_lineno > call_node.lineno + ctx:
+                limitations.append("multiline call truncated")
+            if symbol in allowed_method_names:
+                limitations.append("ambiguous method receiver")
             excerpts.append(
                 CallerExcerpt(
                     path=name,
                     start_line=start + 1,
                     symbol=symbol,
-                    code=snippet,
+                    code=snippet[:max_chars],
+                    limitations=tuple(limitations),
                 )
             )
             if len(excerpts) >= max_files:
@@ -642,6 +677,7 @@ class TreeSitterCallerFinder:
         max_files: int = 3,
         max_chars: int = 700,
         context_lines: int = 3,
+        report: CallerEvidenceReport | None = None,
     ) -> tuple[CallerExcerpt, ...]:
         if max_files <= 0 or max_chars <= 0:
             return ()
@@ -662,6 +698,8 @@ class TreeSitterCallerFinder:
             defined = self._extract_definitions(name, source)
             for sym in defined:
                 if sym in words:
+                    if report is not None:
+                        report.definitions.add((name, sym))
                     targets.setdefault(sym, set()).add(name)
 
         if not targets:
@@ -692,13 +730,27 @@ class TreeSitterCallerFinder:
             lineno, symbol = match
             lines = source.splitlines()
             start = max(0, lineno - ctx)
-            snippet = "\n".join(lines[start : lineno + ctx + 1])[:max_chars]
+            snippet = "\n".join(lines[start : lineno + ctx + 1])
+            limitations = []
+            if len(snippet) > max_chars:
+                limitations.append("excerpt truncated")
+            named, namespaces = _parse_js_imports(source)
+            specifiers = [spec for imported, _, spec in named if imported == symbol]
+            specifiers.extend(spec for _, spec in namespaces)
+            resolved = any(
+                _js_specifier_matches_editable(spec, name, target)
+                for spec in specifiers
+                for target in targets[symbol]
+            )
+            if len(targets[symbol]) != 1 or not resolved:
+                limitations.append("ambiguous symbol binding")
             excerpts.append(
                 CallerExcerpt(
                     path=name,
                     start_line=start + 1,
                     symbol=symbol,
-                    code=snippet,
+                    code=snippet[:max_chars],
+                    limitations=tuple(limitations),
                 )
             )
             if len(excerpts) >= max_files:
@@ -951,6 +1003,7 @@ class CompositeCallerFinder:
         max_files: int = 3,
         max_chars: int = 700,
         context_lines: int = 3,
+        report: CallerEvidenceReport | None = None,
     ) -> tuple[CallerExcerpt, ...]:
         if max_files <= 0 or max_chars <= 0:
             return ()
@@ -960,7 +1013,7 @@ class CompositeCallerFinder:
         unique_candidates = tuple(
             c for c in sorted(set(candidates)) if Path(c).as_posix() not in editable_norm
         )
-        if not editable_tuple or not unique_candidates:
+        if not editable_tuple or (not unique_candidates and report is None):
             return ()
 
         prod_candidates = tuple(c for c in unique_candidates if not _is_test_path(c))
@@ -968,21 +1021,26 @@ class CompositeCallerFinder:
 
         # Prefer real production callers; only fall back to test/smoke files when no
         # production caller matches (prevents weak smoke assertions from diluting contracts).
-        for pool in (prod_candidates, test_candidates):
-            if not pool:
-                continue
+        pools = [pool for pool in (prod_candidates, test_candidates) if pool]
+        for pool in pools or [()]:
             by_path: dict[str, CallerExcerpt] = {}
             for finder in self.finders:
                 supported_editable = [p for p in editable_tuple if finder.supports(p)]
                 supported_candidates = [p for p in pool if finder.supports(p)]
-                if not supported_editable or not supported_candidates:
+                if not supported_editable or (not supported_candidates and report is None):
                     continue
                 found = finder.find_callers(
                     resolved_root,
                     message,
                     supported_editable,
                     supported_candidates,
-                    max_files=max_files,
+                    **(
+                        {"report": report}
+                        if report is not None
+                        and isinstance(finder, (PythonAstCallerFinder, TreeSitterCallerFinder))
+                        else {}
+                    ),
+                    max_files=max_files + 1,
                     max_chars=max_chars,
                     context_lines=context_lines,
                 )
@@ -990,7 +1048,22 @@ class CompositeCallerFinder:
                     by_path.setdefault(excerpt.path, excerpt)
             if by_path:
                 ordered = sorted(by_path.values(), key=lambda item: item.path)
-                return tuple(ordered[:max_files])
+                selected = ordered[:max_files]
+                if len(ordered) > max_files:
+                    selected[-1] = replace(
+                        selected[-1],
+                        limitations=(*selected[-1].limitations, "additional files omitted"),
+                    )
+                if report is not None:
+                    missing = {name for _, name in report.definitions} - {
+                        e.symbol for e in selected
+                    }
+                    if missing:
+                        selected[-1] = replace(
+                            selected[-1],
+                            limitations=(*selected[-1].limitations, "unmatched target symbols"),
+                        )
+                return tuple(selected)
 
         return ()
 
@@ -1007,6 +1080,7 @@ def find_related_callers(
     max_files: int = 3,
     max_chars: int = 700,
     context_lines: int = 3,
+    report: CallerEvidenceReport | None = None,
 ) -> tuple[CallerExcerpt, ...]:
     """Find bounded local caller excerpts across Python and non-Python source files."""
     return _DEFAULT_FINDER.find_callers(
@@ -1014,6 +1088,7 @@ def find_related_callers(
         message,
         tuple(editable),
         tuple(candidates),
+        report=report,
         max_files=max_files,
         max_chars=max_chars,
         context_lines=context_lines,
@@ -1028,7 +1103,7 @@ def related_callers(
 ) -> str:
     """Backwards-compatible wrapper returning formatted caller excerpts joined by blank lines."""
     excerpts = find_related_callers(root, message, editable, candidates, context_lines=3)
-    return "\n\n".join(excerpt.format() for excerpt in excerpts)
+    return "\n\n".join(f"{e.path}:{e.start_line}\n{e.code}" for e in excerpts)
 
 
 def format_caller_context(

@@ -142,7 +142,7 @@ def get_parser(default_config_files, git_root):
         default="passive",
         help=(
             "How caller excerpts are applied: 'passive' attaches a read-only snapshot, "
-            "'contract' enforces a CALLER_CONTRACT and dry-run TRACE before edits are applied "
+            "'contract' requests CALLER_CONTRACT and TRACE sections (format check only) "
             "(default: passive)"
         ),
     )
@@ -155,6 +155,13 @@ def get_parser(default_config_files, git_root):
             "Run an isolated post-edit Chain-of-Verification caller-contract audit against "
             "the diff and caller excerpts (default: False)"
         ),
+    )
+
+    group.add_argument(
+        "--local-callers-policy",
+        choices=("strict", "advisory"),
+        default="strict",
+        help="Strict blocks unverified edits from auto-commit. Advisory permits them with a diagnostic.",
     )
 
     group = parser.add_argument_group("TDD workflow (opt-in)")

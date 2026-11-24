@@ -262,3 +262,30 @@ def test_production_callers_preferred_over_smoke_and_tests(tmp_path):
         ["smoke.py", "tests/test_api.py"],
     )
     assert [e.path for e in fallback] == ["smoke.py", "tests/test_api.py"]
+
+
+def test_evidence_report_names_definition_without_a_matching_caller(tmp_path):
+    from aider.local_callers import CallerEvidenceReport
+
+    (tmp_path / "api.py").write_text("def process(): pass")
+    (tmp_path / "other.py").write_text("print('hello')")
+    report = CallerEvidenceReport()
+    excerpts = find_related_callers(
+        tmp_path, "fix process", ["api.py"], ["other.py"], report=report
+    )
+    assert not excerpts
+    assert "NO_EVIDENCE" in report.describe(excerpts)
+    assert "api.py:process" in report.describe(excerpts)
+
+
+def test_evidence_report_marks_ambiguous_method_receiver(tmp_path):
+    from aider.local_callers import CallerEvidenceReport
+
+    (tmp_path / "api.py").write_text("class A:\n    def convert(self): pass")
+    (tmp_path / "other.py").write_text("from api import A\ndef process(obj): return obj.convert()")
+    report = CallerEvidenceReport()
+    excerpts = find_related_callers(
+        tmp_path, "fix convert", ["api.py"], ["other.py"], report=report
+    )
+    assert "ambiguous method receiver" in report.describe(excerpts)
+    assert excerpts[0].incomplete

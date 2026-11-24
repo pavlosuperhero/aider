@@ -495,6 +495,12 @@ def summarize(rows: list[dict]) -> None:
             "audit_ran": 0,
             "audit_failed": 0,
             "seconds": 0.0,
+            "unknowns": 0,
+            "errors": 0,
+            "false_approval": 0,
+            "extra_calls": 0,
+            "tokens": 0,
+            "instrumented": 0,
         }
     )
 
@@ -530,6 +536,10 @@ def summarize(rows: list[dict]) -> None:
         stat["contract_rejected"] += int(bool(r.get("contract_rejected")))
         stat["audit_ran"] += int(bool(r.get("audit_ran")))
         stat["audit_failed"] += int(bool(r.get("audit_failed")))
+        if r.get("tokens") is not None:
+            stat["instrumented"] += 1
+        for field in ("unknowns", "errors", "false_approval", "extra_calls", "tokens"):
+            stat[field] += r.get(field) or 0
         stat["seconds"] += float(r.get("seconds", 0.0))
 
     arms = ordered_values(present_arms, ARM_ORDER)
@@ -626,6 +636,13 @@ def summarize(rows: list[dict]) -> None:
             f" contract_rej={int(stat['contract_rejected'])}"
             f" audit={int(stat['audit_ran'])} (fail={int(stat['audit_failed'])})"
             f" mean_s={mean_sec:.1f}"
+            + (
+                f" extra_calls={stat['extra_calls']} tokens={stat['tokens']}"
+                f" false_approvals={stat['false_approval']} unknowns={stat['unknowns']}"
+                f" errors={stat['errors']}"
+                if stat["instrumented"] == n
+                else " detailed telemetry incomplete"
+            )
         )
 
 
@@ -666,6 +683,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--map-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20261123)
+    parser.add_argument("--model", default=run.MODEL)
     parser.add_argument("--out", default=str(Path(__file__).with_name("heldout_results.jsonl")))
     parser.add_argument("--summarize", action="store_true", help="only summarize --out")
     parser.add_argument(
@@ -693,6 +711,7 @@ def main():
         default=None,
         help=f"optional comma-separated language filter from {', '.join(LANGUAGE_ORDER)}",
     )
+    parser.add_argument("--suite", choices=["synthetic", "requests"], default="synthetic")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -701,7 +720,14 @@ def main():
         summarize(rows)
         return
 
-    selected_cases = select_cases(args.cases, args.languages, parser)
+    if args.suite == "requests":
+        import requests_cases
+
+        selected_cases = requests_cases.cases()
+        if args.cases or args.languages:
+            parser.error("Use --suite requests without synthetic case or language filters")
+    else:
+        selected_cases = select_cases(args.cases, args.languages, parser)
     if args.check_fixtures:
         raise SystemExit(check_fixtures(selected_cases))
 
@@ -728,6 +754,7 @@ def main():
             round_id=r,
             map_tokens=args.map_tokens,
             spec=spec,
+            model=args.model,
         )
         rows.append(result)
         print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)

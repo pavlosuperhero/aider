@@ -26,6 +26,7 @@ class FakeExcerpt:
     start_line: int
     symbol: str
     code: str
+    incomplete: bool = False
 
     def format(self) -> str:
         return f"{self.path}:{self.start_line}\n{self.code}"
@@ -87,14 +88,14 @@ def test_parse_audit_verdict_fail_multiline_and_case_insensitive():
     raw = "verdict: fail\nCounterexample: format_price(0) returns '$0.00', breaking float()."
     verdict = parse_audit_verdict(raw)
     assert verdict.passed is False
-    assert "format_price(0)" in verdict.reason
+    assert verdict.status == "UNKNOWN"
 
 
 def test_parse_audit_verdict_fail_fallback_when_nothing_follows():
     raw = "The caller unpacks (a, b) but the diff returns (b, a).\nVERDICT: FAIL"
     verdict = parse_audit_verdict(raw)
     assert verdict.passed is False
-    assert "caller unpacks (a, b)" in verdict.reason
+    assert verdict.status == "FAIL"
 
 
 def test_parse_audit_verdict_uses_last_occurrence():
@@ -109,16 +110,15 @@ def test_parse_audit_verdict_uses_last_occurrence():
 
 
 @pytest.mark.parametrize("raw", [None, "", "   \n\t  "])
-def test_parse_audit_verdict_empty_fails_open(raw):
+def test_parse_audit_verdict_empty_is_unknown(raw):
     verdict = parse_audit_verdict(raw)
-    assert verdict.passed is True
-    assert verdict.reason == "empty audit response"
+    assert verdict.status == "UNKNOWN"
     assert verdict.raw_response == (raw or "")
 
 
-def test_parse_audit_verdict_no_token_fails_open():
+def test_parse_audit_verdict_no_token_is_unknown():
     verdict = parse_audit_verdict("Everything looks consistent across callers.")
-    assert verdict.passed is True
+    assert verdict.status == "UNKNOWN"
     assert verdict.raw_response == "Everything looks consistent across callers."
 
 
@@ -182,15 +182,15 @@ def test_contract_hook_respects_max_rejections_and_resets_on_begin_turn():
     assert isinstance(hook(EDIT_BLOCK), ResponseHookResult)
     assert isinstance(hook(EDIT_BLOCK), ResponseHookResult)
     assert hook.rejections == 2
-    assert hook(EDIT_BLOCK) is None
+    assert hook(EDIT_BLOCK) == ResponseHookResult()
 
     hook.begin_turn([SAMPLE_EXCERPT])
     assert hook.rejections == 0
     assert isinstance(hook(EDIT_BLOCK), ResponseHookResult)
 
-    # Empty turn disables gating so stale excerpts do not leak.
+    # A strict format gate requires at least one source.
     hook.begin_turn(())
-    assert hook(EDIT_BLOCK) is None
+    assert hook(EDIT_BLOCK) == ResponseHookResult()
 
 
 def test_contract_hook_disabled_always_passes_through():
@@ -247,7 +247,7 @@ def test_auditor_returns_fail_verdict_and_continuation():
     assert "leading '$'" in cont
 
     # Respects max_audits budget within the same turn
-    assert auditor.audit("+    return 'x'", io=io) is None
+    assert auditor.audit("+    return 'x'", io=io).status == "UNKNOWN"
     assert len(captured) == 1
 
 
@@ -262,28 +262,28 @@ def test_auditor_returns_pass_verdict():
     io.tool_output.assert_called_once_with("Local caller audit: PASS")
 
 
-def test_auditor_fails_open_on_exception_or_none():
+def test_auditor_reports_backend_failure_and_empty_response():
     io = Mock()
     auditor_err = IsolatedCallerAuditor(Mock(side_effect=RuntimeError("network down")))
     auditor_err.begin_turn([SAMPLE_EXCERPT])
     verdict_err = auditor_err.audit("+x = 1", io=io)
     assert verdict_err is not None
-    assert verdict_err.passed is True
-    io.tool_warning.assert_called_once()
+    assert verdict_err.status == "ERROR"
+    io.tool_output.assert_called_once()
 
     auditor_none = IsolatedCallerAuditor(lambda msgs: None)
     auditor_none.begin_turn([SAMPLE_EXCERPT])
     verdict_none = auditor_none.audit("+x = 1")
     assert verdict_none is not None
-    assert verdict_none.passed is True
+    assert verdict_none.status == "UNKNOWN"
 
 
 def test_auditor_skips_when_empty_excerpts_or_diff():
     called = Mock(return_value="VERDICT: FAIL: should not run")
     auditor = IsolatedCallerAuditor(called)
-    assert auditor.audit("+x = 1") is None
+    assert auditor.audit("+x = 1").status == "UNKNOWN"
     auditor.begin_turn([SAMPLE_EXCERPT])
-    assert auditor.audit("   \n") is None
+    assert auditor.audit("   \n").status == "UNKNOWN"
     called.assert_not_called()
 
 
@@ -407,11 +407,13 @@ def test_coder_audit_fail_sets_reflected_message_with_counterexample(project, mo
             "but pkg/consumer.py expects '10.50'"
         )
 
-    monkeypatch.setattr(coder.main_model, "simple_send_with_retries", fake_audit)
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", fake_audit)
     sends = fake_send(coder, [EDIT_BLOCK, FIX_EDIT_BLOCK])
 
+    head = git.Repo(project).head.commit
     coder.run("update format_price")
 
+    assert git.Repo(project).head.commit == head
     assert len(audit_calls) == 1
     assert len(audit_calls[0]) == 2
     assert "pkg/consumer.py:12" in audit_calls[0][1]["content"]
@@ -432,7 +434,7 @@ def test_coder_audit_pass_does_not_reflect(project, monkeypatch):
         audit_calls.append(messages)
         return "VERDICT: PASS"
 
-    monkeypatch.setattr(coder.main_model, "simple_send_with_retries", fake_audit)
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", fake_audit)
     sends = fake_send(coder, [EDIT_BLOCK])
 
     coder.run("update format_price")
@@ -461,7 +463,7 @@ def test_coder_contract_mode_gates_before_applying_edits(project, monkeypatch):
     assert coder.get_inchat_relative_files() == ["pricing.py"]
 
 
-def test_contract_hook_does_not_reject_followup_reflection_once_satisfied():
+def test_contract_hook_requires_sections_on_followup_edit():
     hook = CallerContractHook(enabled=True, max_rejections=2)
     hook.begin_turn([SAMPLE_EXCERPT])
     valid = (
@@ -470,14 +472,14 @@ def test_contract_hook_does_not_reject_followup_reflection_once_satisfied():
         + EDIT_BLOCK
     )
     assert hook(valid) is None
-    # Follow-up edit after an audit/test reflection should not be rejected again.
-    assert hook(FIX_EDIT_BLOCK) is None
+    # Each changed proposal needs its own contract and trace.
+    assert hook(FIX_EDIT_BLOCK) is not None
     # New turn resets satisfaction.
     hook.begin_turn([SAMPLE_EXCERPT])
     assert hook(FIX_EDIT_BLOCK) is not None
 
 
-def test_auditor_uses_task_and_updated_files_instead_of_diff():
+def test_auditor_keeps_patch_when_updated_file_is_long():
     captured = []
 
     def complete(messages):
@@ -495,6 +497,215 @@ def test_auditor_uses_task_and_updated_files_instead_of_diff():
     user_msg = captured[0][1]["content"]
     assert "## Task" in user_msg
     assert "Update format_price to return dollars." in user_msg
-    assert "## Updated implementation" in user_msg
-    assert "### pricing.py" in user_msg
-    assert "old_bug" not in user_msg
+    assert "## Proposed diff" in user_msg
+    assert "+ new_fix()" in user_msg
+
+
+@pytest.mark.parametrize("auto_commit", [True, False])
+@pytest.mark.parametrize("stream", [False, True])
+def test_audit_uses_late_hunk_and_only_commits_after_acceptance(project, monkeypatch, auto_commit, stream):
+    repo = git.Repo(project)
+    path = project / "pricing.py"
+    path.write_text("# padding\n" * 700 + path.read_text())
+    repo.index.add(["pricing.py"])
+    head = repo.index.commit("long file")
+    coder = make_coder(local_callers=True, local_callers_audit=True, auto_commits=auto_commit)
+    fake_send(coder, [EDIT_BLOCK, FIX_EDIT_BLOCK.replace("return f'{cents", "return  f'{cents")])
+    prompts = []
+
+    def audit(messages):
+        assert repo.head.commit == head
+        prompts.append(messages[1]["content"])
+        return "VERDICT: FAIL: currency prefix" if len(prompts) == 1 else "VERDICT: PASS"
+
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", audit)
+    if stream:
+        list(coder.run_stream("update format_price"))
+    else:
+        coder.run("update format_price")
+    assert len(prompts) == 2
+    assert "@@ -69" in prompts[0]
+    assert "+    return f'$" in prompts[0]
+    assert (repo.head.commit != head) == auto_commit
+    assert repo.is_dirty() != auto_commit
+
+
+@pytest.mark.parametrize("stage", ["lint", "test"])
+def test_failed_checks_leave_edit_uncommitted(project, monkeypatch, stage):
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    repo = git.Repo(project)
+    head = repo.head.commit
+    fake_send(coder, [EDIT_BLOCK])
+    coder.auto_lint = stage == "lint"
+    coder.auto_test = stage == "test"
+    monkeypatch.setattr(coder, "lint_edited", lambda paths: "lint failure")
+    monkeypatch.setattr(coder.commands, "cmd_test", lambda cmd: "test failure")
+    monkeypatch.setattr(coder.io, "confirm_ask", lambda *a, **kw: False)
+    coder.run("update format_price")
+    assert repo.head.commit == head
+    assert repo.is_dirty()
+    assert coder.local_caller_auditor.audits_run == 0
+
+
+def test_contradictory_trace_only_claims_format_compliance():
+    hook = CallerContractHook(enabled=True)
+    hook.begin_turn([SAMPLE_EXCERPT])
+    io = Mock()
+    assert (
+        hook(
+            "CALLER_CONTRACT: consumer.py expects '10.50'.\nTRACE: got '$10.50'.\n" + EDIT_BLOCK,
+            io=io,
+        )
+        is None
+    )
+    io.tool_output.assert_called_once_with(
+        "Local caller contract format present; semantics unverified"
+    )
+
+
+@pytest.mark.parametrize("policy,committed", [("strict", False), ("advisory", True)])
+def test_unavailable_verification_requires_explicit_advisory(
+    project, monkeypatch, policy, committed
+):
+    coder = make_coder(local_callers=True, local_callers_audit=True, local_callers_policy=policy)
+    repo = git.Repo(project)
+    head = repo.head.commit
+    fake_send(coder, [EDIT_BLOCK])
+    monkeypatch.setattr(
+        coder.main_model, "send_completion", Mock(side_effect=RuntimeError("offline"))
+    )
+    coder.run("update format_price")
+    assert (repo.head.commit != head) == committed
+    assert repo.is_dirty() != committed
+    if not committed:
+        fake_send(coder, [FIX_EDIT_BLOCK])
+        coder.run("update format_price again")
+        assert repo.head.commit == head
+        assert "return f'$" in (project / "pricing.py").read_text()
+
+
+def test_incomplete_evidence_never_calls_backend():
+    auditor = IsolatedCallerAuditor(Mock())
+    from aider.local_callers import CallerExcerpt
+
+    auditor.begin_turn([CallerExcerpt("consumer.py", 1, "fn", "fn()", ("excerpt truncated",))])
+    assert auditor.audit("+change").status == "UNKNOWN"
+    auditor.begin_turn([SAMPLE_EXCERPT])
+    patch = "+changed\n" * 3000
+    assert "[remaining patch omitted]" in auditor.build_messages(patch)[1]["content"]
+    assert auditor.audit(patch).status == "UNKNOWN"
+    auditor._complete_fn.assert_not_called()
+
+
+def test_malformed_qualified_or_conflicting_pass_is_unknown():
+    for reply in (
+        "VERDICT: PASS (maybe)",
+        "VERDICT: PASS: missing evidence",
+        "VERDICT: FAIL: incorrect\nVERDICT: PASS",
+        "VERDICT: PASS\nmore text",
+    ):
+        assert parse_audit_verdict(reply).status == "UNKNOWN"
+
+
+def test_advisory_exhaustion_is_visible():
+    hook = CallerContractHook(enabled=True, max_rejections=0, advisory=True)
+    hook.begin_turn([SAMPLE_EXCERPT])
+    io = Mock()
+    assert hook(EDIT_BLOCK, io=io) is None
+    io.tool_output.assert_called_once_with("Local caller contract check: ENFORCEMENT_EXHAUSTED")
+
+
+def test_concurrent_change_during_audit_stays_in_working_tree(project, monkeypatch):
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    repo = git.Repo(project)
+    head = repo.head.commit
+    fake_send(coder, [EDIT_BLOCK])
+    path = project / "pricing.py"
+
+    def concurrent_change(messages):
+        path.write_text(path.read_text() + "# user change\n")
+        return "VERDICT: PASS"
+
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", concurrent_change)
+    coder.run("update format_price")
+    assert repo.head.commit == head
+    assert path.read_text().endswith("# user change\n")
+
+
+def test_declined_patch_does_not_run_suggested_commands(project, monkeypatch):
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    fake_send(coder, [EDIT_BLOCK])
+    shell = Mock()
+    monkeypatch.setattr(coder, "run_shell_commands", shell)
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", lambda messages: None)
+    coder.run("update format_price")
+    shell.assert_not_called()
+
+
+def test_contract_markers_inside_patch_cannot_satisfy_pre_edit_gate():
+    hook = CallerContractHook(enabled=True)
+    hook.begin_turn([SAMPLE_EXCERPT])
+    maliciously_formatted = EDIT_BLOCK.replace(
+        "def format_price", "# CALLER_CONTRACT: consumer.py\n# TRACE:\ndef format_price"
+    )
+    assert hook(maliciously_formatted).continuation
+
+
+def test_strict_contract_exhaustion_stops_before_writing(project, monkeypatch):
+    coder = make_coder(local_callers=True, local_callers_mode="contract")
+    repo = git.Repo(project)
+    head = repo.head.commit
+    sends = fake_send(coder, [EDIT_BLOCK])
+    coder.run("update format_price")
+    assert len(sends) == 3
+    assert repo.head.commit == head
+    assert not repo.is_dirty()
+
+
+def test_auditor_propagates_missing_model_choices_as_unknown(project, monkeypatch):
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    repo = git.Repo(project)
+    head = repo.head.commit
+    fake_send(coder, [EDIT_BLOCK])
+    monkeypatch.setattr(coder.main_model, "send_completion", lambda **kwargs: ("hash", None))
+    coder.run("update format_price")
+    assert repo.head.commit == head
+    assert repo.is_dirty()
+
+
+def test_reflection_rechecks_all_pending_files_in_one_commit(project, monkeypatch):
+    repo = git.Repo(project)
+    note = project / "notes.py"
+    note.write_text("value = 1\n")
+    repo.index.add(["notes.py"])
+    head = repo.index.commit("add second editable file")
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    coder.add_rel_fname("notes.py")
+    second = "notes.py\n```python\n<<<<<<< SEARCH\nvalue = 1\n=======\nvalue = 2\n>>>>>>> REPLACE\n```\n"
+    fix = FIX_EDIT_BLOCK.replace("return f'{cents", "return  f'{cents")
+    fake_send(coder, [EDIT_BLOCK + second, fix])
+    prompts = []
+
+    def verify(messages):
+        assert repo.head.commit == head
+        prompts.append(messages[1]["content"])
+        return "VERDICT: FAIL: unexpected currency prefix" if len(prompts) == 1 else "VERDICT: PASS"
+
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", verify)
+    coder.run("update format_price")
+    assert len(prompts) == 2
+    assert all("+++ b/notes.py" in prompt and "+++ b/pricing.py" in prompt for prompt in prompts)
+    assert repo.head.commit.parents == (head,)
+    assert not repo.is_dirty()
+
+
+@pytest.mark.parametrize("line,status", [
+    ("4. VERDICT: PASS", "PASS"),
+    ("4. VERDICT: FAIL: wrong unit", "FAIL"),
+    ("4. VERDICT: UNKNOWN: incomplete snippet", "UNKNOWN"),
+    ("4. VERDICT: PASS, probably", "UNKNOWN"),
+    ("4. VERDICT: FAIL: wrong unit\nVERDICT: PASS", "UNKNOWN"),
+    ("VERDICT: FAIL: wrong unit\n4. VERDICT: PASS", "UNKNOWN"),
+])
+def test_numbered_final_step_uses_the_same_verdict_grammar(line, status):
+    assert parse_audit_verdict(line).status == status
