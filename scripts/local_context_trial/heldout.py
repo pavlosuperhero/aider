@@ -407,6 +407,41 @@ def ordered_values(present: set[str], preferred: tuple[str, ...]) -> list[str]:
     return [v for v in preferred if v in present] + extras
 
 
+_Z_95 = 1.959963984540054
+_T_CRIT_95 = {
+    1: 12.706204736432095,
+    2: 4.302652729911275,
+    3: 3.182446305284263,
+    4: 2.7764451051977987,
+    5: 2.5705818366147395,
+    6: 2.4469118487916806,
+    7: 2.3646242510102993,
+    8: 2.3060041350333704,
+    9: 2.2621571627409915,
+    10: 2.2281388519649385,
+    11: 2.200985160082949,
+    12: 2.1788128296634177,
+    13: 2.1603686564610127,
+    14: 2.1447866879169273,
+    15: 2.131449545559323,
+    16: 2.1199052992210112,
+    17: 2.1098155778331806,
+    18: 2.10092204024096,
+    19: 2.093024054408263,
+    20: 2.0859634472658364,
+    21: 2.079613844727662,
+    22: 2.0738730679040147,
+    23: 2.0686576104190406,
+    24: 2.0638985616280205,
+    25: 2.059538552753294,
+    26: 2.055529438642871,
+    27: 2.0518305164802833,
+    28: 2.048407141795244,
+    29: 2.045229642132703,
+    30: 2.0422724563012373,
+}
+
+
 def sign_test(wins: int, losses: int) -> float:
     n = wins + losses
     if not n:
@@ -414,6 +449,71 @@ def sign_test(wins: int, losses: int) -> float:
     k = min(wins, losses)
     tail = sum(math.comb(n, i) for i in range(k + 1)) / 2**n
     return min(1.0, 2 * tail)
+
+
+def _t_critical_95(df: int) -> float:
+    """Two-sided 95% Student-t critical value for degrees of freedom >= 1."""
+    if df < 1:
+        raise ValueError(f"df must be >= 1, got {df}")
+    if df in _T_CRIT_95:
+        return _T_CRIT_95[df]
+    z = _Z_95
+    return (
+        z
+        + (z**3 + z) / (4.0 * df)
+        + (5.0 * z**5 + 16.0 * z**3 + 3.0 * z) / (96.0 * df**2)
+        + (3.0 * z**7 + 19.0 * z**5 + 17.0 * z**3 - 15.0 * z) / (384.0 * df**3)
+    )
+
+
+def paired_proportion_diff_ci(
+    wins: int,
+    losses: int,
+    n_pairs: int,
+) -> tuple[float | None, float | None, float | None]:
+    """Return (delta, ci_low, ci_high) using Bonett-Price (2012) 95% paired CI."""
+    if n_pairs < 0 or wins < 0 or losses < 0 or wins + losses > n_pairs:
+        raise ValueError(
+            f"Invalid paired counts: wins={wins}, losses={losses}, n_pairs={n_pairs}"
+        )
+    if n_pairs == 0:
+        return None, None, None
+    delta = (wins - losses) / n_pairs
+    p10 = (wins + 1.0) / (n_pairs + 2.0)
+    p01 = (losses + 1.0) / (n_pairs + 2.0)
+    center = p10 - p01
+    var = max(0.0, (p10 + p01 - center * center) / (n_pairs + 2.0))
+    half = _Z_95 * math.sqrt(var)
+    return delta, max(-1.0, center - half), min(1.0, center + half)
+
+
+def paired_mean_diff_ci(
+    diffs: list[float],
+) -> tuple[float | None, float | None, float | None]:
+    """Return (mean, ci_low, ci_high) using a 95% paired Student-t interval."""
+    n = len(diffs)
+    if n == 0:
+        return None, None, None
+    mean = sum(diffs) / n
+    if n == 1:
+        return mean, None, None
+    ss = sum((d - mean) ** 2 for d in diffs)
+    se = math.sqrt(ss / (n - 1)) / math.sqrt(n)
+    half = _t_critical_95(n - 1) * se
+    return mean, mean - half, mean + half
+
+
+def load_results(path: Path) -> list[dict]:
+    """Load trial rows from a JSONL file, ignoring blank lines and metadata records."""
+    rows: list[dict] = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        obj = json.loads(line)
+        if isinstance(obj, dict) and obj.get("record_type") == "metadata":
+            continue
+        rows.append(obj)
+    return rows
 
 
 def check_fixtures(cases: list[run.CaseSpec]) -> int:
@@ -472,34 +572,288 @@ def _paired_comparison(
         if not group_filter(key):
             continue
         if treatment in outcomes and reference in outcomes:
+            t_val = outcomes[treatment]
+            r_val = outcomes[reference]
+            if t_val is None or r_val is None:
+                continue
             total += 1
-            win += int(bool(outcomes[treatment]) and not bool(outcomes[reference]))
-            loss += int(bool(outcomes[reference]) and not bool(outcomes[treatment]))
+            win += int(bool(t_val) and not bool(r_val))
+            loss += int(bool(r_val) and not bool(t_val))
     return win, loss, total
 
 
-def summarize(rows: list[dict]) -> None:
-    """Print grouped pass-rate table and paired exact sign-test p-values."""
+def _paired_binary_stats(
+    pairs: dict[tuple[str, str, str, str, object], dict[str, bool | None]],
+    group_filter,
+    treatment: str,
+    reference: str,
+) -> dict | None:
+    win, loss, n_pairs = _paired_comparison(pairs, group_filter, treatment, reference)
+    if not n_pairs:
+        return None
+    delta, ci_low, ci_high = paired_proportion_diff_ci(win, loss, n_pairs)
+    return {
+        "n_pairs": n_pairs,
+        "wins": win,
+        "losses": loss,
+        "delta": delta,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "p_value": sign_test(win, loss),
+    }
+
+
+def _paired_numeric_stats(
+    pairs: dict[tuple[str, str, str, str, object], dict[str, float | None]],
+    group_filter,
+    treatment: str,
+    reference: str,
+) -> dict | None:
+    diffs: list[float] = []
+    for key, values in pairs.items():
+        if not group_filter(key):
+            continue
+        if treatment in values and reference in values:
+            t_val = values[treatment]
+            r_val = values[reference]
+            if t_val is not None and r_val is not None:
+                diffs.append(float(t_val) - float(r_val))
+    if not diffs:
+        return None
+    mean, ci_low, ci_high = paired_mean_diff_ci(diffs)
+    return {
+        "n_pairs": len(diffs),
+        "mean_diff": mean,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+    }
+
+
+def _extract_row_outcomes(row: dict) -> dict:
+    """Extract separate audit, commit, hidden, and token metrics with legacy compatibility."""
+    if "audit_outcome" in row and row["audit_outcome"] is not None:
+        audit_outcome = str(row["audit_outcome"])
+    else:
+        verdicts = row.get("audit_verdicts") or []
+        if verdicts:
+            audit_outcome = str(verdicts[-1]).lower()
+        elif row.get("audit_ran"):
+            audit_outcome = "fail" if row.get("audit_failed") else "pass"
+        else:
+            audit_outcome = "not_run"
+
+    if "audit_passed" in row:
+        audit_passed = row["audit_passed"]
+    elif audit_outcome == "not_run":
+        audit_passed = None
+    else:
+        audit_passed = audit_outcome == "pass"
+
+    commit_passed = bool(row["commit_passed"]) if row.get("commit_passed") is not None else None
+    commit_outcome = row.get("commit_outcome")
+    hidden_passed = bool(row["hidden_passed"]) if row.get("hidden_passed") is not None else None
+    hidden_outcome = row.get("hidden_outcome")
+    smoke_passed = bool(row["smoke_passed"]) if row.get("smoke_passed") is not None else None
+
+    tokens = row.get("tokens")
+    tokens_measured = (
+        bool(row["tokens_measured"])
+        if "tokens_measured" in row and row["tokens_measured"] is not None
+        else (tokens is not None)
+    )
+    return {
+        "audit_outcome": audit_outcome,
+        "audit_passed": audit_passed,
+        "commit_outcome": commit_outcome,
+        "commit_passed": commit_passed,
+        "hidden_outcome": hidden_outcome,
+        "hidden_passed": hidden_passed,
+        "smoke_passed": smoke_passed,
+        "tokens": tokens if tokens_measured else None,
+        "tokens_measured": tokens_measured,
+        "editor_tokens": row.get("editor_tokens"),
+        "audit_tokens": row.get("audit_tokens"),
+    }
+
+
+def _row_control_tuple(row: dict) -> tuple[str | None, bool | None, bool]:
+    base_arm = normalize_arm(row["arm"])
+    backend = row.get("local_callers_backend")
+    read_range = row.get("local_callers_read_range")
+    if "local_callers_facts" in row and row["local_callers_facts"] is not None:
+        facts = bool(row["local_callers_facts"])
+    else:
+        facts = base_arm != "baseline"
+    return (backend, read_range, facts)
+
+
+def _build_arm_labels(rows: list[dict]) -> tuple[list[str], dict[str, str]]:
+    """Assign arm display labels, qualifying only arms that vary across controls."""
+    controls_by_arm: dict[str, set[tuple[str | None, bool | None, bool]]] = defaultdict(set)
+    row_base_and_ctrl: list[tuple[str, tuple[str | None, bool | None, bool]]] = []
+    for row in rows:
+        base_arm = normalize_arm(row["arm"])
+        ctrl = _row_control_tuple(row)
+        controls_by_arm[base_arm].add(ctrl)
+        row_base_and_ctrl.append((base_arm, ctrl))
+
+    varying_dims: dict[str, tuple[bool, bool, bool]] = {}
+    for base_arm, ctrls in controls_by_arm.items():
+        if len(ctrls) > 1:
+            varying_dims[base_arm] = (
+                len({c[0] for c in ctrls}) > 1,
+                len({c[1] for c in ctrls}) > 1,
+                len({c[2] for c in ctrls}) > 1,
+            )
+
+    labels: list[str] = []
+    label_to_base: dict[str, str] = {}
+    for base_arm, (backend, read_range, facts) in row_base_and_ctrl:
+        dims = varying_dims.get(base_arm)
+        if not dims:
+            label = base_arm
+        else:
+            vary_backend, vary_range, vary_facts = dims
+            parts: list[str] = []
+            if vary_backend:
+                parts.append(f"backend={backend if backend is not None else 'default'}")
+            if vary_range:
+                range_str = "default" if read_range is None else ("on" if read_range else "off")
+                parts.append(f"range={range_str}")
+            if vary_facts:
+                parts.append("facts=on" if facts else "facts=off")
+            label = f"{base_arm}[{','.join(parts)}]"
+        labels.append(label)
+        label_to_base[label] = base_arm
+    return labels, label_to_base
+
+
+def _order_arm_labels(present: set[str], label_to_base: dict[str, str]) -> list[str]:
+    rank = {arm: idx for idx, arm in enumerate(ARM_ORDER)}
+
+    def sort_key(label: str) -> tuple[int, str, str]:
+        base = label_to_base.get(label, label)
+        return (rank.get(base, len(ARM_ORDER)), base, label)
+
+    return sorted(present, key=sort_key)
+
+
+def _select_comparison_pairs(
+    arms: list[str],
+    label_to_base: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Return ordered (treatment, reference) arm pairs for paired tests and intervals."""
+    pairs_out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_pair(treatment: str, reference: str) -> None:
+        if treatment == reference:
+            return
+        key = (treatment, reference)
+        if key not in seen:
+            seen.add(key)
+            pairs_out.append(key)
+
+    present = set(arms)
+    for ref in ("baseline", "passive"):
+        if ref in present:
+            for arm in arms:
+                if arm == ref or (ref == "passive" and arm == "baseline"):
+                    continue
+                add_pair(arm, ref)
+
+    by_base: dict[str, list[str]] = defaultdict(list)
+    for arm in arms:
+        by_base[label_to_base.get(arm, arm)].append(arm)
+
+    for base_arm, variants in by_base.items():
+        if len(variants) > 1:
+            ref_variant = variants[0]
+            for variant in variants[1:]:
+                add_pair(variant, ref_variant)
+
+    if "baseline" not in present and by_base.get("baseline"):
+        baseline_by_suffix = {
+            arm[len("baseline") :]: arm for arm in by_base["baseline"] if arm.startswith("baseline[")
+        }
+        for arm in arms:
+            base = label_to_base.get(arm, arm)
+            if base == "baseline" or "[" not in arm:
+                continue
+            suffix = arm[len(base) :]
+            if suffix in baseline_by_suffix:
+                add_pair(arm, baseline_by_suffix[suffix])
+
+    if not pairs_out and len(arms) > 1:
+        for arm in arms[1:]:
+            add_pair(arm, arms[0])
+
+    return pairs_out
+
+
+def build_summary(rows: list[dict]) -> dict:
+    """Compute structured trial summary with separate outcomes, tokens, and paired intervals."""
     if not rows:
-        print("No rows to summarize.")
-        return
+        return {
+            "metadata": {"row_count": 0},
+            "arms": [],
+            "languages": [],
+            "kinds": [],
+            "specs": [],
+            "groups": [],
+            "cells": {},
+            "arm_outcomes": {},
+            "paired_groups": [],
+            "paired_overall": [],
+        }
+
+    labels, label_to_base = _build_arm_labels(rows)
 
     cells: dict[tuple[str, str, str, str], list[int]] = defaultdict(lambda: [0, 0])
-    pairs: dict[tuple[str, str, str, str, object], dict[str, bool]] = defaultdict(dict)
-    arm_telemetry: dict[str, dict[str, float]] = defaultdict(
+    passed_pairs: dict[tuple[str, str, str, str, object], dict[str, bool | None]] = defaultdict(
+        dict
+    )
+    hidden_pairs: dict[tuple[str, str, str, str, object], dict[str, bool | None]] = defaultdict(
+        dict
+    )
+    commit_pairs: dict[tuple[str, str, str, str, object], dict[str, bool | None]] = defaultdict(
+        dict
+    )
+    token_pairs: dict[tuple[str, str, str, str, object], dict[str, float | None]] = defaultdict(
+        dict
+    )
+    seconds_pairs: dict[tuple[str, str, str, str, object], dict[str, float | None]] = defaultdict(
+        dict
+    )
+
+    arm_stats: dict[str, dict] = defaultdict(
         lambda: {
             "n": 0,
             "passed": 0,
+            "hidden_passed": 0,
+            "hidden_recorded": 0,
+            "smoke_passed": 0,
+            "smoke_recorded": 0,
+            "commit_passed": 0,
+            "commit_recorded": 0,
+            "commit_outcomes": defaultdict(int),
+            "audit_ran": 0,
+            "audit_passed": 0,
+            "audit_failed": 0,
+            "audit_outcomes": defaultdict(int),
             "evidence": 0,
             "contract_rejected": 0,
-            "audit_ran": 0,
-            "audit_failed": 0,
-            "seconds": 0.0,
             "unknowns": 0,
             "errors": 0,
             "false_approval": 0,
             "extra_calls": 0,
+            "seconds": 0.0,
             "tokens": 0,
+            "tokens_measured_n": 0,
+            "editor_tokens": 0,
+            "editor_tokens_measured_n": 0,
+            "audit_tokens": 0,
+            "audit_tokens_measured_n": 0,
             "instrumented": 0,
         }
     )
@@ -510,12 +864,19 @@ def summarize(rows: list[dict]) -> None:
     present_specs: set[str] = set()
     present_groups: set[tuple[str, str, str]] = set()
 
-    for r in rows:
+    models: set[str] = set()
+    git_commits: set[str] = set()
+    suites: set[str] = set()
+    seeds: set[int] = set()
+    backends: set[str] = set()
+    read_ranges: set[bool] = set()
+
+    for r, arm in zip(rows, labels):
         lang = r.get("language") or "python"
         kind = r["kind"]
         spec = r["spec"]
-        arm = normalize_arm(r["arm"])
         passed = bool(r["passed"])
+        outcomes = _extract_row_outcomes(r)
 
         present_arms.add(arm)
         present_langs.add(lang)
@@ -523,29 +884,237 @@ def summarize(rows: list[dict]) -> None:
         present_specs.add(spec)
         present_groups.add((lang, kind, spec))
 
+        if r.get("model"):
+            models.add(str(r["model"]))
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if meta.get("git_commit"):
+            git_commits.add(str(meta["git_commit"]))
+        if meta.get("suite"):
+            suites.add(str(meta["suite"]))
+        if meta.get("seed") is not None:
+            seeds.add(meta["seed"])
+        if r.get("local_callers_backend") is not None:
+            backends.add(str(r["local_callers_backend"]))
+        if r.get("local_callers_read_range") is not None:
+            read_ranges.add(bool(r["local_callers_read_range"]))
+
         cell = cells[(lang, kind, spec, arm)]
         cell[0] += int(passed)
         cell[1] += 1
 
-        pairs[(lang, kind, spec, r["case"], r["round"])][arm] = passed
+        pair_key = (lang, kind, spec, r["case"], r["round"])
+        passed_pairs[pair_key][arm] = passed
+        if outcomes["hidden_passed"] is not None:
+            hidden_pairs[pair_key][arm] = outcomes["hidden_passed"]
+        if outcomes["commit_passed"] is not None:
+            commit_pairs[pair_key][arm] = outcomes["commit_passed"]
+        if outcomes["tokens"] is not None:
+            token_pairs[pair_key][arm] = float(outcomes["tokens"])
+        if r.get("seconds") is not None:
+            seconds_pairs[pair_key][arm] = float(r["seconds"])
 
-        stat = arm_telemetry[arm]
+        stat = arm_stats[arm]
         stat["n"] += 1
         stat["passed"] += int(passed)
+        if outcomes["hidden_passed"] is not None:
+            stat["hidden_recorded"] += 1
+            stat["hidden_passed"] += int(outcomes["hidden_passed"])
+        if outcomes["smoke_passed"] is not None:
+            stat["smoke_recorded"] += 1
+            stat["smoke_passed"] += int(outcomes["smoke_passed"])
+        if outcomes["commit_passed"] is not None:
+            stat["commit_recorded"] += 1
+            stat["commit_passed"] += int(outcomes["commit_passed"])
+        if outcomes["commit_outcome"] is not None:
+            stat["commit_outcomes"][outcomes["commit_outcome"]] += 1
+
+        stat["audit_outcomes"][outcomes["audit_outcome"]] += 1
+        if outcomes["audit_passed"] is True:
+            stat["audit_passed"] += 1
+        stat["audit_ran"] += int(bool(r.get("audit_ran")) or outcomes["audit_outcome"] != "not_run")
+        stat["audit_failed"] += int(bool(r.get("audit_failed")) or outcomes["audit_outcome"] == "fail")
+
         stat["evidence"] += int(bool(r.get("evidence")))
         stat["contract_rejected"] += int(bool(r.get("contract_rejected")))
-        stat["audit_ran"] += int(bool(r.get("audit_ran")))
-        stat["audit_failed"] += int(bool(r.get("audit_failed")))
-        if r.get("tokens") is not None:
+        for field in ("unknowns", "errors", "false_approval", "extra_calls"):
+            stat[field] += int(r.get(field) or 0)
+
+        if outcomes["tokens"] is not None:
             stat["instrumented"] += 1
-        for field in ("unknowns", "errors", "false_approval", "extra_calls", "tokens"):
-            stat[field] += r.get(field) or 0
+            stat["tokens_measured_n"] += 1
+            stat["tokens"] += int(outcomes["tokens"])
+        if outcomes["editor_tokens"] is not None:
+            stat["editor_tokens_measured_n"] += 1
+            stat["editor_tokens"] += int(outcomes["editor_tokens"])
+        if outcomes["audit_tokens"] is not None:
+            stat["audit_tokens_measured_n"] += 1
+            stat["audit_tokens"] += int(outcomes["audit_tokens"])
         stat["seconds"] += float(r.get("seconds", 0.0))
 
-    arms = ordered_values(present_arms, ARM_ORDER)
+    arms = _order_arm_labels(present_arms, label_to_base)
     langs = ordered_values(present_langs, LANGUAGE_ORDER)
     kinds = ordered_values(present_kinds, KIND_ORDER)
     specs = ordered_values(present_specs, SPEC_ORDER)
+    comparison_pairs = _select_comparison_pairs(arms, label_to_base)
+
+    paired_groups: list[dict] = []
+    for treatment, ref in comparison_pairs:
+        for lang in langs:
+            for kind in kinds:
+                for spec in specs:
+                    if (lang, kind, spec) not in present_groups:
+                        continue
+                    stats = _paired_binary_stats(
+                        passed_pairs,
+                        lambda k, lg=lang, kd=kind, sp=spec: k[:3] == (lg, kd, sp),
+                        treatment,
+                        ref,
+                    )
+                    if stats is None:
+                        continue
+                    paired_groups.append(
+                        {
+                            "scope": f"{lang}/{kind}/{spec}",
+                            "treatment": treatment,
+                            "reference": ref,
+                            **stats,
+                        }
+                    )
+        if len(langs) > 1:
+            for kind in kinds:
+                for spec in specs:
+                    if not any((lang, kind, spec) in present_groups for lang in langs):
+                        continue
+                    stats = _paired_binary_stats(
+                        passed_pairs,
+                        lambda k, kd=kind, sp=spec: k[1:3] == (kd, sp),
+                        treatment,
+                        ref,
+                    )
+                    if stats is None:
+                        continue
+                    paired_groups.append(
+                        {
+                            "scope": f"ALL/{kind}/{spec}",
+                            "treatment": treatment,
+                            "reference": ref,
+                            **stats,
+                        }
+                    )
+
+    paired_overall: list[dict] = []
+    for treatment, ref in comparison_pairs:
+        overall_passed = _paired_binary_stats(passed_pairs, lambda _k: True, treatment, ref)
+        if overall_passed is None:
+            continue
+        paired_overall.append(
+            {
+                "scope": "ALL",
+                "treatment": treatment,
+                "reference": ref,
+                "passed": overall_passed,
+                "hidden": _paired_binary_stats(hidden_pairs, lambda _k: True, treatment, ref),
+                "commit": _paired_binary_stats(commit_pairs, lambda _k: True, treatment, ref),
+                "tokens": _paired_numeric_stats(token_pairs, lambda _k: True, treatment, ref),
+                "seconds": _paired_numeric_stats(seconds_pairs, lambda _k: True, treatment, ref),
+            }
+        )
+
+    arm_outcomes: dict[str, dict] = {}
+    for arm in arms:
+        stat = arm_stats[arm]
+        n = int(stat["n"])
+        measured_n = int(stat["tokens_measured_n"])
+        arm_outcomes[arm] = {
+            "n": n,
+            "passed": int(stat["passed"]),
+            "hidden_passed": int(stat["hidden_passed"]),
+            "hidden_recorded": int(stat["hidden_recorded"]),
+            "smoke_passed": int(stat["smoke_passed"]),
+            "smoke_recorded": int(stat["smoke_recorded"]),
+            "commit_passed": int(stat["commit_passed"]),
+            "commit_recorded": int(stat["commit_recorded"]),
+            "commit_outcomes": dict(stat["commit_outcomes"]),
+            "audit_ran": int(stat["audit_ran"]),
+            "audit_passed": int(stat["audit_passed"]),
+            "audit_failed": int(stat["audit_failed"]),
+            "audit_outcomes": dict(stat["audit_outcomes"]),
+            "evidence": int(stat["evidence"]),
+            "contract_rejected": int(stat["contract_rejected"]),
+            "unknowns": int(stat["unknowns"]),
+            "errors": int(stat["errors"]),
+            "false_approval": int(stat["false_approval"]),
+            "extra_calls": int(stat["extra_calls"]),
+            "seconds_total": stat["seconds"],
+            "mean_seconds": (stat["seconds"] / n) if n else 0.0,
+            "tokens_total": int(stat["tokens"]),
+            "tokens_measured_n": measured_n,
+            "mean_tokens": (stat["tokens"] / measured_n) if measured_n else None,
+            "editor_tokens_total": int(stat["editor_tokens"]),
+            "editor_tokens_measured_n": int(stat["editor_tokens_measured_n"]),
+            "audit_tokens_total": int(stat["audit_tokens"]),
+            "audit_tokens_measured_n": int(stat["audit_tokens_measured_n"]),
+            "instrumented": int(stat["instrumented"]),
+        }
+
+    return {
+        "metadata": {
+            "row_count": len(rows),
+            "models": sorted(models),
+            "git_commits": sorted(git_commits),
+            "suites": sorted(suites),
+            "seeds": sorted(seeds),
+            "backends": sorted(backends),
+            "read_ranges": sorted(read_ranges),
+        },
+        "arms": arms,
+        "languages": langs,
+        "kinds": kinds,
+        "specs": specs,
+        "groups": sorted(present_groups),
+        "cells": {f"{lg}/{kd}/{sp}/{a}": list(v) for (lg, kd, sp, a), v in cells.items()},
+        "arm_outcomes": arm_outcomes,
+        "paired_groups": paired_groups,
+        "paired_overall": paired_overall,
+    }
+
+
+def _format_ci(lo: float | None, hi: float | None, precision: int = 3) -> str:
+    if lo is None or hi is None:
+        return "n/a"
+    return f"[{lo:+.{precision}f}, {hi:+.{precision}f}]"
+
+
+def summarize(rows: list[dict]) -> dict:
+    """Print grouped pass-rate table, paired sign tests/intervals, and separate outcomes."""
+    summary = build_summary(rows)
+    if not rows:
+        print("No rows to summarize.")
+        return summary
+
+    meta = summary["metadata"]
+    meta_parts = [f"rows={meta['row_count']}"]
+    if meta["models"]:
+        meta_parts.append(f"model={','.join(meta['models'])}")
+    if meta["suites"]:
+        meta_parts.append(f"suite={','.join(meta['suites'])}")
+    if meta["seeds"]:
+        meta_parts.append(f"seed={','.join(str(s) for s in meta['seeds'])}")
+    if meta["git_commits"]:
+        meta_parts.append(f"git={','.join(c[:10] for c in meta['git_commits'])}")
+    if meta["backends"]:
+        meta_parts.append(f"backend={','.join(meta['backends'])}")
+    if meta["read_ranges"]:
+        rr_str = ",".join("on" if v else "off" for v in meta["read_ranges"])
+        meta_parts.append(f"read_range={rr_str}")
+    print("\nRun metadata: " + " ".join(meta_parts))
+
+    arms = summary["arms"]
+    langs = summary["languages"]
+    kinds = summary["kinds"]
+    specs = summary["specs"]
+    present_groups = set(summary["groups"])
+    cells = summary["cells"]
 
     col_w = max(14, *(len(a) + 2 for a in arms))
     header = f"{'lang':7} {'kind':8} {'spec':9}" + "".join(f"{a:>{col_w}}" for a in arms)
@@ -558,7 +1127,7 @@ def summarize(rows: list[dict]) -> None:
                     continue
                 cols = []
                 for arm in arms:
-                    ok, total = cells[(lang, kind, spec, arm)]
+                    ok, total = cells.get(f"{lang}/{kind}/{spec}/{arm}", [0, 0])
                     cell_str = f"{ok}/{total}" if total else "-"
                     cols.append(f"{cell_str:>{col_w}}")
                 print(f"{lang:7} {kind:8} {spec:9}" + "".join(cols))
@@ -571,79 +1140,98 @@ def summarize(rows: list[dict]) -> None:
                     continue
                 cols = []
                 for arm in arms:
-                    ok = sum(cells[(lang, kind, spec, arm)][0] for lang in langs)
-                    total = sum(cells[(lang, kind, spec, arm)][1] for lang in langs)
+                    ok = sum(cells.get(f"{lang}/{kind}/{spec}/{arm}", [0, 0])[0] for lang in langs)
+                    total = sum(
+                        cells.get(f"{lang}/{kind}/{spec}/{arm}", [0, 0])[1] for lang in langs
+                    )
                     cell_str = f"{ok}/{total}" if total else "-"
                     cols.append(f"{cell_str:>{col_w}}")
                 print(f"{'ALL':7} {kind:8} {spec:9}" + "".join(cols))
 
-    references = [ref for ref in ("baseline", "passive") if ref in present_arms]
-    if references:
-        print("\nPaired exact two-sided sign tests:")
-        for ref in references:
-            treatments = [
-                a for a in arms if a != ref and not (ref == "passive" and a == "baseline")
+    if summary["paired_groups"]:
+        print("\nPaired exact two-sided sign tests & 95% paired intervals:")
+        for entry in summary["paired_groups"]:
+            print(
+                f"  {entry['scope']}: {entry['treatment']} vs {entry['reference']} ->"
+                f" +{entry['wins']}/-{entry['losses']}"
+                f" (n={entry['n_pairs']}, delta={entry['delta']:+.3f},"
+                f" 95% CI {_format_ci(entry['ci_low'], entry['ci_high'])},"
+                f" p={entry['p_value']:.4f})"
+            )
+
+    if summary["paired_overall"]:
+        print("\nPaired overall intervals (95% CI):")
+        for entry in summary["paired_overall"]:
+            p_stat = entry["passed"]
+            parts = [
+                f"passed={p_stat['delta']:+.3f} {_format_ci(p_stat['ci_low'], p_stat['ci_high'])}"
+                f" (n={p_stat['n_pairs']}, p={p_stat['p_value']:.4f})"
             ]
-            if not treatments:
-                continue
-            for lang in langs:
-                for kind in kinds:
-                    for spec in specs:
-                        if (lang, kind, spec) not in present_groups:
-                            continue
-                        for arm in treatments:
-                            win, loss, n_pairs = _paired_comparison(
-                                pairs,
-                                lambda k, lg=lang, kd=kind, sp=spec: k[:3] == (lg, kd, sp),
-                                arm,
-                                ref,
-                            )
-                            if not n_pairs:
-                                continue
-                            pval = sign_test(win, loss)
-                            print(
-                                f"  {lang}/{kind}/{spec}: {arm} vs {ref} ->"
-                                f" +{win}/-{loss} (n={n_pairs}, p={pval:.4f})"
-                            )
-            if len(langs) > 1:
-                for kind in kinds:
-                    for spec in specs:
-                        if not any((lang, kind, spec) in present_groups for lang in langs):
-                            continue
-                        for arm in treatments:
-                            win, loss, n_pairs = _paired_comparison(
-                                pairs,
-                                lambda k, kd=kind, sp=spec: k[1:3] == (kd, sp),
-                                arm,
-                                ref,
-                            )
-                            if not n_pairs:
-                                continue
-                            pval = sign_test(win, loss)
-                            print(
-                                f"  ALL/{kind}/{spec}: {arm} vs {ref} ->"
-                                f" +{win}/-{loss} (n={n_pairs}, p={pval:.4f})"
-                            )
+            if entry["hidden"] is not None:
+                h_stat = entry["hidden"]
+                parts.append(
+                    f"hidden={h_stat['delta']:+.3f}"
+                    f" {_format_ci(h_stat['ci_low'], h_stat['ci_high'])}"
+                )
+            if entry["commit"] is not None:
+                c_stat = entry["commit"]
+                parts.append(
+                    f"commit={c_stat['delta']:+.3f}"
+                    f" {_format_ci(c_stat['ci_low'], c_stat['ci_high'])}"
+                )
+            if entry["tokens"] is not None:
+                t_stat = entry["tokens"]
+                parts.append(
+                    f"tokens={t_stat['mean_diff']:+.1f}"
+                    f" {_format_ci(t_stat['ci_low'], t_stat['ci_high'], precision=1)}"
+                    f" (n={t_stat['n_pairs']})"
+                )
+            print(f"  {entry['treatment']} vs {entry['reference']}: " + " | ".join(parts))
 
     print("\nArm telemetry:")
     for arm in arms:
-        stat = arm_telemetry[arm]
-        n = int(stat["n"])
-        mean_sec = stat["seconds"] / n if n else 0.0
-        print(
-            f"  {arm:15} pass={int(stat['passed'])}/{n}"
-            f" evidence={int(stat['evidence'])}/{n}"
-            f" contract_rej={int(stat['contract_rejected'])}"
-            f" audit={int(stat['audit_ran'])} (fail={int(stat['audit_failed'])})"
-            f" mean_s={mean_sec:.1f}"
-            + (
-                f" extra_calls={stat['extra_calls']} tokens={stat['tokens']}"
-                f" false_approvals={stat['false_approval']} unknowns={stat['unknowns']}"
-                f" errors={stat['errors']}"
-                if stat["instrumented"] == n
-                else " detailed telemetry incomplete"
-            )
+        stat = summary["arm_outcomes"][arm]
+        n = stat["n"]
+        hidden_str = (
+            f"{stat['hidden_passed']}/{stat['hidden_recorded']}"
+            if stat["hidden_recorded"]
+            else "n/a"
         )
+        commit_str = (
+            f"{stat['commit_passed']}/{stat['commit_recorded']}"
+            if stat["commit_recorded"]
+            else "n/a"
+        )
+        audit_str = (
+            f"{stat['audit_passed']}/{stat['audit_ran']} (fail={stat['audit_failed']})"
+            if stat["audit_ran"]
+            else f"0 (fail={stat['audit_failed']})"
+        )
+        token_detail = (
+            f" extra_calls={stat['extra_calls']} tokens={stat['tokens_total']}"
+            f" (mean={stat['mean_tokens']:.1f}"
+            + (
+                f", editor={stat['editor_tokens_total']}, audit={stat['audit_tokens_total']}"
+                if stat["editor_tokens_measured_n"] == n and stat["audit_tokens_measured_n"] == n
+                else ""
+            )
+            + ")"
+            f" false_approvals={stat['false_approval']} unknowns={stat['unknowns']}"
+            f" errors={stat['errors']}"
+            if stat["instrumented"] == n
+            else f" tokens_measured={stat['tokens_measured_n']}/{n} detailed telemetry incomplete"
+        )
+        print(
+            f"  {arm:15} pass={stat['passed']}/{n}"
+            f" hidden={hidden_str}"
+            f" commit={commit_str}"
+            f" audit={audit_str}"
+            f" evidence={stat['evidence']}/{n}"
+            f" contract_rej={stat['contract_rejected']}"
+            f" mean_s={stat['mean_seconds']:.1f}"
+            + token_detail
+        )
+    return summary
 
 
 def parse_csv_arg(raw: str, allowed: tuple[str, ...], parser: argparse.ArgumentParser, flag: str):
@@ -678,7 +1266,60 @@ def select_cases(
     return selected
 
 
-def main():
+BOOL_MODE_VALUES = {"default": None, "off": False, "on": True}
+
+
+def parse_bool_modes(raw: str, parser: argparse.ArgumentParser, flag: str) -> list[bool | None]:
+    items = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not items:
+        parser.error(f"{flag} must contain at least one value")
+    out: list[bool | None] = []
+    for item in items:
+        if item not in BOOL_MODE_VALUES:
+            allowed = ", ".join(BOOL_MODE_VALUES.keys())
+            parser.error(f"Invalid value {item!r} for {flag}; choose from {allowed}")
+        val = BOOL_MODE_VALUES[item]
+        if val not in out:
+            out.append(val)
+    return out
+
+
+def resolve_control_grid(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> list[tuple[str | None, bool | None, bool | None]]:
+    """Build the cartesian grid of optional independent (backend, read_range, facts) controls."""
+    if args.local_callers_backend is None:
+        backends: list[str | None] = [None]
+    else:
+        backends = [item.strip() for item in args.local_callers_backend.split(",") if item.strip()]
+        if not backends:
+            parser.error("--local-callers-backend must contain at least one non-empty value")
+        backends = list(dict.fromkeys(backends))
+
+    if args.read_range_modes is not None:
+        if args.local_callers_read_range is not None:
+            parser.error("Use either --local-callers-read-range or --read-range-modes, not both")
+        read_ranges = parse_bool_modes(args.read_range_modes, parser, "--read-range-modes")
+    else:
+        read_ranges = [args.local_callers_read_range]
+
+    if args.facts_modes is not None:
+        if args.local_callers_facts is not None:
+            parser.error("Use either --local-callers-facts/--facts or --facts-modes, not both")
+        facts_list = parse_bool_modes(args.facts_modes, parser, "--facts-modes")
+    else:
+        facts_list = [args.local_callers_facts]
+
+    return [
+        (backend, read_range, facts)
+        for backend in backends
+        for read_range in read_ranges
+        for facts in facts_list
+    ]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--map-tokens", type=int, default=1024)
@@ -712,11 +1353,45 @@ def main():
         help=f"optional comma-separated language filter from {', '.join(LANGUAGE_ORDER)}",
     )
     parser.add_argument("--suite", choices=["synthetic", "requests"], default="synthetic")
+    parser.add_argument(
+        "--local-callers-backend",
+        default=None,
+        help="optional backend (or comma-separated list) passed via --local-callers-backend",
+    )
+    parser.add_argument(
+        "--local-callers-read-range",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="optional override for --local-callers-read-range / --no-local-callers-read-range",
+    )
+    parser.add_argument(
+        "--read-range-modes",
+        default=None,
+        help="optional comma-separated factorial modes from default,off,on for read-range",
+    )
+    parser.add_argument(
+        "--local-callers-facts",
+        "--facts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="local_callers_facts",
+        help="optional independent override for caller facts (--local-callers / --no-local-callers)",
+    )
+    parser.add_argument(
+        "--facts-modes",
+        default=None,
+        help="optional comma-separated factorial modes from default,off,on for caller facts",
+    )
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     out = Path(args.out)
     if args.summarize:
-        rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()]
+        rows = load_results(out)
         summarize(rows)
         return
 
@@ -733,20 +1408,49 @@ def main():
 
     arms = parse_csv_arg(args.arms, ARM_ORDER, parser, "--arms")
     specs = parse_csv_arg(args.specs, SPEC_ORDER, parser, "--specs")
+    control_grid = resolve_control_grid(args, parser)
 
     jobs = [
-        (r, case_spec, spec, arm)
+        (r, case_spec, spec, arm, backend, read_range, facts)
         for r in range(args.rounds)
         for case_spec in selected_cases
         for spec in specs
         for arm in arms
+        for backend, read_range, facts in control_grid
     ]
     random.Random(args.seed).shuffle(jobs)
+
+    run_meta = run.collect_run_metadata(
+        model=args.model,
+        suite=args.suite,
+        map_tokens=args.map_tokens,
+        rounds=args.rounds,
+        seed=args.seed,
+        arms=arms,
+        specs=specs,
+        cases=[case.name for case in selected_cases],
+        controls={
+            "backends": [b for b in dict.fromkeys(b for b, _, _ in control_grid)],
+            "read_ranges": [rr for rr in dict.fromkeys(rr for _, rr, _ in control_grid)],
+            "facts": [f for f in dict.fromkeys(f for _, _, f in control_grid)],
+        },
+    )
+    run.write_run_metadata(out.with_suffix(".meta.json"), run_meta)
+    row_meta = {
+        "schema_version": run_meta["schema_version"],
+        "run_id": run_meta["run_id"],
+        "timestamp_utc": run_meta["timestamp_utc"],
+        "git_commit": run_meta["git_commit"],
+        "git_dirty": run_meta["git_dirty"],
+        "python_version": run_meta["python_version"],
+        "suite": run_meta["suite"],
+        "seed": run_meta["seed"],
+    }
 
     workdir = Path(tempfile.mkdtemp(prefix="aider-heldout-"))
     print(workdir, flush=True)
     rows = []
-    for r, case_spec, spec, arm in jobs:
+    for r, case_spec, spec, arm, backend, read_range, facts in jobs:
         result = run.run_spec(
             output=workdir,
             case_spec=case_spec,
@@ -755,6 +1459,10 @@ def main():
             map_tokens=args.map_tokens,
             spec=spec,
             model=args.model,
+            backend=backend,
+            read_range=read_range,
+            facts=facts,
+            metadata=row_meta,
         )
         rows.append(result)
         print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)
