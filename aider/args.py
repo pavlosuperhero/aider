@@ -122,6 +122,48 @@ def get_parser(default_config_files, git_root):
         help="Load an additional read-only Oracle reference document, like --read (default: none)",
     )
 
+    group = parser.add_argument_group("Local context (opt-in)")
+    group.add_argument(
+        "--local-callers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include short read-only excerpts from callers of named functions or symbols",
+    )
+
+    group.add_argument(
+        "--local-callers-hint",
+        metavar="TEXT",
+        help="Override the hint accompanying caller excerpts. Pass an empty string for code only.",
+    )
+
+    group.add_argument(
+        "--local-callers-mode",
+        choices=["passive", "contract"],
+        default="passive",
+        help=(
+            "How caller excerpts are applied: 'passive' attaches a read-only snapshot, "
+            "'contract' requests CALLER_CONTRACT and TRACE sections (format check only) "
+            "(default: passive)"
+        ),
+    )
+
+    group.add_argument(
+        "--local-callers-audit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run an isolated post-edit Chain-of-Verification caller-contract audit against "
+            "the diff and caller excerpts (default: False)"
+        ),
+    )
+
+    group.add_argument(
+        "--local-callers-policy",
+        choices=("strict", "advisory"),
+        default="strict",
+        help="Strict blocks unverified edits from auto-commit. Advisory permits them with a diagnostic.",
+    )
+
     group = parser.add_argument_group("TDD workflow (opt-in)")
     group.add_argument(
         "--tdd",

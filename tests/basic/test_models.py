@@ -202,6 +202,71 @@ class TestModels(unittest.TestCase):
         model.set_thinking_tokens("0.5M")
         self.assertEqual(model.extra_params["thinking"]["budget_tokens"], 0.5 * 1024 * 1024)
 
+    @patch("httpx.Client.send", side_effect=AssertionError("Unexpected network request"))
+    def test_bedrock_reasoning_effort_preserves_cache_translation(self, mock_send):
+        from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+        from litellm.utils import get_optional_params
+
+        for model_id in (
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-sonnet-5-5",
+        ):
+            for cache_enabled in (False, True):
+                with self.subTest(model=model_id, cache_enabled=cache_enabled):
+                    # Avoid model discovery and credentials: exercise the real adapter offline.
+                    model = object.__new__(Model)
+                    model.name = "bedrock/" + model_id
+                    model.extra_params = {"max_tokens": 8192}
+                    model.set_reasoning_effort("high")
+                    self.assertEqual(model.get_reasoning_effort(), "high")
+                    content = {"type": "text", "text": "Stable context"}
+                    if cache_enabled:
+                        content["cache_control"] = {"type": "ephemeral"}
+                    config = AmazonConverseConfig()
+                    params = get_optional_params(
+                        model=model_id,
+                        custom_llm_provider="bedrock",
+                        drop_params=False,
+                        **model.extra_params,
+                    )
+                    request = config.transform_request(
+                        model=model_id,
+                        messages=[{"role": "user", "content": [content]}],
+                        optional_params=params,
+                        litellm_params={},
+                        headers={},
+                    )
+                    fields = request["additionalModelRequestFields"]
+                    self.assertNotIn("extra_body", fields)
+                    if "sonnet-5-5" in model_id:
+                        self.assertEqual(fields["output_config"]["effort"], "high")
+                        self.assertEqual(fields["thinking"]["type"], "adaptive")
+                    else:
+                        self.assertEqual(
+                            fields["thinking"], {"type": "enabled", "budget_tokens": 4096}
+                        )
+                    blocks = request["messages"][0]["content"]
+                    self.assertEqual(any("cachePoint" in block for block in blocks), cache_enabled)
+                    self.assertEqual(model.extra_params["max_tokens"], 8192)
+        mock_send.assert_not_called()
+
+    def test_reasoning_effort_provider_formats(self):
+        for name, expected in (
+            ("bedrock/us.anthropic.claude-sonnet-5-5", {"reasoning_effort": "high"}),
+            (
+                "openrouter/anthropic/claude-sonnet-4.5",
+                {"extra_body": {"reasoning": {"effort": "high"}}},
+            ),
+            ("gpt-5", {"extra_body": {"reasoning_effort": "high"}}),
+        ):
+            with self.subTest(model=name):
+                model = object.__new__(Model)
+                model.name = name
+                model.extra_params = None
+                model.set_reasoning_effort("high")
+                self.assertEqual(model.extra_params, expected)
+                self.assertEqual(model.get_reasoning_effort(), "high")
+
     @patch("aider.models.check_pip_install_extra")
     def test_check_for_dependencies_bedrock(self, mock_check_pip):
         """Test that check_for_dependencies calls check_pip_install_extra for Bedrock models"""

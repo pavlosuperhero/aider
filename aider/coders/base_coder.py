@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import base64
+import difflib
 import hashlib
 import json
 import locale
@@ -199,6 +200,9 @@ class Coder:
             if hasattr(coder, "edit_format") and coder.edit_format == edit_format:
                 res = coder(main_model, io, **kwargs)
                 res.original_kwargs = dict(kwargs)
+                if from_coder and res.local_caller_auditor is not None:
+                    res._unreviewed_paths.update(from_coder._unreviewed_paths)
+                    res._unreviewed_paths.update(from_coder._audit_originals)
                 return res
 
         valid_formats = [
@@ -350,10 +354,32 @@ class Coder:
         response_hooks=(),
         test_result_hooks=(),
         edit_hooks=(),
+        local_callers=False,
+        local_callers_hint=None,
+        local_callers_mode="passive",
+        local_callers_audit=False,
+        local_callers_policy="strict",
     ):
+        if local_callers_mode not in ("passive", "contract"):
+            raise ValueError(
+                f"Invalid local_callers_mode {local_callers_mode!r};"
+                " expected 'passive' or 'contract'."
+            )
+        from aider.caller_audit import CallerContractHook, IsolatedCallerAuditor
+
         self.test_result_hooks = tuple(test_result_hooks)
         self.edit_hooks = tuple(edit_hooks)
         self.test_hook_continuation = None
+        self.local_callers_hint = local_callers_hint
+        self.local_callers = local_callers
+        self.local_callers_mode = local_callers_mode
+        if local_callers_policy not in ("strict", "advisory"):
+            raise ValueError(f"Unknown caller policy: {local_callers_policy}")
+        self.caller_advisory = local_callers_policy == "advisory"
+        self._local_caller_task = ""
+        self._audit_originals = {}
+        self._unreviewed_paths = {}
+        self.local_callers_audit = local_callers_audit
         self.oracle_provider = oracle_provider
         self.response_hooks = tuple(response_hooks)
         if oracle_provider is not None:
@@ -362,6 +388,24 @@ class Coder:
             hook = create_oracle_response_hook(oracle_provider)
             if hook is not None:
                 self.response_hooks += (hook,)
+        self.local_caller_contract_hook = CallerContractHook(
+            enabled=bool(self.local_callers and self.local_callers_mode == "contract"),
+            advisory=self.caller_advisory,
+        )
+        if self.local_caller_contract_hook.enabled:
+            self.response_hooks += (self.local_caller_contract_hook,)
+        if self.local_callers and (
+            self.local_callers_audit or self.local_callers_mode == "contract"
+        ):
+            self.max_reflections = max(self.max_reflections, 4)
+        self.local_caller_auditor = (
+            IsolatedCallerAuditor(
+                self._complete_caller_audit,
+                max_audits=1 + self.max_reflections,
+            )
+            if self.local_callers and self.local_callers_audit
+            else None
+        )
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
 
@@ -887,8 +931,11 @@ class Coder:
             return
         while True:
             self.response_hook_pending = False
+            if self.local_caller_auditor is not None:
+                self.reflected_message = None
             yield from self.send_message(user_message)
-            if not self.response_hook_pending:
+            retry_audited_edit = self.local_caller_auditor is not None and self.reflected_message
+            if not self.response_hook_pending and not retry_audited_edit:
                 break
             if self.num_reflections >= self.max_reflections:
                 self.io.tool_warning("Response hook reached the reflection limit, stopping.")
@@ -896,27 +943,133 @@ class Coder:
             self.num_reflections += 1
             user_message = self.reflected_message
 
-    def get_oracle_message(self, message):
-        if not message or self.oracle_provider is None:
-            return message
-        from aider.oracle import add_oracle_context
+    def _reset_local_caller_state(self, excerpts, task=""):
+        self._local_caller_task = task or ""
+        self.local_caller_contract_hook.begin_turn(excerpts)
+        if self.local_caller_auditor is not None:
+            self.local_caller_auditor.begin_turn(excerpts)
 
-        message = add_oracle_context(
-            message, self.oracle_provider, self.main_model.token_count, self.io
-        )
-        if message is None:
-            self.partial_response_content = None
+    def _complete_caller_audit(self, messages):
+        litellm_ex = LiteLLMExceptions()
+        response = None
+        max_attempts = 3
+        retry_delay = 0.5
+        try:
+            for attempt in range(max_attempts):
+                try:
+                    _, response = self.main_model.send_completion(
+                        messages=messages, functions=None, stream=False
+                    )
+                    break
+                except litellm_ex.exceptions_tuple() as err:
+                    ex_info = litellm_ex.get_ex_info(err)
+                    if not ex_info.retry or attempt + 1 >= max_attempts:
+                        raise
+                    self.io.tool_warning(
+                        f"Local caller audit transient error ({err}); retrying in {retry_delay:.1f}s..."
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 20.0)
+        finally:
+            if os.getenv("AIDER_TRIAL_USAGE"):
+                usage = getattr(response, "usage", None)
+                total = getattr(usage, "total_tokens", None)
+                self.io.tool_output(f"Trial usage: audit {total}")
+        if not response or not response.choices:
+            return None
+        raw = response.choices[0].message.content
+        return remove_reasoning_content(raw or "", self.main_model.reasoning_tag)
+
+    def _caller_audit_paths(self, edits):
+        return {
+            self.get_rel_fname(self.abs_root_path(edit[0])) for edit in edits if edit[0] is not None
+        }
+
+    def _audit_file_text(self, path):
+        file = Path(self.abs_root_path(path)).resolve()
+        if not file.is_relative_to(Path(self.root).resolve()):
+            raise OSError(f"Caller audit path outside repository: {path}")
+        if not file.exists():
+            return ""
+        with file.open(encoding=self.io.encoding, newline="") as source:
+            return source.read()
+
+    def _get_local_caller_audit_diff(self):
+        chunks = []
+        for path, original in sorted(self._audit_originals.items()):
+            updated = self._audit_file_text(path)
+            lines = difflib.unified_diff(
+                original.splitlines(keepends=True),
+                updated.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+            )
+            for line in lines:
+                chunks.append(
+                    line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+                )
+        return "".join(chunks)
+
+    def get_oracle_message(self, message):
+        if not message:
+            if self.local_callers:
+                self._reset_local_caller_state(())
+            return message
+        task = message
+        if self.oracle_provider is not None:
+            from aider.oracle import add_oracle_context
+
+            message = add_oracle_context(
+                message, self.oracle_provider, self.main_model.token_count, self.io
+            )
+            if message is None:
+                if self.local_callers:
+                    self._reset_local_caller_state(())
+                self.partial_response_content = None
+                return None
+        if self.local_callers and self.repo:
+            from aider.local_callers import (
+                CallerEvidenceReport,
+                find_related_callers,
+                format_caller_context,
+            )
+
+            report = CallerEvidenceReport()
+            excerpts = find_related_callers(
+                Path(self.root),
+                task,
+                self.get_inchat_relative_files(),
+                self.get_addable_relative_files(),
+                report=report,
+            )
+            self._reset_local_caller_state(excerpts, task=task)
+            self.io.tool_output("Local caller evidence: " + report.describe(excerpts))
+            if excerpts:
+                formatted = format_caller_context(
+                    excerpts,
+                    hint=self.local_callers_hint,
+                    mode=self.local_callers_mode,
+                )
+                if formatted:
+                    message += f"\n\n{formatted}"
+        elif self.local_callers:
+            self.io.tool_output("Local caller evidence: NO_EVIDENCE (no repository)")
+            self._reset_local_caller_state(())
         return message
 
     def init_before_message(self):
         self.response_hook_pending = False
         self.aider_edited_files = set()
+        self._unreviewed_paths.update(self._audit_originals)
+        self._audit_originals.clear()
         self.reflected_message = None
         self.num_reflections = 0
         self.lint_outcome = None
         self.test_outcome = None
         self.shell_commands = []
         self.message_cost = 0
+        if self.local_callers:
+            self._reset_local_caller_state(())
 
         if self.repo:
             self.commit_before_message.append(self.repo.get_head_commit_sha())
@@ -1723,10 +1876,16 @@ class Coder:
             ]
             return
 
+        auditing = self.local_caller_auditor is not None
+        if auditing:
+            self.shell_commands = []
         edited = self.apply_updates()
 
         if edited:
             self.aider_edited_files.update(edited)
+        if auditing and edited:
+            edited = set(self._audit_originals)
+        if edited and not auditing:
             saved_message = self.auto_commit(edited)
 
             if not saved_message and hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
@@ -1739,21 +1898,22 @@ class Coder:
 
         if edited and self.auto_lint:
             lint_errors = self.lint_edited(edited)
-            self.auto_commit(edited, context="Ran the linter")
+            if not auditing:
+                self.auto_commit(edited, context="Ran the linter")
             self.lint_outcome = not lint_errors
             if lint_errors:
                 ok = self.io.confirm_ask("Attempt to fix lint errors?")
                 if ok:
                     self.reflected_message = lint_errors
                     return
+                if auditing:
+                    self.io.tool_warning("Lint failed. Edits remain uncommitted.")
+                    return
 
-        shared_output = self.run_shell_commands()
-        if shared_output:
-            self.cur_messages += [
-                dict(role="user", content=shared_output),
-                dict(role="assistant", content="Ok"),
-            ]
+        if not auditing or not self._audit_originals:
+            self._share_shell_output()
 
+        test_errors = None
         if edited and self.auto_test:
             self.test_hook_continuation = None
             test_errors = self.commands.cmd_test(self.test_cmd)
@@ -1767,6 +1927,49 @@ class Coder:
                 if ok:
                     self.reflected_message = test_errors
                     return
+                if auditing:
+                    self.io.tool_warning("Tests failed. Edits remain uncommitted.")
+
+        if auditing and edited and not test_errors and not self.dry_run:
+            self._finish_local_caller_audit()
+
+    def _share_shell_output(self):
+        shared_output = self.run_shell_commands()
+        if shared_output:
+            self.cur_messages += [
+                dict(role="user", content=shared_output),
+                dict(role="assistant", content="Ok"),
+            ]
+
+    def _finish_local_caller_audit(self):
+        try:
+            patch = self._get_local_caller_audit_diff()
+            verdict = self.local_caller_auditor.audit(
+                patch, task=self._local_caller_task, io=self.io
+            )
+            if verdict.status == "UNKNOWN" and verdict.raw_response:
+                if self.verbose or os.getenv("AIDER_TRIAL_USAGE"):
+                    self.io.tool_output(f"Audit response tail: {verdict.raw_response[-200:]!r}")
+            if not verdict.passed and not self.caller_advisory:
+                self.io.tool_warning(
+                    "Edits remain uncommitted. Review the working tree with git status and git diff."
+                )
+                if verdict.status == "FAIL":
+                    self.reflected_message = self.local_caller_auditor.build_continuation(verdict)
+                    self.response_hook_pending = True
+                return
+            if patch != self._get_local_caller_audit_diff():
+                self.io.tool_warning("Files changed during verification. Edits remain uncommitted.")
+                return
+        except (OSError, UnicodeError) as err:
+            self.io.tool_warning(f"Local caller audit: ERROR - {err}. Edits remain uncommitted.")
+            return
+        saved_message = self.auto_commit(set(self._audit_originals))
+        self._audit_originals.clear()
+        if not saved_message:
+            saved_message = getattr(self.gpt_prompts, "files_content_gpt_edits_no_repo", None)
+        self.move_back_cur_messages(saved_message)
+        self._share_shell_output()
 
     def reply_completed(self):
         pass
@@ -1915,6 +2118,10 @@ class Coder:
         mentioned_rel_fnames = self.get_file_mentions(content)
 
         new_mentions = mentioned_rel_fnames - self.ignore_mentions
+        if self.local_callers and (
+            "<<<<<<< SEARCH" in content or "CALLER_CONTRACT:" in content.upper()
+        ):
+            new_mentions -= self.local_caller_contract_hook.attached_paths
 
         if not new_mentions:
             return
@@ -2260,6 +2467,9 @@ class Coder:
         self.total_tokens_received += self.message_tokens_received
 
         self.io.tool_output(self.usage_report)
+        if os.getenv("AIDER_TRIAL_USAGE"):
+            total = self.message_tokens_sent + self.message_tokens_received
+            self.io.tool_output(f"Trial usage: editor {total}")
 
         prompt_tokens = self.message_tokens_sent
         completion_tokens = self.message_tokens_received
@@ -2330,6 +2540,11 @@ class Coder:
             return
         if not self.dirty_commits:
             return
+        if (
+            self._audit_originals
+            and self.get_rel_fname(self.abs_root_path(path)) in self._audit_originals
+        ):
+            return
         if not self.repo.is_dirty(path):
             return
 
@@ -2369,7 +2584,7 @@ class Coder:
                 # Seems unlikely that we needed to create the file, but it was
                 # actually already part of the repo.
                 # But let's only add if we need to, just to be safe.
-                if need_to_add and self.auto_commits:
+                if need_to_add and self.auto_commits and self.local_caller_auditor is None:
                     self.repo.repo.git.add(full_path)
 
             self.abs_fnames.add(full_path)
@@ -2383,7 +2598,7 @@ class Coder:
             self.io.tool_output(f"Skipping edits to {path}")
             return
 
-        if need_to_add and self.auto_commits:
+        if need_to_add and self.auto_commits and self.local_caller_auditor is None:
             self.repo.repo.git.add(full_path)
 
         self.abs_fnames.add(full_path)
@@ -2454,9 +2669,32 @@ class Coder:
             edits = self.apply_edits_dry_run(edits)
             if self.edit_hooks and self.handle_edit_hooks(edits, shell_commands_before):
                 return edited
+            contract = self.local_caller_contract_hook
+            if edits and contract.enabled and not contract.format_present and not contract.advisory:
+                self.io.tool_warning(
+                    "Local caller contract check: UNKNOWN (unverified edit format)"
+                )
+                return edited
+            if self.local_caller_auditor is not None:
+                paths = self._caller_audit_paths(edits)
+                for path in paths & self._unreviewed_paths.keys():
+                    if (
+                        self.auto_commits
+                        and self.repo
+                        and self.repo.is_dirty(path)
+                        and self._audit_file_text(path) != self._unreviewed_paths[path]
+                    ):
+                        self.io.tool_warning(
+                            f"Review and commit or discard the previous unverified edit to {path} first."
+                        )
+                        return edited
+                    del self._unreviewed_paths[path]
             edits = self.prepare_to_edit(edits)
             edited = set(edit[0] for edit in edits)
 
+            if self.local_caller_auditor is not None:
+                for path in self._caller_audit_paths(edits) - self._audit_originals.keys():
+                    self._audit_originals[path] = self._audit_file_text(path)
             self.apply_edits(edits)
         except ValueError as err:
             self.num_malformed_responses += 1
@@ -2473,6 +2711,8 @@ class Coder:
 
         except ANY_GIT_ERROR as err:
             self.io.tool_error(str(err))
+            if self.local_caller_auditor is not None:
+                return set()
             return edited
         except Exception as err:
             self.io.tool_error("Exception while updating files:")

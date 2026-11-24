@@ -546,6 +546,15 @@ class PatchCoder(Coder):
         action = PatchAction(type=ActionType.ADD, path="", new_content="\n".join(added_lines))
         return action, index
 
+    def _caller_audit_paths(self, edits):
+        paths = super()._caller_audit_paths(edits)
+        paths.update(
+            self.get_rel_fname(self.abs_root_path(action.move_path))
+            for _, action in edits
+            if action.move_path
+        )
+        return paths
+
     def apply_edits(self, edits: List[PatchAction]):
         """
         Applies the parsed PatchActions to the corresponding files.
