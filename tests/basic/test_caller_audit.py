@@ -701,11 +701,67 @@ def test_reflection_rechecks_all_pending_files_in_one_commit(project, monkeypatc
 
 @pytest.mark.parametrize("line,status", [
     ("4. VERDICT: PASS", "PASS"),
+    ("4) VERDICT: PASS", "PASS"),
+    ("**VERDICT: PASS**", "PASS"),
     ("4. VERDICT: FAIL: wrong unit", "FAIL"),
     ("4. VERDICT: UNKNOWN: incomplete snippet", "UNKNOWN"),
     ("4. VERDICT: PASS, probably", "UNKNOWN"),
+    ("**VERDICT: PASS", "UNKNOWN"),
     ("4. VERDICT: FAIL: wrong unit\nVERDICT: PASS", "UNKNOWN"),
     ("VERDICT: FAIL: wrong unit\n4. VERDICT: PASS", "UNKNOWN"),
 ])
 def test_numbered_final_step_uses_the_same_verdict_grammar(line, status):
     assert parse_audit_verdict(line).status == status
+
+
+def test_long_fail_reason_truncates_instead_of_becoming_unknown():
+    long_reason = "x" * 750
+    verdict = parse_audit_verdict(f"Analysis.\nVERDICT: FAIL: {long_reason}")
+    assert verdict.status == "FAIL"
+    assert len(verdict.reason) == 600
+    assert verdict.reason == "x" * 600
+
+
+def test_contract_hook_allows_quoted_fenced_code_before_trace():
+    hook = CallerContractHook(enabled=True)
+    hook.begin_turn([SAMPLE_EXCERPT])
+    reply = (
+        "CALLER_CONTRACT: `pkg/consumer.py` expects:\n"
+        "```python\n"
+        "raw = format_price(1050)\n"
+        "```\n"
+        "TRACE: format_price(1050) -> '10.50'.\n"
+        + EDIT_BLOCK
+    )
+    assert hook(reply) is None
+    assert hook.format_present is True
+
+
+def test_complete_caller_audit_retries_transient_litellm_errors(project, monkeypatch):
+    from aider.llm import litellm
+
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    calls = []
+    ok_resp = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="VERDICT: PASS"))])
+
+    def flaky_send(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise litellm.RateLimitError(
+                "rate limit",
+                llm_provider="openai",
+                model="gpt-4",
+                response=SimpleNamespace(status_code=429),
+            )
+        return ("hash", ok_resp)
+
+    monkeypatch.setattr(coder.main_model, "send_completion", flaky_send)
+    monkeypatch.setattr("aider.coders.base_coder.time.sleep", lambda s: None)
+    assert coder._complete_caller_audit([{"role": "user", "content": "check"}]) == "VERDICT: PASS"
+    assert len(calls) == 2
+
+
+def test_max_reflections_unchanged_when_local_callers_disabled(project):
+    baseline = make_coder(local_callers=False, local_callers_audit=False)
+    disabled = make_coder(local_callers=False, local_callers_audit=True)
+    assert disabled.max_reflections == baseline.max_reflections

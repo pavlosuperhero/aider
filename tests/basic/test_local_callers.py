@@ -289,3 +289,26 @@ def test_evidence_report_marks_ambiguous_method_receiver(tmp_path):
     )
     assert "ambiguous method receiver" in report.describe(excerpts)
     assert excerpts[0].incomplete
+
+
+def test_non_js_tree_sitter_caller_is_not_flagged_with_js_import_ambiguity(tmp_path):
+    from aider.local_callers import CallerEvidenceReport
+
+    (tmp_path / "api.go").write_text("package p\nfunc FormatPrice(c int) string { return \"\" }\n")
+    (tmp_path / "consumer.go").write_text("package p\nfunc Use() string { return FormatPrice(10) }\n")
+    report = CallerEvidenceReport()
+    excerpts = find_related_callers(
+        tmp_path, "fix FormatPrice", ["api.go"], ["consumer.go"], report=report
+    )
+    assert len(excerpts) == 1
+    assert not excerpts[0].incomplete
+    assert "SELECTED" in report.describe(excerpts)
+
+    # Duplicate definition across two editable Go files IS still marked ambiguous.
+    (tmp_path / "api2.go").write_text("package p\nfunc FormatPrice(c int) string { return \"\" }\n")
+    dup_excerpts = find_related_callers(
+        tmp_path, "fix FormatPrice", ["api.go", "api2.go"], ["consumer.go"]
+    )
+    assert len(dup_excerpts) == 1
+    assert dup_excerpts[0].incomplete
+    assert "ambiguous symbol binding" in dup_excerpts[0].limitations

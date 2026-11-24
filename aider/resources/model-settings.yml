@@ -3154,5 +3154,6 @@
   use_repo_map: true
   editor_model_name: lm_studio/qwen/qwen3.6-35b-a3b
   editor_edit_format: editor-diff
+  reasoning_tag: think
   extra_params:
     max_tokens: 32768

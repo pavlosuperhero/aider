@@ -306,7 +306,7 @@ def run_spec(
     contract_rejected = "Local caller contract check:" in log_text
     verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
     usage = re.findall(r"^Trial usage: (editor|audit) (\d+|None)$", log_text, re.M)
-    if not any(kind == "editor" for kind, _ in usage):
+    if code != 124 and not any(kind == "editor" for kind, _ in usage):
         raise RuntimeError(f"No editor completion recorded. See {folder / 'aider.log'}")
     tokens = (
         sum(int(value) for _, value in usage)

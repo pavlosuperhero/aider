@@ -12,7 +12,10 @@ from typing import Callable, Iterable, Literal, Protocol
 
 from aider.hooks import ResponseHookResult
 
-_VERDICT_RE = re.compile(r"(?:4\. )?VERDICT: (PASS|FAIL|UNKNOWN)(?:: ([^\n]{1,600}))?", re.I)
+_VERDICT_RE = re.compile(
+    r"(?:(?:\d+[.)]|[-*])\s+)?(\*{0,2})VERDICT:[ \t]*(PASS|FAIL|UNKNOWN)\1(?::[ \t]*([^\n]+))?",
+    re.I,
+)
 _VERDICT_DECLARATION = re.compile(r"^\s*(?:(?:\d+[.)]|[-*])\s+)?\**VERDICT\s*:", re.I)
 _MAX_PATCH_CHARS = 16000
 _CONTRACT_RE = re.compile(r"\bCALLER_CONTRACT\s*:", re.IGNORECASE)
@@ -21,10 +24,10 @@ _MAX_REASON_CHARS = 600
 
 _AUDITOR_SYSTEM_PROMPT = """\
 You are an independent caller-contract verifier. You receive ONLY the task \
-summary, the caller snippets, and the updated implementation (with no prior \
+summary, the caller snippets, and the proposed diff (with no prior \
 conversation history).
 
-Evaluate strictly whether the UPDATED implementation satisfies every caller's \
+Evaluate strictly whether the proposed diff satisfies every caller's \
 contract. Do NOT assume any previous buggy behavior should be preserved; judge \
 only against the task and the callers.
 
@@ -34,18 +37,21 @@ every variable assigned or unpacked from the call, plus how downstream lines use
 it (element order, types, units, prefixes/formatting, and null/sentinel checks).
 2. TRACE_REALISTIC: Pick 1 realistic, standard-format, asymmetric input matching \
 the task and parameter names (never use symmetric placeholders like 'A B' or \
-[1, 1]) and 1 edge case. Execute the EXACT updated implementation line by line \
-to compute its literal return value, then substitute that return value into the \
-caller's exact variable names AND evaluate the caller's final output expression.
+[1, 1]) and 1 edge case. Trace the EXACT changed behavior in the proposed diff \
+line by line to compute its literal return value, then substitute that return \
+value into the caller's exact variable names AND evaluate the caller's final \
+output expression.
 3. MISMATCH_CHECK: Verify that every variable bound in the caller actually holds \
 what its variable name and downstream expression require (e.g., unpacked items \
 are not swapped, numeric values use the caller's expected unit, types and \
 null/sentinel checks match, and the caller's final output is valid).
-4. Put your verdict on a separate final line in plain text, without numbering or Markdown.
-If evidence is insufficient, use VERDICT: UNKNOWN: <reason>. For a verified match use:
+4. Output your verdict on a separate final line in plain text, without numbering or Markdown.
+For a verified match output:
 VERDICT: PASS
-or, ONLY if you proved a concrete input where a caller variable or caller result \
-is wrong:
+If evidence is insufficient output:
+VERDICT: UNKNOWN: <reason>
+ONLY if you proved a concrete input where a caller variable or caller result \
+is wrong output:
 VERDICT: FAIL: <input -> actual return -> wrong caller variable/result -> required fix>"""
 
 
@@ -100,8 +106,9 @@ def parse_audit_verdict(raw: str | None) -> AuditVerdict:
     match = _VERDICT_RE.fullmatch(lines[-1].strip()) if lines else None
     if len(candidates) != 1 or not match:
         return AuditVerdict("UNKNOWN", "Missing or malformed final verdict", raw[-2000:])
-    status, reason = match.groups()
+    _, status, reason = match.groups()
     status = status.upper()
+    reason = (reason or "").strip()[:_MAX_REASON_CHARS]
     if status == "PASS" and reason:
         return AuditVerdict("UNKNOWN", "Qualified PASS verdict", raw[-2000:])
     return AuditVerdict(status, reason or status, raw[-2000:])
@@ -142,10 +149,10 @@ class CallerContractHook:
         if not self.enabled or not content:
             return None
         edit_marker = re.search(
-            r"<<<<<<< SEARCH|```|^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
+            r"<<<<<<< SEARCH|^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
             content,
             re.M,
-        )
+        ) or re.search(r"```", content)
         if not edit_marker:
             return None
         if not self._excerpts:

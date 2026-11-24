@@ -734,15 +734,19 @@ class TreeSitterCallerFinder:
             limitations = []
             if len(snippet) > max_chars:
                 limitations.append("excerpt truncated")
-            named, namespaces = _parse_js_imports(source)
-            specifiers = [spec for imported, _, spec in named if imported == symbol]
-            specifiers.extend(spec for _, spec in namespaces)
-            resolved = any(
-                _js_specifier_matches_editable(spec, name, target)
-                for spec in specifiers
-                for target in targets[symbol]
-            )
-            if len(targets[symbol]) != 1 or not resolved:
+            is_js_ts = Path(name).suffix.lower() in _JS_TS_SUFFIXES
+            if is_js_ts:
+                named, namespaces = _parse_js_imports(source)
+                specifiers = [spec for imported, _, spec in named if imported == symbol]
+                specifiers.extend(spec for _, spec in namespaces)
+                resolved = any(
+                    _js_specifier_matches_editable(spec, name, target)
+                    for spec in specifiers
+                    for target in targets[symbol]
+                )
+                if len(targets[symbol]) != 1 or not resolved:
+                    limitations.append("ambiguous symbol binding")
+            elif len(targets[symbol]) != 1:
                 limitations.append("ambiguous symbol binding")
             excerpts.append(
                 CallerExcerpt(

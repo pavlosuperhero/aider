@@ -394,7 +394,9 @@ class Coder:
         )
         if self.local_caller_contract_hook.enabled:
             self.response_hooks += (self.local_caller_contract_hook,)
-        if self.local_callers_audit or self.local_callers_mode == "contract":
+        if self.local_callers and (
+            self.local_callers_audit or self.local_callers_mode == "contract"
+        ):
             self.max_reflections = max(self.max_reflections, 4)
         self.local_caller_auditor = (
             IsolatedCallerAuditor(
@@ -948,9 +950,26 @@ class Coder:
             self.local_caller_auditor.begin_turn(excerpts)
 
     def _complete_caller_audit(self, messages):
+        litellm_ex = LiteLLMExceptions()
         response = None
+        max_attempts = 3
+        retry_delay = 0.5
         try:
-            _, response = self.main_model.send_completion(messages=messages, functions=None, stream=False)
+            for attempt in range(max_attempts):
+                try:
+                    _, response = self.main_model.send_completion(
+                        messages=messages, functions=None, stream=False
+                    )
+                    break
+                except litellm_ex.exceptions_tuple() as err:
+                    ex_info = litellm_ex.get_ex_info(err)
+                    if not ex_info.retry or attempt + 1 >= max_attempts:
+                        raise
+                    self.io.tool_warning(
+                        f"Local caller audit transient error ({err}); retrying in {retry_delay:.1f}s..."
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 20.0)
         finally:
             if os.getenv("AIDER_TRIAL_USAGE"):
                 usage = getattr(response, "usage", None)
