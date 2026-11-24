@@ -1,6 +1,6 @@
 # Issue 5 implementation plan and tracker
 
-[Issue #5](https://github.com/pavlosuperhero/aider/issues/5) builds on the [issue #7 pre-commit verifier](https://github.com/pavlosuperhero/aider/issues/7). Keep Cymbal, range-based prompt changes and facts opt-in during evaluation. Each task has a dedicated branch and headless `agy` NEON worker. The lead supplies the Oracle passage via `fetch(id)`, reviews the diff and verifies the observed behavior before closing the task.
+[Issue #5](https://github.com/pavlosuperhero/aider/issues/5) builds on the [issue #7 pre-commit verifier](https://github.com/pavlosuperhero/aider/issues/7). Keep Cymbal, range-based prompt changes and facts opt-in during evaluation. Use `feat/caller-context-cymbal-readrange-facts` as the consolidated branch for all seven iterations. Each iteration has a headless `agy` NEON worker. The lead supplies the Oracle passage via `fetch(id)`, reviews the diff and verifies the observed behavior before closing the task.
 
 | Task | Status | Observed result or remaining work | PR |
 | --- | --- | --- | --- |
@@ -20,7 +20,7 @@
 
 ## 1. Freeze the baseline
 
-- **Branch:** `codex/5-baseline-tracker`
+- **Original task branch:** `codex/5-baseline-tracker`
 - **Dependency:** None
 - **Reason:** On `d2f5965`, 13/13 synthetic and 2/2 Requests 2.34.2 fixtures passed smoke and failed hidden checks. A separate discovery probe found `requests_copy` returned `INCOMPLETE` (expected calls `models.py:458-459`), and `requests_json` returned `NO_EVIDENCE` (alias `models.py:67`, exception `__reduce__` `exceptions.py:55`).
 - **Expected behavior:** Establish the baseline tracker for `d2f5965` and freeze 30 unseen real replays and negative controls before tuning.
@@ -31,7 +31,7 @@
 
 ## 2. Report caller evidence and scope
 
-- **Branch:** `codex/5-caller-evidence`
+- **Original task branch:** `codex/5-caller-evidence`
 - **Dependency:** Task 1 baseline
 - **Reason:** Selection by path and a 3-file cap can hide limited coverage.
 - **Expected behavior:** Extend the existing report and expose an immutable typed result with states `NO_EVIDENCE`, `INCOMPLETE`, and `COMPLETE_WITHIN_SCOPE`, including fields for `path`, `line`, `symbol`, `kind`, `source`, `scope`, `ambiguity`, and `truncation`.
@@ -42,7 +42,7 @@
 
 ## 3. Integrate the Cymbal adapter
 
-- **Branch:** `codex/5-cymbal-adapter`
+- **Original task branch:** `codex/5-cymbal-adapter`
 - **Dependency:** Task 2
 - **Reason:** The composite currently passes report data only to recognized built-in classes. A third adapter needs the same reporting path or its uncertainty can disappear.
 - **Expected behavior:**
@@ -57,7 +57,7 @@
 
 ## 4. Read bounded source ranges
 
-- **Branch:** `codex/5-read-range`
+- **Original task branch:** `codex/5-read-range`
 - **Dependency:** Task 2 for native reads, Task 3 for Cymbal show
 - **Reason:** `read_source` currently rejects files larger than 131072 bytes, and existing excerpts are limited to 700 characters.
 - **Expected behavior:**
@@ -71,17 +71,18 @@
 
 ## 5. Persist project facts
 
-- **Branch:** `codex/5-project-facts`
+- **Original task branch:** `codex/5-project-facts`
 - **Dependency:** Task 1 baseline
 - **Reason:** `ChatSummary` may drop original conventions.
 - **Expected Behavior:**
-  - Support opt-in `--facts` and `--facts-db` options plus `/fact`.
+  - With `--facts`, persist confirmed records in the local worktree file `.aider.facts.sqlite3`, ignored by Git. Accept `--facts-db PATH` for an alternate location. With facts disabled, skip opening or creating the store.
+  - Use Python’s embedded SQLite driver and FTS5. The standalone SQLite executable and a database server are optional. If the driver or FTS5 is missing, report that facts are disabled, preserve any existing database, and continue the Aider session. Do not silently save records to another store. Expose explicit recording via `/fact`.
   - Provide fake and SQLite FTS5 implementations (Repository Pattern) for `add`, `search`, and `list_for_paths`.
   - Track source hashes and invalidate entries on source change.
   - Keep model candidates marked unverified.
   - Enforce worktree isolation and bounded top-K results.
 - **Acceptance Checks:**
-  - Verify opt-in `--facts`, `--facts-db`, and `/fact` behavior.
+  - Test disabled mode, default and custom paths, and a missing SQLite executable with a working Python driver. Simulate missing Python SQLite and missing FTS5 separately. Check the diagnostic, unchanged existing file, and absence of a fallback file.
   - Verify `add`, `search`, and `list_for_paths` against both fake and SQLite FTS5 backends.
   - Verify source-hash invalidation on source change, unverified model candidates, worktree isolation, and bounded top-K limits.
   - Record a decision, force it outside the retained chat tail, compact, and restart. Assert the original source hash and provenance survive. An edited or missing source must mark the fact stale.
@@ -89,7 +90,7 @@
 
 ## 6. Verify the edited working tree
 
-- **Branch:** `codex/5-verifier-integration`
+- **Original task branch:** `codex/5-verifier-integration`
 - **Dependency:** Tasks 2–5 and the existing issue #7 gate
 - **Reason:** Integrate verifier checks into the existing strict audit gate from issue 7 by reusing the hook and auditor with `--tdd` and the configured test command.
 - **Expected behavior:**
@@ -105,7 +106,7 @@
 
 ## 7. Measure retrieval and edit outcomes
 
-- **Branch:** `codex/5-benchmark-report`
+- **Original task branch:** `codex/5-benchmark-report`
 - **Dependency:** Tasks 1–6
 - **Reason:** Baseline stands at 14/26, passive at 22/26, with seven false approvals across audit arms; controlled benchmarking is required prior to tuning.
 - **Expected behavior:** Freeze paired real replays, evaluate the five original arms, then evaluate one additional factor at a time on pinned local quantized Qwen. Separate correct edits, audit verdicts, and commits; report intervals, p50/p95 token cost, and cold/warm/incremental retrieval metrics; justify control margin and power prior to tuning.
