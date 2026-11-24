@@ -43,24 +43,55 @@ PREREGISTRATION_FIELD_DOCS: dict[str, str] = {
     "frozen": "Boolean indicating whether the manifest is frozen for evaluation runs.",
     "hypothesis": "Primary experimental hypothesis tested by this replay corpus.",
     "primary_metric": "Primary outcome metric used to adjudicate the hypothesis.",
-    "secondary_metrics": "Ordered tuple of secondary diagnostic metrics recorded alongside primary_metric.",
-    "inclusion_criteria": "Non-empty tuple of documented criteria required for a commit/task to enter the corpus.",
-    "exclusion_criteria": "Non-empty tuple of documented criteria that disqualify candidate commits/tasks.",
+    "secondary_metrics": (
+        "Ordered tuple of secondary diagnostic metrics recorded alongside primary_metric."
+    ),
+    "inclusion_criteria": (
+        "Non-empty tuple of documented criteria required for a commit/task to enter the corpus."
+    ),
+    "exclusion_criteria": (
+        "Non-empty tuple of documented criteria that disqualify candidate commits/tasks."
+    ),
     "stopping_rule": "Documented rule specifying when corpus construction or evaluation stops.",
-    "leakage_controls": "Non-empty tuple of documented controls preventing target/test leakage into prompts or snapshots.",
+    "leakage_controls": (
+        "Non-empty tuple of documented controls preventing target/test leakage"
+        " into prompts or snapshots."
+    ),
     "cutoff_date": "Optional ISO-8601 date (YYYY-MM-DD) governing temporal contamination checks.",
-    "cutoff_direction": "How case commit_date is checked against cutoff_date: 'on_or_after' or 'on_or_before'.",
-    "manifest_sha256": "Optional SHA-256 hex digest of the canonical manifest (with manifest_sha256 set to null) for tamper detection.",
+    "cutoff_direction": (
+        "How case commit_date is checked against cutoff_date:"
+        " 'on_or_after' or 'on_or_before'."
+    ),
+    "manifest_sha256": (
+        "Optional SHA-256 hex digest of the canonical manifest"
+        " (with manifest_sha256 set to null) for tamper detection."
+    ),
 }
 
 CASE_PREREGISTRATION_FIELD_DOCS: dict[str, str] = {
-    "selection_rationale": "Documented rationale explaining why this case satisfies corpus inclusion_criteria.",
-    "source_origin": "Human-readable provenance label (e.g. repo and issue/PR identifier); metadata only, never fetched.",
-    "commit_date": "Optional ISO-8601 date (YYYY-MM-DD) of the historical commit for cutoff_date verification.",
+    "selection_rationale": (
+        "Documented rationale explaining why this case satisfies corpus inclusion_criteria."
+    ),
+    "source_origin": (
+        "Human-readable provenance label (e.g. repo and issue/PR identifier);"
+        " metadata only, never fetched."
+    ),
+    "commit_date": (
+        "Optional ISO-8601 date (YYYY-MM-DD) of the historical commit"
+        " for cutoff_date verification."
+    ),
     "expected_difficulty": "Preregistered difficulty tier: 'easy', 'medium', or 'hard'.",
-    "file_scope_category": "Preregistered edit scope: 'single_file' (1 editable file) or 'multi_file' (2+ editable files).",
-    "leakage_checked": "Boolean attestation that task_prompt and explicit_guidance do not leak hidden tests or fix diffs.",
-    "preregistered_notes": "Optional pre-run notes or caveats documented prior to trial execution.",
+    "file_scope_category": (
+        "Preregistered edit scope: 'single_file' (1 editable file)"
+        " or 'multi_file' (2+ editable files)."
+    ),
+    "leakage_checked": (
+        "Boolean attestation that task_prompt and explicit_guidance"
+        " do not leak hidden tests or fix diffs."
+    ),
+    "preregistered_notes": (
+        "Optional pre-run notes or caveats documented prior to trial execution."
+    ),
 }
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -929,7 +960,8 @@ def materialize_source(
     """
     if _is_remote_location(source.repo_path):
         raise FixtureValidationError(
-            f"Remote repository URLs are forbidden; use a local pinned git checkout: {source.repo_path!r}"
+            "Remote repository URLs are forbidden; "
+            f"use a local pinned git checkout: {source.repo_path!r}"
         )
     subdir_err = _validate_rel_posix_path(source.subdir, allow_empty=True)
     if subdir_err is not None:
@@ -946,12 +978,14 @@ def materialize_source(
     if commit_override is None and source.expected_tree_sha is not None:
         if not _is_full_hex_oid(source.expected_tree_sha):
             raise FixtureValidationError(
-                f"source.expected_tree_sha must be a full hex OID, got {source.expected_tree_sha!r}"
+                "source.expected_tree_sha must be a full hex OID, "
+                f"got {source.expected_tree_sha!r}"
             )
         actual_tree = _resolve_git_tree(repo_path, target_commit)
         if actual_tree != source.expected_tree_sha:
             raise FixtureValidationError(
-                f"Git tree pin mismatch at {target_commit}: expected {source.expected_tree_sha}, got {actual_tree}"
+                f"Git tree pin mismatch at {target_commit}: "
+                f"expected {source.expected_tree_sha}, got {actual_tree}"
             )
 
     include_res = [_glob_to_regex(pat) for pat in source.include_globs]
@@ -987,7 +1021,8 @@ def materialize_source(
             continue
         if len(raw) > source.max_file_bytes:
             raise FixtureValidationError(
-                f"Materialized file {relpath!r} ({len(raw)} bytes) exceeds max_file_bytes ({source.max_file_bytes})"
+                f"Materialized file {relpath!r} ({len(raw)} bytes) "
+                f"exceeds max_file_bytes ({source.max_file_bytes})"
             )
         assert decoded is not None
         files[relpath] = decoded
@@ -995,18 +1030,21 @@ def materialize_source(
     missing_editable = [path for path in editable_files if path not in files]
     if missing_editable:
         raise FixtureValidationError(
-            f"Editable file(s) missing from materialized commit {target_commit}: {', '.join(missing_editable)}"
+            f"Editable file(s) missing from materialized commit {target_commit}: "
+            f"{', '.join(missing_editable)}"
         )
 
     digest = compute_files_digest(files)
     if commit_override is None and source.expected_files_sha256 is not None:
         if not _is_sha256_hex(source.expected_files_sha256):
             raise FixtureValidationError(
-                f"source.expected_files_sha256 must be 64 lowercase hex chars, got {source.expected_files_sha256!r}"
+                "source.expected_files_sha256 must be 64 lowercase hex chars, "
+                f"got {source.expected_files_sha256!r}"
             )
         if digest != source.expected_files_sha256:
             raise FixtureValidationError(
-                f"Materialized files digest mismatch: expected {source.expected_files_sha256}, got {digest}"
+                "Materialized files digest mismatch: "
+                f"expected {source.expected_files_sha256}, got {digest}"
             )
 
     return files, digest
@@ -1043,14 +1081,16 @@ def resolve_hidden_files(
         if hf.placement == "workspace":
             if hf.target_path in materialized_files or hf.target_path in editable_set:
                 raise FixtureValidationError(
-                    f"{ctx}.target_path {hf.target_path!r} collides with materialized workspace files"
+                    f"{ctx}.target_path {hf.target_path!r} "
+                    "collides with materialized workspace files"
                 )
 
         has_fs = hf.source_path is not None
         has_git = hf.git_commit is not None or hf.git_path is not None
         if has_fs == has_git:
             raise FixtureValidationError(
-                f"{ctx} must specify either source_path or (git_commit and git_path), not both or neither"
+                f"{ctx} must specify either source_path or "
+                "(git_commit and git_path), not both or neither"
             )
 
         resolved_source_path: Path | None = None
@@ -1064,11 +1104,13 @@ def resolve_hidden_files(
             resolved_source_path = _resolve_local_path(hf.source_path, base_dir)
             if not resolved_source_path.is_file():
                 raise FixtureValidationError(
-                    f"{ctx}.source_path does not exist or is not a regular file: {resolved_source_path}"
+                    f"{ctx}.source_path does not exist or is not a regular file: "
+                    f"{resolved_source_path}"
                 )
             if _is_within(resolved_source_path, repo_path):
                 raise FixtureValidationError(
-                    f"{ctx}.source_path ({resolved_source_path}) must be external to repo_path ({repo_path})"
+                    f"{ctx}.source_path ({resolved_source_path}) "
+                    f"must be external to repo_path ({repo_path})"
                 )
             content_bytes = resolved_source_path.read_bytes()
         else:
@@ -1085,7 +1127,8 @@ def resolve_hidden_files(
                     rel_in_subdir = rel_in_subdir[len(entry.source.subdir) + 1 :]
                 if rel_in_subdir in materialized_files:
                     raise FixtureValidationError(
-                        f"{ctx} references {hf.git_path!r} at base_commit which is already exposed in materialized files"
+                        f"{ctx} references {hf.git_path!r} at base_commit "
+                        "which is already exposed in materialized files"
                     )
             resolved_repo_path = repo_path
             content_bytes = _read_single_git_blob(repo_path, hf.git_commit, hf.git_path)
@@ -1098,7 +1141,8 @@ def resolve_hidden_files(
                 )
             if actual_sha != hf.sha256:
                 raise FixtureValidationError(
-                    f"{ctx} SHA-256 mismatch for {hf.target_path!r}: expected {hf.sha256}, got {actual_sha}"
+                    f"{ctx} SHA-256 mismatch for {hf.target_path!r}: "
+                    f"expected {hf.sha256}, got {actual_sha}"
                 )
 
         resolved.append(
@@ -1155,7 +1199,8 @@ def build_hidden_runner_script(
     config_json = json.dumps(config, sort_keys=True)
     return (
         "def _replay_run_hidden():\n"
-        "    import base64, hashlib, json, os, pathlib, subprocess, sys, tempfile, zlib\n"
+        "    import base64, hashlib, json, os, pathlib\n"
+        "    import shutil, subprocess, sys, tempfile, zlib\n"
         f"    cfg = json.loads({config_json!r})\n"
         "    workspace = pathlib.Path.cwd().resolve()\n"
         "    created_files = []\n"
@@ -1180,7 +1225,10 @@ def build_hidden_runner_script(
         "                        env=git_env,\n"
         "                    )\n"
         "                    if gproc.returncode != 0:\n"
-        "                        raise AssertionError('Failed to read git hidden file: ' + gproc.stderr.decode('utf-8', 'replace'))\n"
+        "                        err_msg = gproc.stderr.decode('utf-8', 'replace')\n"
+        "                        raise AssertionError(\n"
+        "                            'Failed to read git hidden file: ' + err_msg\n"
+        "                        )\n"
         "                    data = gproc.stdout\n"
         "                actual_sha = hashlib.sha256(data).hexdigest()\n"
         "                if actual_sha != item['sha256']:\n"
@@ -1193,7 +1241,10 @@ def build_hidden_runner_script(
         "                dest.relative_to(base)\n"
         "                if item['placement'] == 'workspace':\n"
         "                    if dest.exists():\n"
-        "                        raise AssertionError('Hidden workspace file collides with existing path: ' + item['target_path'])\n"
+        "                        raise AssertionError(\n"
+        "                            'Hidden workspace file collides with existing path: '\n"
+        "                            + item['target_path']\n"
+        "                        )\n"
         "                    missing_parents = []\n"
         "                    parent = dest.parent\n"
         "                    while parent != workspace and not parent.exists():\n"
@@ -1218,13 +1269,22 @@ def build_hidden_runner_script(
         "                return text\n"
         "            argv = [_sub(tok) for tok in cfg['command']]\n"
         "            env = os.environ.copy()\n"
+        "            env['PYTHONDONTWRITEBYTECODE'] = '1'\n"
         "            env['REPLAY_WORKSPACE'] = str(workspace)\n"
         "            env['REPLAY_HIDDEN_DIR'] = str(hidden_dir)\n"
         "            existing_pp = env.get('PYTHONPATH', '')\n"
-        "            env['PYTHONPATH'] = str(workspace) if not existing_pp else str(workspace) + os.pathsep + existing_pp\n"
+        "            env['PYTHONPATH'] = (\n"
+        "                str(workspace)\n"
+        "                if not existing_pp\n"
+        "                else str(workspace) + os.pathsep + existing_pp\n"
+        "            )\n"
         "            for k, v in cfg['env'].items():\n"
         "                env[k] = _sub(v)\n"
-        "            run_cwd = workspace if not cfg['cwd'] else (workspace / cfg['cwd']).resolve()\n"
+        "            run_cwd = (\n"
+        "                workspace\n"
+        "                if not cfg['cwd']\n"
+        "                else (workspace / cfg['cwd']).resolve()\n"
+        "            )\n"
         "            run_cwd.relative_to(workspace)\n"
         "            proc = subprocess.run(\n"
         "                argv,\n"
@@ -1236,7 +1296,8 @@ def build_hidden_runner_script(
         "            )\n"
         "            if proc.returncode != cfg['expected_exit_code']:\n"
         "                raise AssertionError(\n"
-        "                    'Hidden command ' + repr(argv) + ' exited with ' + str(proc.returncode)\n"
+        "                    'Hidden command ' + repr(argv)\n"
+        "                    + ' exited with ' + str(proc.returncode)\n"
         "                    + ' (expected ' + str(cfg['expected_exit_code']) + ')\\n'\n"
         "                    + 'STDOUT:\\n' + proc.stdout + '\\nSTDERR:\\n' + proc.stderr\n"
         "                )\n"
@@ -1247,10 +1308,7 @@ def build_hidden_runner_script(
         "                except FileNotFoundError:\n"
         "                    pass\n"
         "            for directory in reversed(created_dirs):\n"
-        "                try:\n"
-        "                    directory.rmdir()\n"
-        "                except OSError:\n"
-        "                    pass\n"
+        "                shutil.rmtree(directory, ignore_errors=True)\n"
         "_replay_run_hidden()\n"
         "del _replay_run_hidden\n"
     )
@@ -1372,7 +1430,7 @@ def validate_manifest(
     run_checks: bool = False,
     require_frozen: bool = False,
 ) -> ValidationReport:
-    """Validate preregistration metadata, git pins, external hidden fixtures, and optional checks."""
+    """Validate preregistration metadata, git pins, external hidden fixtures, and checks."""
     errors: list[ValidationIssue] = []
     warnings: list[ValidationIssue] = []
     case_results: dict[str, CaseValidationResult] = {}
@@ -1418,13 +1476,15 @@ def validate_manifest(
     if not prereg.preregistration_id.strip() or not _SLUG_RE.match(prereg.preregistration_id):
         add_error(
             "invalid_preregistration_id",
-            f"preregistration.preregistration_id must be a non-empty slug, got {prereg.preregistration_id!r}",
+            "preregistration.preregistration_id must be a non-empty slug, "
+            f"got {prereg.preregistration_id!r}",
             field_name="preregistration.preregistration_id",
         )
     if not _validate_iso_timestamp(prereg.registered_at):
         add_error(
             "invalid_registered_at",
-            f"preregistration.registered_at must be an ISO-8601 timestamp with timezone, got {prereg.registered_at!r}",
+            "preregistration.registered_at must be an ISO-8601 timestamp with timezone, "
+            f"got {prereg.registered_at!r}",
             field_name="preregistration.registered_at",
         )
     if not prereg.frozen:
@@ -1437,7 +1497,8 @@ def validate_manifest(
         else:
             add_warning(
                 "manifest_not_frozen",
-                "preregistration.frozen is false; freeze and pin manifest_sha256 before running formal trials",
+                "preregistration.frozen is false; freeze and pin manifest_sha256"
+                " before running formal trials",
                 field_name="preregistration.frozen",
             )
     for attr in ("hypothesis", "primary_metric", "stopping_rule"):
@@ -1459,7 +1520,8 @@ def validate_manifest(
     if prereg.cutoff_direction not in ALLOWED_CUTOFF_DIRECTIONS:
         add_error(
             "invalid_cutoff_direction",
-            f"preregistration.cutoff_direction must be one of {ALLOWED_CUTOFF_DIRECTIONS}, got {prereg.cutoff_direction!r}",
+            f"preregistration.cutoff_direction must be one of {ALLOWED_CUTOFF_DIRECTIONS}, "
+            f"got {prereg.cutoff_direction!r}",
             field_name="preregistration.cutoff_direction",
         )
     cutoff_date_parsed: date | None = None
@@ -1476,13 +1538,15 @@ def validate_manifest(
         if not _is_sha256_hex(prereg.manifest_sha256):
             add_error(
                 "invalid_manifest_sha256",
-                f"preregistration.manifest_sha256 must be 64 lowercase hex chars, got {prereg.manifest_sha256!r}",
+                "preregistration.manifest_sha256 must be 64 lowercase hex chars, "
+                f"got {prereg.manifest_sha256!r}",
                 field_name="preregistration.manifest_sha256",
             )
         elif prereg.manifest_sha256 != computed_manifest_sha:
             add_error(
                 "manifest_digest_mismatch",
-                f"preregistration.manifest_sha256 mismatch: expected {prereg.manifest_sha256}, computed {computed_manifest_sha}",
+                "preregistration.manifest_sha256 mismatch: "
+                f"expected {prereg.manifest_sha256}, computed {computed_manifest_sha}",
                 field_name="preregistration.manifest_sha256",
             )
     elif prereg.frozen:
@@ -1493,7 +1557,11 @@ def validate_manifest(
         )
 
     if not manifest.cases:
-        add_error("empty_corpus", "manifest.cases must contain at least one case", field_name="cases")
+        add_error(
+            "empty_corpus",
+            "manifest.cases must contain at least one case",
+            field_name="cases",
+        )
 
     seen_ids: set[str] = set()
     for entry in manifest.cases:
@@ -1574,14 +1642,16 @@ def validate_manifest(
         if cpr.expected_difficulty not in ALLOWED_DIFFICULTIES:
             add_error(
                 "invalid_expected_difficulty",
-                f"expected_difficulty must be one of {ALLOWED_DIFFICULTIES}, got {cpr.expected_difficulty!r}",
+                f"expected_difficulty must be one of {ALLOWED_DIFFICULTIES}, "
+                f"got {cpr.expected_difficulty!r}",
                 case_id=cid,
                 field_name="preregistration.expected_difficulty",
             )
         if cpr.file_scope_category not in ALLOWED_FILE_SCOPES:
             add_error(
                 "invalid_file_scope_category",
-                f"file_scope_category must be one of {ALLOWED_FILE_SCOPES}, got {cpr.file_scope_category!r}",
+                f"file_scope_category must be one of {ALLOWED_FILE_SCOPES}, "
+                f"got {cpr.file_scope_category!r}",
                 case_id=cid,
                 field_name="preregistration.file_scope_category",
             )
@@ -1590,7 +1660,8 @@ def validate_manifest(
             if cpr.file_scope_category != expected_scope:
                 add_error(
                     "file_scope_mismatch",
-                    f"file_scope_category is {cpr.file_scope_category!r} but editable_files has {len(entry.editable_files)} file(s)",
+                    f"file_scope_category is {cpr.file_scope_category!r} "
+                    f"but editable_files has {len(entry.editable_files)} file(s)",
                     case_id=cid,
                     field_name="preregistration.file_scope_category",
                 )
@@ -1606,7 +1677,8 @@ def validate_manifest(
             if parsed_commit_date is None:
                 add_error(
                     "invalid_commit_date",
-                    f"case preregistration.commit_date must be YYYY-MM-DD, got {cpr.commit_date!r}",
+                    "case preregistration.commit_date must be YYYY-MM-DD, "
+                    f"got {cpr.commit_date!r}",
                     case_id=cid,
                     field_name="preregistration.commit_date",
                 )
@@ -1617,7 +1689,8 @@ def validate_manifest(
                 ):
                     add_error(
                         "cutoff_date_violation",
-                        f"commit_date {cpr.commit_date} precedes preregistered cutoff_date {prereg.cutoff_date}",
+                        f"commit_date {cpr.commit_date} precedes "
+                        f"preregistered cutoff_date {prereg.cutoff_date}",
                         case_id=cid,
                         field_name="preregistration.commit_date",
                     )
@@ -1627,7 +1700,8 @@ def validate_manifest(
                 ):
                     add_error(
                         "cutoff_date_violation",
-                        f"commit_date {cpr.commit_date} exceeds preregistered cutoff_date {prereg.cutoff_date}",
+                        f"commit_date {cpr.commit_date} exceeds "
+                        f"preregistered cutoff_date {prereg.cutoff_date}",
                         case_id=cid,
                         field_name="preregistration.commit_date",
                     )
@@ -1699,7 +1773,8 @@ def validate_manifest(
             if "smoke.py" in materialized.files:
                 add_error(
                     "smoke_script_collision",
-                    "smoke.script cannot be set when materialized source already contains 'smoke.py'",
+                    "smoke.script cannot be set when materialized source"
+                    " already contains 'smoke.py'",
                     case_id=cid,
                     field_name="smoke.script",
                 )
@@ -1737,7 +1812,8 @@ def validate_manifest(
                     if not changed_editable:
                         add_error(
                             "fix_commit_no_editable_diff",
-                            "source.fix_commit does not change any declared editable_files relative to base_commit",
+                            "source.fix_commit does not change any declared"
+                            " editable_files relative to base_commit",
                             case_id=cid,
                             field_name="source.fix_commit",
                         )
@@ -1769,9 +1845,11 @@ def validate_manifest(
                     else:
                         base_smoke_passed = smoke_proc.returncode == 0
                         if not base_smoke_passed:
+                            detail = smoke_proc.stderr or smoke_proc.stdout
                             add_error(
                                 "base_smoke_failed",
-                                f"Smoke check failed on base_commit (rc={smoke_proc.returncode}): {smoke_proc.stderr or smoke_proc.stdout}",
+                                "Smoke check failed on base_commit "
+                                f"(rc={smoke_proc.returncode}): {detail}",
                                 case_id=cid,
                                 field_name="smoke",
                             )
@@ -1783,7 +1861,8 @@ def validate_manifest(
                     if not base_smoke_passed:
                         add_error(
                             "base_smoke_failed",
-                            f"Repository smoke.py failed on base_commit (rc={smoke_proc.returncode})",
+                            "Repository smoke.py failed on base_commit "
+                            f"(rc={smoke_proc.returncode})",
                             case_id=cid,
                             field_name="smoke",
                         )
@@ -1807,7 +1886,8 @@ def validate_manifest(
                     if not base_hidden_failed:
                         add_error(
                             "base_hidden_unexpectedly_passed",
-                            "Hidden verification passed on buggy base_commit; fixture must fail on base_commit",
+                            "Hidden verification passed on buggy base_commit; "
+                            "fixture must fail on base_commit",
                             case_id=cid,
                             field_name="hidden",
                         )
@@ -1828,16 +1908,19 @@ def validate_manifest(
                         fix_hidden_passed = False
                         add_error(
                             "fix_hidden_timeout",
-                            "Hidden verification timed out after applying fix_commit editable_files",
+                            "Hidden verification timed out after applying"
+                            " fix_commit editable_files",
                             case_id=cid,
                             field_name="source.fix_commit",
                         )
                     else:
                         fix_hidden_passed = hidden_fix_proc.returncode == 0
                         if not fix_hidden_passed:
+                            detail = hidden_fix_proc.stderr or hidden_fix_proc.stdout
                             add_error(
                                 "fix_hidden_failed",
-                                f"Hidden verification failed after applying fix_commit editable_files (rc={hidden_fix_proc.returncode}): {hidden_fix_proc.stderr or hidden_fix_proc.stdout}",
+                                "Hidden verification failed after applying fix_commit "
+                                f"editable_files (rc={hidden_fix_proc.returncode}): {detail}",
                                 case_id=cid,
                                 field_name="source.fix_commit",
                             )
@@ -1848,7 +1931,8 @@ def validate_manifest(
                         if not fix_smoke_passed:
                             add_error(
                                 "fix_smoke_failed",
-                                f"Smoke check failed after applying fix_commit editable_files (rc={smoke_fix_proc.returncode})",
+                                "Smoke check failed after applying fix_commit "
+                                f"editable_files (rc={smoke_fix_proc.returncode})",
                                 case_id=cid,
                                 field_name="smoke",
                             )
@@ -2063,7 +2147,10 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
     p_dig = sub.add_parser(
         "digest",
-        help="Compute canonical manifest_sha256, materialized files_sha256, and hidden file digests.",
+        help=(
+            "Compute canonical manifest_sha256, materialized files_sha256,"
+            " and hidden file digests."
+        ),
     )
     p_dig.add_argument("manifest", help="Path to replay manifest JSON file.")
 
@@ -2143,9 +2230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             status = "OK" if report.ok else "FAILED"
             print(f"Validation {status} (manifest_sha256={report.manifest_sha256})")
             for warning in report.warnings:
-                print(f"  WARNING [{warning.code}] ({warning.case_id or 'manifest'}): {warning.message}")
+                target = warning.case_id or "manifest"
+                print(f"  WARNING [{warning.code}] ({target}): {warning.message}")
             for error in report.errors:
-                print(f"  ERROR [{error.code}] ({error.case_id or 'manifest'}): {error.message}")
+                target = error.case_id or "manifest"
+                print(f"  ERROR [{error.code}] ({target}): {error.message}")
         return 0 if report.ok else 1
 
     return 2

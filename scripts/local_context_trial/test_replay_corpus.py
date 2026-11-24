@@ -14,13 +14,14 @@ import subprocess
 import sys
 import tempfile
 import types
+from typing import Any
 import unittest
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-import replay_corpus
+import replay_corpus  # noqa: E402
 
 
 def _git_test_env() -> dict[str, str]:
@@ -118,7 +119,9 @@ def _create_sample_checkout(root: Path) -> dict[str, Any]:
     fix_commit = _git(repo, "rev-parse", "HEAD")
 
     # Dirty the working tree deliberately to prove materialization ignores working tree state
-    (repo / "pkg" / "store.py").write_text("DIRTY WORKING TREE SHOULD BE IGNORED\n", encoding="utf-8")
+    (repo / "pkg" / "store.py").write_text(
+        "DIRTY WORKING TREE SHOULD BE IGNORED\n", encoding="utf-8"
+    )
 
     # External hidden test directory outside the git checkout
     hidden_root = root / "external_hidden"
@@ -206,7 +209,9 @@ def _make_manifest_dict(
             "preregistration_id": "replay-unit-test-v1",
             "registered_at": "2026-11-24T00:00:00Z",
             "frozen": frozen,
-            "hypothesis": "Multi-file context improves hidden test pass rate on pinned replay bugs.",
+            "hypothesis": (
+                "Multi-file context improves hidden test pass rate on pinned replay bugs."
+            ),
             "primary_metric": "hidden_pass_rate",
             "secondary_metrics": ["wall_time_seconds"],
             "inclusion_criteria": [
@@ -225,8 +230,13 @@ def _make_manifest_dict(
         "cases": [
             {
                 "case_id": "bag_case_copy",
-                "task_prompt": "Fix key normalization and Bag.copy so keys are case-insensitive and copies are independent.",
-                "explicit_guidance": "Normalize keys to lowercase and clone internal storage in Bag.copy.",
+                "task_prompt": (
+                    "Fix key normalization and Bag.copy so keys are case-insensitive"
+                    " and copies are independent."
+                ),
+                "explicit_guidance": (
+                    "Normalize keys to lowercase and clone internal storage in Bag.copy."
+                ),
                 "editable_files": ["pkg/normalizer.py", "pkg/store.py"],
                 "source": {
                     "repo_path": str(fixture["repo"]),
@@ -250,7 +260,11 @@ def _make_manifest_dict(
                     "expected_exit_code": 0,
                 },
                 "smoke": {
-                    "command": ["{python}", "-c", "from pkg.store import Bag; assert Bag({'a': 1}).get('a') == 1"],
+                    "command": [
+                        "{python}",
+                        "-c",
+                        "from pkg.store import Bag; assert Bag({'a': 1}).get('a') == 1",
+                    ],
                     "script": None,
                     "timeout_seconds": 15.0,
                 },
@@ -419,7 +433,7 @@ class ReplayCorpusTests(unittest.TestCase):
             root = Path(tmp)
             fixture = _create_sample_checkout(root)
 
-            # Workspace placement from external file cleans up overlays even when hidden check fails
+            # Workspace placement from external file cleans up overlays even when check fails
             manifest_ws = replay_corpus.ReplayManifest.from_dict(
                 _make_manifest_dict(fixture, placement="workspace")
             )
@@ -437,7 +451,7 @@ class ReplayCorpusTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertFalse((ws_dir / "hidden_suite").exists())
 
-            # Git-sourced hidden file from fix_commit passes full fail-on-base / pass-on-fix validation
+            # Git-sourced hidden file from fix_commit passes fail-on-base / pass-on-fix checks
             manifest_git = replay_corpus.ReplayManifest.from_dict(
                 _make_manifest_dict(fixture, use_git_hidden=True)
             )
@@ -475,7 +489,10 @@ class ReplayCorpusTests(unittest.TestCase):
             )
             self.assertFalse(report2.ok)
             self.assertTrue(
-                any("collides with materialized workspace files" in e.message for e in report2.errors)
+                any(
+                    "collides with materialized workspace files" in e.message
+                    for e in report2.errors
+                )
             )
 
             # 3. SHA-256 mismatch on external hidden file is rejected
@@ -583,7 +600,7 @@ class ReplayCorpusTests(unittest.TestCase):
             )
             self.assertNotEqual(hidden_base_proc.returncode, 0)
 
-            # 2. Verify against the real sibling run.py when present in scripts/local_context_trial/
+            # 2. Verify against sibling run.py when present in scripts/local_context_trial/
             try:
                 import run as real_run  # type: ignore[import-not-found]
             except ImportError:

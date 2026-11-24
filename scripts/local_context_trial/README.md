@@ -43,3 +43,68 @@ python scripts/local_context_trial/run.py --map-tokens 1024 --specify-behavior
 фрагмент із позначкою джерела. Підказка з’являється лише за наявності фрагмента.
 На один запуск налаштування можна перевизначити через
 `--local-callers-hint="..."`, `--local-callers-hint=` або `--no-local-callers`.
+
+## Issue 5: Frozen Replay Corpus Comparison
+
+No replay corpus manifest or external task archive is bundled in this repository, and no replay results are fabricated here. A human operator supplies a local frozen JSON manifest pointing to local version-pinned git checkouts and external hidden verification files, then runs the factorial comparison through `scripts/local_context_trial/heldout.py`.
+
+### 1. Preregister and pin before running
+
+Record the following pins in your preregistration log and manifest before invoking any LLM:
+
+- **Model and revision**: exact `--model` identifier plus local model revision, quantization, and inference server build.
+- **Randomization seed**: fixed `--seed` value controlling paired job ordering (default `20261123`).
+- **Repo map token budget**: fixed `--map-tokens` across every arm and control cell (e.g., `1024`).
+- **Frozen manifest digest**: compute the canonical digest with `replay_corpus.py digest`, set `preregistration.frozen: true` and `preregistration.manifest_sha256` in the manifest, and verify fail-on-base / pass-on-fix integrity before running:
+
+~~~sh
+python scripts/local_context_trial/replay_corpus.py digest /path/to/manifest.json
+python scripts/local_context_trial/replay_corpus.py validate /path/to/manifest.json \
+  --require-frozen --run-checks
+~~~
+
+- **Backend tool version**: pin Cymbal to `v0.18.0` when comparing the `cymbal` backend against `ast` or `graft`, and keep the `.meta.json` sidecar written alongside `--out` for the Aider git commit and Python version.
+
+### 2. Verify fixtures offline (`--check-fixtures`)
+
+`--suite replay` enforces `require_frozen=True` and never executes external hidden commands during manifest loading. To verify that every materialized replay case passes smoke and fails hidden checks without calling an LLM:
+
+~~~sh
+python scripts/local_context_trial/heldout.py \
+  --suite replay \
+  --replay-manifest /path/to/manifest.json \
+  --check-fixtures
+~~~
+
+### 3. Run the comparison and summarize (`--summarize`)
+
+Run the paired comparison across arms and independent backend/read-range/facts controls, then summarize the recorded JSONL rows:
+
+~~~sh
+python scripts/local_context_trial/heldout.py \
+  --suite replay \
+  --replay-manifest /path/to/manifest.json \
+  --model <model-id> \
+  --seed 20261123 \
+  --map-tokens 1024 \
+  --rounds 3 \
+  --arms baseline,passive,contract,audit,contract+audit \
+  --local-callers-backend ast,cymbal \
+  --read-range-modes off,on \
+  --facts-modes off,on \
+  --out /path/to/replay_results.jsonl
+
+python scripts/local_context_trial/heldout.py \
+  --summarize \
+  --out /path/to/replay_results.jsonl
+~~~
+
+Key CLI flags:
+
+- `--suite replay --replay-manifest PATH`: load a local frozen replay manifest (`--replay-manifest` is rejected for non-replay suites).
+- `--arms`: comma-separated arms from `baseline`, `passive`, `contract`, `audit`, `contract+audit`.
+- `--local-callers-backend`: single backend or comma-separated list (e.g., `ast,cymbal`).
+- `--read-range-modes`: comma-separated factorial grid values from `default,off,on`.
+- `--facts-modes`: comma-separated factorial grid values from `default,off,on`.
+- `--check-fixtures`: offline smoke/hidden fixture self-check with no LLM calls.
+- `--summarize`: print grouped pass rates, paired sign tests, 95% CIs, and arm telemetry from `--out`.

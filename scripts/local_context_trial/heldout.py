@@ -774,7 +774,9 @@ def _select_comparison_pairs(
 
     if "baseline" not in present and by_base.get("baseline"):
         baseline_by_suffix = {
-            arm[len("baseline") :]: arm for arm in by_base["baseline"] if arm.startswith("baseline[")
+            arm[len("baseline") :]: arm
+            for arm in by_base["baseline"]
+            if arm.startswith("baseline[")
         }
         for arm in arms:
             base = label_to_base.get(arm, arm)
@@ -932,7 +934,9 @@ def build_summary(rows: list[dict]) -> dict:
         if outcomes["audit_passed"] is True:
             stat["audit_passed"] += 1
         stat["audit_ran"] += int(bool(r.get("audit_ran")) or outcomes["audit_outcome"] != "not_run")
-        stat["audit_failed"] += int(bool(r.get("audit_failed")) or outcomes["audit_outcome"] == "fail")
+        stat["audit_failed"] += int(
+            bool(r.get("audit_failed")) or outcomes["audit_outcome"] == "fail"
+        )
 
         stat["evidence"] += int(bool(r.get("evidence")))
         stat["contract_rejected"] += int(bool(r.get("contract_rejected")))
@@ -1352,7 +1356,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"optional comma-separated language filter from {', '.join(LANGUAGE_ORDER)}",
     )
-    parser.add_argument("--suite", choices=["synthetic", "requests"], default="synthetic")
+    parser.add_argument(
+        "--suite",
+        choices=["synthetic", "requests", "replay"],
+        default="synthetic",
+    )
+    parser.add_argument(
+        "--replay-manifest",
+        default=None,
+        metavar="PATH",
+        help="path to a frozen replay corpus manifest JSON (for --suite replay)",
+    )
     parser.add_argument(
         "--local-callers-backend",
         default=None,
@@ -1375,7 +1389,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         dest="local_callers_facts",
-        help="optional independent override for caller facts (--local-callers / --no-local-callers)",
+        help=(
+            "optional independent override for caller facts"
+            " (--local-callers / --no-local-callers)"
+        ),
     )
     parser.add_argument(
         "--facts-modes",
@@ -1385,9 +1402,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def resolve_suite_cases(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> list[run.CaseSpec]:
+    """Resolve trial cases for the selected suite without running hidden commands."""
+    if args.replay_manifest is not None and args.suite != "replay":
+        parser.error("--replay-manifest is only valid with --suite replay")
+
+    if args.suite == "requests":
+        if args.cases or args.languages:
+            parser.error("Use --suite requests without synthetic case or language filters")
+        import requests_cases
+
+        return requests_cases.cases()
+
+    if args.suite == "replay":
+        if args.cases or args.languages:
+            parser.error("Use --suite replay without synthetic case or language filters")
+        import replay_corpus
+
+        try:
+            return replay_corpus.cases(args.replay_manifest, require_frozen=True)
+        except (replay_corpus.FixtureValidationError, ValueError, FileNotFoundError) as exc:
+            parser.error(str(exc))
+
+    return select_cases(args.cases, args.languages, parser)
+
+
+def main(argv: list[str] | None = None):
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.replay_manifest is not None and args.suite != "replay":
+        parser.error("--replay-manifest is only valid with --suite replay")
 
     out = Path(args.out)
     if args.summarize:
@@ -1395,14 +1443,7 @@ def main():
         summarize(rows)
         return
 
-    if args.suite == "requests":
-        import requests_cases
-
-        selected_cases = requests_cases.cases()
-        if args.cases or args.languages:
-            parser.error("Use --suite requests without synthetic case or language filters")
-    else:
-        selected_cases = select_cases(args.cases, args.languages, parser)
+    selected_cases = resolve_suite_cases(args, parser)
     if args.check_fixtures:
         raise SystemExit(check_fixtures(selected_cases))
 

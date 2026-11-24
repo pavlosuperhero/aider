@@ -4,13 +4,21 @@
 
 | Task | Status | Observed result or remaining work | PR |
 | --- | --- | --- | --- |
-| 1 | In progress | Baseline reproduced. The 30-replay corpus and preregistration are outstanding. | — |
-| 2 | Planned | Evidence contract | — |
-| 3 | Planned | Cymbal integration | — |
-| 4 | Planned | Native and indexed range reads | — |
-| 5 | Planned | Fact persistence and invalidation | — |
-| 6 | Planned | Pre-commit integration | — |
-| 7 | Planned | Paired benchmark and shipping decision | — |
+| 1 | In progress | Baseline reproduced (`13/13` synthetic, `2/2` Requests). The 30-replay frozen corpus manifest and preregistration are outstanding. | — |
+| 2 | Verified locally | Scoped evidence API and tests verified (`test_local_callers.py`). | — |
+| 3 | In progress | Cymbal adapter unit/fake-runner tests pass (`test_cymbal_callers.py`). Pinned `v0.18.0` live CLI smoke test skipped (`cymbal` binary not installed locally). | — |
+| 4 | Verified locally | Bounded source reader, validated Cymbal `show`, and tests verified (`test_read_range.py`). | — |
+| 5 | Verified locally | Local SQLite/FTS5 (`.aider.facts.sqlite3`) and in-memory repositories, revalidation, `/fact`, and tests verified (`test_project_facts.py`). | — |
+| 6 | Verified locally | CLI flags, `/read-range`, `/fact`, automatic call-site ranges, strict verifier evidence, and integration tests verified (`test_local_context_integration.py`, `test_caller_audit.py`). | — |
+| 7 | In progress | Trial runner, reporting, replay loader, and `--suite replay --replay-manifest PATH` CLI verified (`test_local_context_trial.py`, `test_replay_corpus.py`). Frozen 30-task corpus, comparative model results, and shipping decision outstanding. | — |
+
+### Implementation verified on `feat/caller-context-cymbal-readrange-facts`
+
+- `.venv/bin/python -m pytest -q tests/basic/test_local_callers.py tests/basic/test_caller_audit.py tests/basic/test_cymbal_callers.py tests/basic/test_read_range.py tests/basic/test_project_facts.py tests/basic/test_local_context_integration.py tests/basic/test_local_context_trial.py scripts/local_context_trial/test_replay_corpus.py`: **153 passed, 1 skipped** (`test_pinned_v0_18_0_cymbal_smoke`, no `cymbal` binary installed).
+- `.venv/bin/python -m pytest -q tests/basic/test_oracle.py tests/basic/test_oracle_integration.py tests/basic/test_tdd.py tests/basic/test_tdd_integration.py tests/basic/test_commands.py tests/basic/test_main.py`: **361 passed** (`test_cmd_read_only_with_tilde_path` verified with a temporary `HOME`).
+- `.venv/bin/python scripts/local_context_trial/heldout.py --check-fixtures` (**13/13**) and `--suite requests --check-fixtures` (**2/2**) passed.
+- `.venv/bin/flake8` passed cleanly across the new/modified issue #5 `aider/`, `scripts/local_context_trial/` (`heldout.py`, `replay_corpus.py`, `test_replay_corpus.py`), and `tests/basic/` files.
+- Still outstanding before shipping: live validation against pinned `cymbal` `v0.18.0`, creating/freezing the 30-task unseen replay corpus manifest, and running the comparative local quantized Qwen trial.
 
 ### Baseline verified on d2f5965
 
