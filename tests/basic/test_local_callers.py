@@ -1,8 +1,17 @@
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from aider.local_callers import (
     DEFAULT_CALLER_HINT,
+    CallerEvidence,
+    CallerEvidenceReport,
+    CallerEvidenceResult,
     CallerExcerpt,
+    CallerScope,
+    CompositeCallerFinder,
+    PythonAstCallerFinder,
+    discover_related_callers,
     find_related_callers,
     format_caller_context,
     read_source,
@@ -312,3 +321,413 @@ def test_non_js_tree_sitter_caller_is_not_flagged_with_js_import_ambiguity(tmp_p
     assert len(dup_excerpts) == 1
     assert dup_excerpts[0].incomplete
     assert "ambiguous symbol binding" in dup_excerpts[0].limitations
+
+
+def test_discover_related_callers_returns_immutable_typed_result_and_all_fields(tmp_path):
+    (tmp_path / "api.py").write_text("def parse(value):\n    return value\n")
+    (tmp_path / "consumer.py").write_text(
+        "from api import parse\n"
+        "\n"
+        "# line 3\n"
+        "# line 4\n"
+        "# line 5\n"
+        "result = parse('ok')\n"
+    )
+    (tmp_path / "unused.py").write_text("print('no match')\n")
+
+    no_ev_report = CallerEvidenceReport()
+    no_ev = discover_related_callers(
+        tmp_path, "fix parse", ["api.py"], ["unused.py"], report=no_ev_report
+    )
+    assert isinstance(no_ev, CallerEvidenceResult)
+    assert no_ev.status == "NO_EVIDENCE"
+    assert no_ev.evidence == ()
+    assert no_ev.excerpts == ()
+    assert no_ev.definitions == (("api.py", "parse"),)
+    assert isinstance(no_ev.scope, CallerScope)
+    assert no_ev.scope.pool == "production"
+    assert no_ev.ambiguity == ()
+    assert no_ev.truncation == ()
+    assert no_ev_report.result == no_ev
+    assert "NO_EVIDENCE" in no_ev_report.describe()
+
+    report = CallerEvidenceReport()
+    complete = discover_related_callers(
+        tmp_path, "fix parse", ["api.py"], ["consumer.py", "unused.py"], report=report
+    )
+    assert complete.status == "COMPLETE_WITHIN_SCOPE"
+    assert complete.has_evidence is True
+    assert complete.incomplete is False
+    assert complete.ambiguity == ()
+    assert complete.truncation == ()
+    assert complete.limitations == ()
+    assert complete.sources == ("python_ast",)
+    assert len(complete.evidence) == 1
+
+    item = complete.evidence[0]
+    assert isinstance(item, CallerEvidence)
+    assert item.path == "consumer.py"
+    assert item.line == 6
+    assert item.start_line == 4
+    assert item.symbol == "parse"
+    assert item.kind == "direct_call"
+    assert item.source == "python_ast"
+    assert item.scope == "production"
+    assert item.ambiguity == ()
+    assert item.truncation == ()
+    assert report.result == complete
+    assert "COMPLETE_WITHIN_SCOPE" in report.describe()
+    assert "SELECTED" in report.describe(complete.excerpts)
+    assert "consumer.py:4" in format_caller_context(complete, mode="passive")
+
+    # Public result and nested DTOs are strictly immutable.
+    with pytest.raises(FrozenInstanceError):
+        complete.status = "NO_EVIDENCE"
+    with pytest.raises(FrozenInstanceError):
+        complete.scope.pool = "tests"
+    with pytest.raises(FrozenInstanceError):
+        item.line = 1
+    with pytest.raises(FrozenInstanceError):
+        complete.excerpts[0].symbol = "other"
+
+    with pytest.raises(ValueError, match="Unknown caller evidence status"):
+        CallerEvidenceResult(status="INVALID")  # type: ignore[arg-type]
+
+
+def test_duplicate_python_definitions_across_and_within_files_report_ambiguity(tmp_path):
+    (tmp_path / "a.py").write_text("def parse(v):\n    return v\n")
+    (tmp_path / "b.py").write_text("def parse(v):\n    return v\n")
+    (tmp_path / "consumer.py").write_text("from a import parse\nval = parse(1)\n")
+
+    cross_file = discover_related_callers(
+        tmp_path, "fix parse", ["a.py", "b.py"], ["consumer.py"]
+    )
+    assert cross_file.status == "INCOMPLETE"
+    assert cross_file.definitions == (("a.py", "parse"), ("b.py", "parse"))
+    assert "duplicate symbol definition" in cross_file.ambiguity
+    assert "duplicate symbol definition" in cross_file.evidence[0].ambiguity
+    assert cross_file.excerpts[0].incomplete is True
+
+    (tmp_path / "dup_methods.py").write_text(
+        "class First:\n"
+        "    def copy(self): return 1\n"
+        "class Second:\n"
+        "    def copy(self): return 2\n"
+    )
+    (tmp_path / "method_use.py").write_text(
+        "from dup_methods import First\nout = First().copy()\n"
+    )
+    within_file = discover_related_callers(
+        tmp_path, "fix copy", ["dup_methods.py"], ["method_use.py"]
+    )
+    assert within_file.status == "INCOMPLETE"
+    assert "ambiguous method receiver" in within_file.ambiguity
+    assert "duplicate symbol definition" in within_file.ambiguity
+    assert within_file.evidence[0].kind == "method_call"
+
+
+def test_duplicate_non_python_definitions_and_duplicate_candidates(tmp_path):
+    (tmp_path / "api.go").write_text('package p\nfunc FormatPrice(c int) string { return "" }\n')
+    (tmp_path / "api2.go").write_text('package p\nfunc FormatPrice(c int) string { return "" }\n')
+    (tmp_path / "consumer.go").write_text("package p\nfunc Use() string { return FormatPrice(10) }\n")
+
+    dup_go = discover_related_callers(
+        tmp_path, "fix FormatPrice", ["api.go", "api2.go"], ["consumer.go", "./consumer.go"]
+    )
+    assert dup_go.status == "INCOMPLETE"
+    assert dup_go.scope.candidates_total == 1
+    assert len(dup_go.evidence) == 1
+    assert "ambiguous symbol binding" in dup_go.ambiguity
+    assert "duplicate symbol definition" in dup_go.ambiguity
+
+    (tmp_path / "api.py").write_text("def parse(x):\n    return x\n")
+    (tmp_path / "consumer.py").write_text("from api import parse\nout = parse(1)\n")
+    deduped = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["consumer.py", "./consumer.py", "consumer.py"],
+    )
+    assert deduped.status == "COMPLETE_WITHIN_SCOPE"
+    assert deduped.scope.candidates_total == 1
+    assert len(deduped.evidence) == 1
+
+
+def test_multiple_calls_in_same_file_report_truncation_when_outside_window(tmp_path):
+    (tmp_path / "api.py").write_text("def parse(x):\n    return x\n")
+    padding = "\n".join(f"# spacer {i}" for i in range(15))
+    (tmp_path / "consumer.py").write_text(
+        f"from api import parse\nfirst = parse(1)\n{padding}\nsecond = parse(2)\n"
+    )
+
+    result = discover_related_callers(tmp_path, "fix parse", ["api.py"], ["consumer.py"])
+    assert result.status == "INCOMPLETE"
+    assert result.evidence[0].line == 2
+    assert "additional calls in file omitted" in result.truncation
+    assert "additional calls in file omitted" in result.evidence[0].truncation
+    assert result.excerpts[0].incomplete is True
+
+
+def test_capped_production_callers_report_scope_and_truncation(tmp_path):
+    (tmp_path / "api.py").write_text("def parse(x):\n    return x\n")
+    prod_files = [f"prod_{i}.py" for i in range(5)]
+    for name in prod_files:
+        (tmp_path / name).write_text("from api import parse\nout = parse(1)\n")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_files = ["tests/test_a.py", "tests/test_b.py"]
+    for name in test_files:
+        (tmp_path / name).write_text("from api import parse\nassert parse(1) == 1\n")
+
+    result = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        [*prod_files, *test_files],
+        max_files=3,
+    )
+    assert result.status == "INCOMPLETE"
+    assert result.scope.pool == "production"
+    assert result.scope.candidates_total == 7
+    assert result.scope.production_candidates == 5
+    assert result.scope.test_candidates == 2
+    assert result.scope.omitted_test_candidates == 2
+    assert result.scope.selected_files == 3
+    assert result.scope.matched_files == 4
+    assert len(result.evidence) == 3
+    assert all(item.scope == "production" for item in result.evidence)
+    assert "additional files omitted" in result.truncation
+    assert any(e.incomplete for e in result.excerpts)
+
+
+def test_capped_test_callers_fallback_reports_scope_and_truncation(tmp_path):
+    (tmp_path / "api.py").write_text("def parse(x):\n    return x\n")
+    (tmp_path / "unrelated_prod.py").write_text("value = 123\n")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_files = [f"tests/test_case_{i}.py" for i in range(5)]
+    for name in test_files:
+        (tmp_path / name).write_text("from api import parse\nassert parse(1) == 1\n")
+
+    result = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["unrelated_prod.py", *test_files],
+        max_files=3,
+    )
+    assert result.status == "INCOMPLETE"
+    assert result.scope.pool == "tests"
+    assert result.scope.candidates_total == 6
+    assert result.scope.candidates_searched == 6
+    assert result.scope.production_candidates == 1
+    assert result.scope.test_candidates == 5
+    assert result.scope.omitted_test_candidates == 0
+    assert result.scope.selected_files == 3
+    assert result.scope.matched_files == 4
+    assert len(result.evidence) == 3
+    assert all(item.scope == "tests" for item in result.evidence)
+    assert "additional files omitted" in result.truncation
+    assert any(e.incomplete for e in result.excerpts)
+
+
+def test_uncapped_production_and_test_fallback_report_complete_within_scope(tmp_path):
+    (tmp_path / "api.py").write_text("def parse(x):\n    return x\n")
+    (tmp_path / "consumer.py").write_text("from api import parse\nout = parse(1)\n")
+    (tmp_path / "smoke.py").write_text("from api import parse\nassert parse(1) == 1\n")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_api.py").write_text("from api import parse\nassert parse(1) == 1\n")
+
+    prod_res = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["consumer.py", "smoke.py", "tests/test_api.py"],
+    )
+    assert prod_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert prod_res.scope.pool == "production"
+    assert prod_res.scope.omitted_test_candidates == 2
+    assert prod_res.ambiguity == ()
+    assert prod_res.truncation == ()
+    assert [e.path for e in prod_res.evidence] == ["consumer.py"]
+
+    test_res = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["smoke.py", "tests/test_api.py"],
+    )
+    assert test_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert test_res.scope.pool == "tests"
+    assert test_res.scope.omitted_test_candidates == 0
+    assert test_res.ambiguity == ()
+    assert test_res.truncation == ()
+    assert [e.path for e in test_res.evidence] == ["smoke.py", "tests/test_api.py"]
+
+
+def test_injectable_custom_finder_receives_report_and_propagates_limitations(tmp_path):
+    seen_reports = []
+
+    class FakeCymbalAdapter:
+        source = "cymbal"
+
+        def supports(self, path: str) -> bool:
+            return path.endswith(".py")
+
+        def find_callers(
+            self,
+            root,
+            message,
+            editable,
+            candidates,
+            *,
+            max_files=3,
+            max_chars=700,
+            context_lines=3,
+            report=None,
+        ):
+            seen_reports.append(report)
+            if report is not None:
+                report.record_definition("models.py", "copy")
+                report.record_ambiguity("stale index")
+                report.record_ambiguity("ambiguous alias")
+                report.record_truncation("cymbal refs capped")
+            return (
+                CallerExcerpt(
+                    path="models.py",
+                    start_line=456,
+                    line=458,
+                    symbol="copy",
+                    code="p.copy()",
+                    kind="reference",
+                    source="cymbal",
+                ),
+                CallerExcerpt(
+                    path="models.py",
+                    start_line=456,
+                    line=459,
+                    symbol="copy",
+                    code="p.copy()",
+                    kind="reference",
+                    source="cymbal",
+                ),
+            )
+
+    report = CallerEvidenceReport()
+    adapter = FakeCymbalAdapter()
+    result = discover_related_callers(
+        tmp_path,
+        "fix copy",
+        ["structures.py"],
+        ["models.py"],
+        report=report,
+        finder=adapter,
+    )
+    assert seen_reports == [report]
+    assert result.status == "INCOMPLETE"
+    assert result.sources == ("cymbal",)
+    assert result.definitions == (("models.py", "copy"),)
+    assert [(item.path, item.line, item.kind, item.source) for item in result.evidence] == [
+        ("models.py", 458, "reference", "cymbal"),
+        ("models.py", 459, "reference", "cymbal"),
+    ]
+    assert result.scope.matched_files == 1
+    assert result.scope.selected_files == 1
+    assert "stale index" in result.ambiguity
+    assert "ambiguous alias" in result.ambiguity
+    assert "cymbal refs capped" in result.truncation
+    assert all(e.incomplete for e in result.excerpts)
+    assert "stale index" in report.describe()
+
+    # find_related_callers also supports injectable finder.
+    excerpts = find_related_callers(
+        tmp_path, "fix copy", ["structures.py"], ["models.py"], finder=adapter
+    )
+    assert len(excerpts) == 2
+    assert excerpts[0].line == 458
+    assert excerpts[1].line == 459
+
+
+def test_composite_merges_duplicate_matches_and_supports_legacy_and_empty_adapters(tmp_path):
+    (tmp_path / "api.py").write_text("def parse(x):\n    return x\n")
+    (tmp_path / "consumer.py").write_text("from api import parse\nout = parse(1)\n")
+
+    class LegacyNoReportFinder:
+        source = "legacy_adapter"
+
+        def supports(self, path: str) -> bool:
+            return path.endswith(".py")
+
+        def find_callers(
+            self,
+            root,
+            message,
+            editable,
+            candidates,
+            *,
+            max_files=3,
+            max_chars=700,
+            context_lines=3,
+        ):
+            return (
+                CallerExcerpt(
+                    path="consumer.py",
+                    start_line=1,
+                    line=2,
+                    symbol="parse",
+                    code="from api import parse\nout = parse(1)",
+                    limitations=("stale index", "excerpt truncated"),
+                ),
+            )
+
+    composite = CompositeCallerFinder((LegacyNoReportFinder(), PythonAstCallerFinder()))
+    merged = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["consumer.py"],
+        finder=composite,
+    )
+    assert merged.status == "INCOMPLETE"
+    assert len(merged.evidence) == 1
+    assert merged.evidence[0].line == 2
+    assert "stale index" in merged.ambiguity
+    assert "excerpt truncated" in merged.truncation
+    assert set(merged.sources) == {"legacy_adapter", "python_ast"}
+    assert merged.excerpts[0].incomplete is True
+
+    class EmptyWithWarningAdapter:
+        source = "cymbal_probe"
+
+        def supports(self, path: str) -> bool:
+            return path.endswith(".py")
+
+        def find_callers(
+            self,
+            root,
+            message,
+            editable,
+            candidates,
+            *,
+            max_files=3,
+            max_chars=700,
+            context_lines=3,
+            report=None,
+        ):
+            if report is not None:
+                report.record_ambiguity("stale index")
+            return ()
+
+    combined = CompositeCallerFinder((EmptyWithWarningAdapter(), PythonAstCallerFinder()))
+    propagated = discover_related_callers(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["consumer.py"],
+        finder=combined,
+    )
+    assert propagated.status == "INCOMPLETE"
+    assert "stale index" in propagated.ambiguity
+    assert propagated.excerpts[-1].incomplete is True
+    assert "stale index" in propagated.excerpts[-1].ambiguity
