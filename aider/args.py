@@ -164,6 +164,47 @@ def get_parser(default_config_files, git_root):
         help="Strict blocks unverified edits from auto-commit. Advisory permits them with a diagnostic.",
     )
 
+    group.add_argument(
+        "--local-callers-backend",
+        choices=("auto", "builtin", "cymbal"),
+        default="builtin",
+        help=(
+            "Backend for local caller discovery: 'builtin' (AST/tree-sitter), "
+            "'cymbal' (external Cymbal index), or 'auto' (Cymbal with builtin fallback) "
+            "(default: builtin)"
+        ),
+    )
+
+    group.add_argument(
+        "--local-callers-read-range",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable bounded read-only line-range inspection and evidence attachment "
+            "for local callers (default: False)"
+        ),
+    )
+
+    group.add_argument(
+        "--facts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable project facts context injection and the /fact command "
+            "(default: False)"
+        ),
+    )
+
+    group.add_argument(
+        "--facts-db",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to the SQLite database file for project facts "
+            "(default: .aider.facts.sqlite3 in the project root when --facts is enabled)"
+        ),
+    ).complete = shtab.FILE
+
     group = parser.add_argument_group("TDD workflow (opt-in)")
     group.add_argument(
         "--tdd",

@@ -459,7 +459,30 @@ class CallerEvidenceReport:
         """Freeze collected report state and excerpts into an immutable typed result."""
         excerpt_tuple = tuple(excerpts)
         default_scope = self.scope.pool if self.scope.pool != "none" else ""
-        evidence_tuple = tuple(e.to_evidence(scope=default_scope) for e in excerpt_tuple)
+        evidence_items: list[CallerEvidence] = []
+        for e in excerpt_tuple:
+            if isinstance(e, CallerExcerpt):
+                evidence_items.append(e.to_evidence(scope=default_scope))
+            else:
+                lims = tuple(getattr(e, "limitations", ()))
+                if not lims and getattr(e, "incomplete", False):
+                    lims = ("incomplete",)
+                evidence_items.append(
+                    CallerEvidence(
+                        path=getattr(e, "path", ""),
+                        line=getattr(e, "line", 0) or getattr(e, "start_line", 1),
+                        symbol=getattr(e, "symbol", ""),
+                        kind=getattr(e, "kind", "call"),
+                        source=getattr(e, "source", "builtin"),
+                        scope=getattr(e, "scope", "") or default_scope,
+                        ambiguity=tuple(getattr(e, "ambiguity", ())),
+                        truncation=tuple(getattr(e, "truncation", ())),
+                        limitations=lims,
+                        start_line=getattr(e, "start_line", 0),
+                        code=getattr(e, "code", ""),
+                    )
+                )
+        evidence_tuple = tuple(evidence_items)
 
         ambiguity = _dedupe_str(
             (*self.ambiguity, *(reason for e in evidence_tuple for reason in e.ambiguity))
@@ -478,7 +501,11 @@ class CallerEvidenceReport:
         sources = _dedupe_str(
             (*self.sources, *(e.source for e in evidence_tuple if e.source), *self.scope.sources)
         )
-        scope = replace(self.scope, sources=sources) if sources != self.scope.sources else self.scope
+        scope = (
+            replace(self.scope, sources=sources)
+            if sources != self.scope.sources
+            else self.scope
+        )
 
         if not evidence_tuple:
             status: EvidenceStatus = "NO_EVIDENCE"

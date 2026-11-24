@@ -304,7 +304,9 @@ def test_non_js_tree_sitter_caller_is_not_flagged_with_js_import_ambiguity(tmp_p
     from aider.local_callers import CallerEvidenceReport
 
     (tmp_path / "api.go").write_text("package p\nfunc FormatPrice(c int) string { return \"\" }\n")
-    (tmp_path / "consumer.go").write_text("package p\nfunc Use() string { return FormatPrice(10) }\n")
+    (tmp_path / "consumer.go").write_text(
+        "package p\nfunc Use() string { return FormatPrice(10) }\n"
+    )
     report = CallerEvidenceReport()
     excerpts = find_related_callers(
         tmp_path, "fix FormatPrice", ["api.go"], ["consumer.go"], report=report
@@ -429,7 +431,9 @@ def test_duplicate_python_definitions_across_and_within_files_report_ambiguity(t
 def test_duplicate_non_python_definitions_and_duplicate_candidates(tmp_path):
     (tmp_path / "api.go").write_text('package p\nfunc FormatPrice(c int) string { return "" }\n')
     (tmp_path / "api2.go").write_text('package p\nfunc FormatPrice(c int) string { return "" }\n')
-    (tmp_path / "consumer.go").write_text("package p\nfunc Use() string { return FormatPrice(10) }\n")
+    (tmp_path / "consumer.go").write_text(
+        "package p\nfunc Use() string { return FormatPrice(10) }\n"
+    )
 
     dup_go = discover_related_callers(
         tmp_path, "fix FormatPrice", ["api.go", "api2.go"], ["consumer.go", "./consumer.go"]

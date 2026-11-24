@@ -448,6 +448,221 @@ def sanity_check_repo(repo, io):
     return False
 
 
+_VALID_LOCAL_CALLERS_BACKENDS = ("auto", "builtin", "cymbal")
+DEFAULT_FACTS_FILENAME = ".aider.facts.sqlite3"
+
+
+def create_local_caller_finder(backend="builtin", *, cymbal_config=None, runner=None):
+    """Compose the configured local caller finder via aider.cymbal_callers.build_caller_finder."""
+    if backend not in _VALID_LOCAL_CALLERS_BACKENDS:
+        raise ValueError(
+            f"Invalid local_callers_backend {backend!r};"
+            " expected 'auto', 'builtin', or 'cymbal'."
+        )
+    from aider.cymbal_callers import build_caller_finder
+
+    return build_caller_finder(
+        backend=backend,
+        cymbal_config=cymbal_config,
+        runner=runner,
+    )
+
+
+class LocalReadRangeReader:
+    """Bounded read-only range reader backed by aider.read_range and validated Cymbal show."""
+
+    def __init__(self, root=None, *, backend="builtin", cymbal_client=None):
+        self.root = (
+            Path(root).expanduser().resolve() if root is not None else Path.cwd().resolve()
+        )
+        self.backend = backend
+        self.cymbal_client = cymbal_client
+
+    def read_range(
+        self,
+        rel_path,
+        start_line,
+        end_line,
+        *,
+        max_lines=120,
+        max_bytes=16384,
+        symbol="",
+    ):
+        from aider.read_range import read_range
+
+        return read_range(
+            self.root,
+            rel_path,
+            start_line,
+            end_line,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            symbol=symbol,
+        )
+
+    def read_call_site(
+        self,
+        rel_path,
+        line,
+        *,
+        context_lines=15,
+        max_lines=40,
+        max_bytes=4096,
+        symbol="",
+        use_cymbal=False,
+    ):
+        from dataclasses import replace
+
+        from aider.read_range import read_range, validate_cymbal_show
+
+        if use_cymbal and self.cymbal_client is not None:
+            from aider.cymbal_callers import CymbalError
+
+            try:
+                show_res = self.cymbal_client.show(
+                    self.root,
+                    f"{rel_path}:{line}",
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                    verify_disk=False,
+                )
+            except CymbalError:
+                if self.backend == "cymbal":
+                    raise
+                show_res = None
+
+            if show_res is not None and show_res.slices:
+                chosen = next(
+                    (sl for sl in show_res.slices if sl.path == rel_path),
+                    show_res.slices[0],
+                )
+                payload = {
+                    "path": chosen.path,
+                    "start_line": chosen.start_line,
+                    "end_line": chosen.end_line,
+                    "symbol": chosen.symbol or symbol,
+                    "body": chosen.code,
+                    "truncated": chosen.truncated or show_res.truncated,
+                }
+                excerpt = validate_cymbal_show(
+                    self.root,
+                    payload,
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                )
+                extra_lims = []
+                if show_res.stale or chosen.stale:
+                    extra_lims.append("cymbal_stale")
+                if show_res.ambiguous or chosen.ambiguity:
+                    extra_lims.extend(chosen.ambiguity or ("ambiguous",))
+                if extra_lims:
+                    merged = tuple(dict.fromkeys((*excerpt.limitations, *extra_lims)))
+                    excerpt = replace(
+                        excerpt,
+                        stale=excerpt.stale or show_res.stale or chosen.stale,
+                        limitations=merged,
+                    )
+                return excerpt
+
+        start_line = max(1, int(line) - max(0, int(context_lines)))
+        end_line = int(line) + max(0, int(context_lines))
+        return read_range(
+            self.root,
+            rel_path,
+            start_line,
+            end_line,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            symbol=symbol,
+        )
+
+
+def create_read_range_reader(root=None, *, backend="builtin", cymbal_client=None):
+    """Construct the bounded read-only file range reader."""
+    import aider.read_range  # noqa: F401
+
+    return LocalReadRangeReader(
+        root=root,
+        backend=backend,
+        cymbal_client=cymbal_client,
+    )
+
+
+def resolve_facts_db_path(facts_db=None, *, root=None):
+    """Compute the default project facts SQLite path without performing I/O."""
+    root_path = Path(root).expanduser().resolve() if root else Path.cwd().resolve()
+    if facts_db is None or (isinstance(facts_db, str) and not facts_db.strip()):
+        return str(root_path / DEFAULT_FACTS_FILENAME)
+    candidate = Path(facts_db).expanduser()
+    if not candidate.is_absolute():
+        candidate = root_path / candidate
+    return str(candidate.resolve())
+
+
+def create_project_facts_store(
+    db_path=None, *, root=None, enabled=True, read_only=False, io=None
+):
+    """Open the worktree-scoped ProjectFactStore via aider.project_facts."""
+    from aider.project_facts import open_project_fact_store
+
+    root_path = Path(root).expanduser().resolve() if root is not None else Path.cwd().resolve()
+    store = open_project_fact_store(
+        root_path,
+        enabled=enabled,
+        facts_db=db_path,
+        read_only=read_only,
+    )
+    if enabled and not store.active and store.diagnostic and io is not None:
+        io.tool_warning(store.diagnostic)
+    return store
+
+
+def compose_local_context_kwargs(args, *, root=None, io=None):
+    """Compose optional local context adapters without I/O when features are disabled."""
+    backend = getattr(args, "local_callers_backend", "builtin")
+    if backend not in _VALID_LOCAL_CALLERS_BACKENDS:
+        raise ValueError(
+            f"Invalid local_callers_backend {backend!r};"
+            " expected 'auto', 'builtin', or 'cymbal'."
+        )
+    local_callers_enabled = bool(getattr(args, "local_callers", False))
+    read_range_enabled = bool(getattr(args, "local_callers_read_range", False))
+    facts_enabled = bool(getattr(args, "facts", False))
+    facts_db = getattr(args, "facts_db", None)
+
+    kwargs = {
+        "local_callers_backend": backend,
+        "local_callers_read_range": read_range_enabled,
+        "facts": facts_enabled,
+        "facts_db": facts_db,
+    }
+
+    cymbal_client = None
+    if local_callers_enabled and backend != "builtin":
+        finder = create_local_caller_finder(backend)
+        kwargs["local_caller_finder"] = finder
+        cymbal_finder = getattr(finder, "cymbal_finder", None)
+        cymbal_client = getattr(cymbal_finder, "client", None)
+
+    if read_range_enabled:
+        kwargs["read_range_reader"] = create_read_range_reader(
+            root,
+            backend=backend,
+            cymbal_client=cymbal_client,
+        )
+
+    if facts_enabled:
+        store = create_project_facts_store(facts_db, root=root, enabled=True, io=io)
+        kwargs["facts_db"] = (
+            str(store.db_path)
+            if store.db_path is not None
+            else resolve_facts_db_path(facts_db, root=root)
+        )
+        kwargs["facts_store"] = store
+
+    return kwargs
+
+
 def main(argv=None, input=None, output=None, force_git_root=None, return_coder=False):
     report_uncaught_exceptions()
 
@@ -999,6 +1214,12 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             if hasattr(provider, "post_search_guidance"):
                 provider.post_search_guidance = tdd_controller.phase_guidance
             tdd_kwargs = tdd_controller.hook_kwargs()
+        context_root = (
+            repo.root
+            if repo
+            else (git_root if args.git and git_root else utils.find_common_root(fnames))
+        )
+        local_context_kwargs = compose_local_context_kwargs(args, root=context_root, io=io)
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
@@ -1038,6 +1259,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             auto_copy_context=args.copy_paste,
             auto_accept_architect=args.auto_accept_architect,
             add_gitignore_files=args.add_gitignore_files,
+            **local_context_kwargs,
             **oracle_kwargs,
             **tdd_kwargs,
         )

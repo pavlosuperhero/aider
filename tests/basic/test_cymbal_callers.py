@@ -92,7 +92,11 @@ class FakeCymbalRunner:
 
         target = argv_tuple[-1]
         if subcmd == "refs":
-            payload = self.refs(target) if callable(self.refs) else self.refs.get(target, {"references": []})
+            payload = (
+                self.refs(target)
+                if callable(self.refs)
+                else self.refs.get(target, {"references": []})
+            )
             return self._wrap_payload(argv_tuple, payload)
         if subcmd == "impact":
             payload = (
@@ -253,7 +257,9 @@ def test_flag_injection_and_malformed_json_errors(tmp_path):
 
 
 def test_show_validation_disk_freshness_utf8_truncation_and_duplicate_ambiguity(tmp_path):
-    (tmp_path / "a.py").write_text("line1 = 'héllo 🚀'\nline2 = 'world'\nline3 = 'end'\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text(
+        "line1 = 'héllo 🚀'\nline2 = 'world'\nline3 = 'end'\n", encoding="utf-8"
+    )
     (tmp_path / "b.py").write_text("def dup():\n    return 2\n", encoding="utf-8")
 
     # 1. Disk content differs from stale Cymbal show output -> stale flagged, disk text returned.
@@ -302,7 +308,12 @@ def test_show_validation_disk_freshness_utf8_truncation_and_duplicate_ambiguity(
             "dup": {
                 "matches": [
                     {"file": "a.py", "start_line": 1, "end_line": 1, "code": "line1 = 'héllo 🚀'"},
-                    {"file": "b.py", "start_line": 1, "end_line": 2, "code": "def dup():\n    return 2"},
+                    {
+                        "file": "b.py",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "code": "def dup():\n    return 2",
+                    },
                 ]
             }
         }
@@ -400,7 +411,10 @@ def test_robust_path_normalization_and_large_file_bounded_window(tmp_path):
     assert normalize_repo_path(project, "./pkg/consumer.py") == "pkg/consumer.py"
     assert normalize_repo_path(project, r"pkg\consumer.py") == "pkg/consumer.py"
     assert normalize_repo_path(project, str(project / "pkg" / "consumer.py")) == "pkg/consumer.py"
-    assert normalize_repo_path(project, str(project.resolve() / "pkg" / "consumer.py")) == "pkg/consumer.py"
+    assert (
+        normalize_repo_path(project, str(project.resolve() / "pkg" / "consumer.py"))
+        == "pkg/consumer.py"
+    )
 
     # Unsafe paths rejected.
     assert normalize_repo_path(project, "../outside.py") is None
@@ -511,8 +525,11 @@ def test_conservative_stale_alias_and_duplicate_ambiguity(tmp_path):
     assert "stale index" in eof_result.ambiguity
     assert any("out-of-range" in d for d in eof_result.diagnostics)
 
-    # 3. Editable re-export alias symbol (like `from .compat import JSONDecodeError`) is flagged as alias.
-    (tmp_path / "compat.py").write_text("class JSONDecodeError(ValueError): pass\n", encoding="utf-8")
+    # 3. Editable re-export alias symbol (like `from .compat import JSONDecodeError`)
+    # is flagged as alias.
+    (tmp_path / "compat.py").write_text(
+        "class JSONDecodeError(ValueError): pass\n", encoding="utf-8"
+    )
     (tmp_path / "handler.py").write_text(
         "from api import JSONDecodeError\ntry:\n    pass\nexcept JSONDecodeError:\n    pass\n",
         encoding="utf-8",
@@ -522,7 +539,12 @@ def test_conservative_stale_alias_and_duplicate_ambiguity(tmp_path):
             "JSONDecodeError": {
                 "definitions": [{"file": "api.py", "line": 1, "name": "JSONDecodeError"}],
                 "references": [
-                    {"file": "handler.py", "line": 4, "kind": "reference", "snippet": "except JSONDecodeError:"}
+                    {
+                        "file": "handler.py",
+                        "line": 4,
+                        "kind": "reference",
+                        "snippet": "except JSONDecodeError:",
+                    }
                 ],
             }
         },
@@ -564,13 +586,20 @@ def test_production_first_caps_and_call_over_import_priority(tmp_path):
             {"file": "prod1.py", "line": 4, "kind": "call", "snippet": "    return parse(1)"},
             {"file": "prod2.py", "line": 4, "kind": "call", "snippet": "    return parse(1)"},
             {"file": "prod3.py", "line": 4, "kind": "call", "snippet": "    return parse(1)"},
-            {"file": "tests/test_api.py", "line": 2, "kind": "call", "snippet": "assert parse(1) == 1"},
+            {
+                "file": "tests/test_api.py",
+                "line": 2,
+                "kind": "call",
+                "snippet": "assert parse(1) == 1",
+            },
             {"file": "smoke.py", "line": 2, "kind": "call", "snippet": "assert parse(1)"},
             # Unsafe path should be rejected safely with diagnostic.
             {"file": "../outside.py", "line": 1, "kind": "call"},
         ],
     }
-    runner = FakeCymbalRunner(refs={"parse": refs_payload}, impact={"parse": {"direct_callers": []}})
+    runner = FakeCymbalRunner(
+        refs={"parse": refs_payload}, impact={"parse": {"direct_callers": []}}
+    )
     candidates = ["smoke.py", "tests/test_api.py", "prod3.py", "prod1.py", "prod0.py", "prod2.py"]
 
     res = find_callers_with_backend(
@@ -654,7 +683,12 @@ def test_backend_modes_builtin_default_auto_fallback_and_explicit_cymbal_error(t
             "parse": {
                 "definitions": [{"file": "api.py", "line": 1, "name": "parse"}],
                 "references": [
-                    {"file": "consumer.py", "line": 4, "kind": "call", "snippet": "    return parse(raw) + 1"}
+                    {
+                        "file": "consumer.py",
+                        "line": 4,
+                        "kind": "call",
+                        "snippet": "    return parse(raw) + 1",
+                    }
                 ],
             }
         },
@@ -719,7 +753,12 @@ def test_report_propagation_and_immutability_across_builtin_and_cymbal_adapters(
             "convert": {
                 "definitions": [{"file": "api.py", "line": 2, "name": "convert"}],
                 "references": [
-                    {"file": "consumer.py", "line": 3, "kind": "call", "snippet": "    return svc.convert(42)"}
+                    {
+                        "file": "consumer.py",
+                        "line": 3,
+                        "kind": "call",
+                        "snippet": "    return svc.convert(42)",
+                    }
                 ],
                 "truncated": True,
             }
@@ -744,7 +783,8 @@ def test_report_propagation_and_immutability_across_builtin_and_cymbal_adapters(
     assert "no_federate" in res.scope
     assert "INCOMPLETE" in report.describe(excerpts)
 
-    # Protocol compatibility with existing local_callers.CompositeCallerFinder & CallerEvidenceReport.
+    # Protocol compatibility with existing local_callers.CompositeCallerFinder
+    # & CallerEvidenceReport.
     legacy_report = CallerEvidenceReport()
     direct_excerpts = cymbal_finder.find_callers(
         tmp_path,
@@ -775,7 +815,12 @@ def test_total_deadline_and_impact_transitive_handling(tmp_path):
     )
 
     runner = FakeCymbalRunner(
-        refs={"parse": {"definitions": [{"file": "api.py", "line": 1, "name": "parse"}], "references": []}},
+        refs={
+            "parse": {
+                "definitions": [{"file": "api.py", "line": 1, "name": "parse"}],
+                "references": [],
+            }
+        },
         impact={
             "parse": {
                 "direct_callers": [],

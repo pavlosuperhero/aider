@@ -421,7 +421,11 @@ class CymbalEvidenceReport(CallerEvidenceReport):
     items: list[CallerEvidenceItem] = field(default_factory=list)
 
     def add_scope(self, note: str) -> None:
-        if note and note not in self.scope:
+        if not note:
+            return
+        if not isinstance(self.scope, list):
+            self.scope = []
+        if note not in self.scope:
             self.scope.append(note)
 
     def add_ambiguity(self, note: str) -> None:
@@ -445,11 +449,16 @@ class CymbalEvidenceReport(CallerEvidenceReport):
         for note in item.truncation:
             self.add_truncation(note)
 
-    def to_result(self, excerpts: Sequence[CallerExcerpt]) -> CallerLookupResult:
+    def to_result(self, excerpts: Sequence[CallerExcerpt] = ()) -> CallerLookupResult:
         """Build an immutable `CallerLookupResult` from accumulated report evidence."""
         excerpt_tuple = tuple(excerpts)
         ambiguities = list(self.ambiguity)
         truncations = list(self.truncation)
+        for lim in self.limitations:
+            if classify_limitation(lim) == "truncation":
+                truncations.append(lim)
+            else:
+                ambiguities.append(lim)
         for excerpt in excerpt_tuple:
             for lim in excerpt.limitations:
                 if classify_limitation(lim) == "truncation":
@@ -459,7 +468,12 @@ class CymbalEvidenceReport(CallerEvidenceReport):
 
         unique_ambiguity = _unique_ordered(ambiguities)
         unique_truncation = _unique_ordered(truncations)
-        unique_scope = _unique_ordered(self.scope)
+        if isinstance(self.scope, list):
+            unique_scope = _unique_ordered(self.scope)
+        elif hasattr(self.scope, "describe"):
+            unique_scope = _unique_ordered((self.scope.describe(),))
+        else:
+            unique_scope = ()
         unique_diagnostics = _unique_ordered(self.diagnostics)
 
         if not excerpt_tuple:
@@ -483,9 +497,9 @@ class CymbalEvidenceReport(CallerEvidenceReport):
             diagnostics=unique_diagnostics,
         )
 
-    def describe(self, excerpts: Sequence[CallerExcerpt]) -> str:
+    def describe(self, excerpts: Sequence[CallerExcerpt] | None = None) -> str:
         """Render a human-readable summary compatible with `CallerEvidenceReport`."""
-        result = self.to_result(excerpts)
+        result = self.to_result(excerpts or ())
         definitions = list(result.definitions)
         targets = ", ".join(f"{path}:{symbol}" for path, symbol in definitions[:8]) or "none"
         if len(definitions) > 8:
@@ -515,7 +529,9 @@ def _report_add_definition(report: Any, path: str, symbol: str) -> None:
         defs.add((path, symbol))
 
 
-def _report_add_list_or_call(report: Any, method_name: str, attr_names: tuple[str, ...], value: str) -> None:
+def _report_add_list_or_call(
+    report: Any, method_name: str, attr_names: tuple[str, ...], value: str
+) -> None:
     if report is None or not value:
         return
     method = getattr(report, method_name, None)
@@ -1121,7 +1137,9 @@ class CymbalClient:
             key = (norm_path, line, sym)
             if key not in seen:
                 seen.add(key)
-                definitions.append(CymbalDefinition(path=norm_path, line=line, symbol=sym, kind=kind))
+                definitions.append(
+                    CymbalDefinition(path=norm_path, line=line, symbol=sym, kind=kind)
+                )
         return tuple(definitions)
 
     def _parse_references(
@@ -1147,7 +1165,10 @@ class CymbalClient:
                     diagnostics.append(f"rejected unsafe reference path: {raw_path}")
                 continue
             line = _coerce_positive_int(
-                entry.get("line") or entry.get("start_line") or entry.get("lineno") or entry.get("line_number"),
+                entry.get("line")
+                or entry.get("start_line")
+                or entry.get("lineno")
+                or entry.get("line_number"),
                 default=0,
             )
             if line < 1:
@@ -1293,7 +1314,15 @@ class CymbalClient:
             )
 
         raw_direct = None
-        for key in ("direct_callers", "direct", "callers", "impacted", "affected", "references", "results"):
+        for key in (
+            "direct_callers",
+            "direct",
+            "callers",
+            "impacted",
+            "affected",
+            "references",
+            "results",
+        ):
             if key in payload:
                 raw_direct = payload[key]
                 break
@@ -1373,14 +1402,18 @@ class CymbalClient:
             for key in ("changed", "changes", "symbols", "entries", "items", "results"):
                 if key in payload:
                     if not isinstance(payload[key], list):
-                        raise CymbalProtocolError(f"cymbal changed {key} field must be a JSON array")
+                        raise CymbalProtocolError(
+                            f"cymbal changed {key} field must be a JSON array"
+                        )
                     raw_entries = payload[key]
                     break
             raw_files = []
             for key in ("files", "changed_files"):
                 if key in payload:
                     if not isinstance(payload[key], list):
-                        raise CymbalProtocolError(f"cymbal changed {key} field must be a JSON array")
+                        raise CymbalProtocolError(
+                            f"cymbal changed {key} field must be a JSON array"
+                        )
                     raw_files = payload[key]
                     break
             stale = _extract_bool(payload, ("stale", "is_stale", "index_stale", "outdated"))
@@ -1417,7 +1450,9 @@ class CymbalClient:
                         default=0,
                     ),
                     kind=_extract_str(item, ("kind", "type"), default="changed").lower(),
-                    status=_extract_str(item, ("status", "change_type"), default="modified").lower(),
+                    status=_extract_str(
+                        item, ("status", "change_type"), default="modified"
+                    ).lower(),
                 )
             )
 
@@ -1484,7 +1519,10 @@ class CymbalClient:
                 if not isinstance(container, list):
                     raise CymbalProtocolError("cymbal show container field must be a JSON array")
                 raw_items = [item for item in container if isinstance(item, dict)]
-            elif any(k in payload for k in ("file", "path", "filename", "rel_path", "code", "content", "body")):
+            elif any(
+                k in payload
+                for k in ("file", "path", "filename", "rel_path", "code", "content", "body")
+            ):
                 raw_items = [payload]
 
         slices: list[CymbalShowSlice] = []
@@ -1655,7 +1693,9 @@ def _extract_python_targets(path: str, source: str, words: set[str]) -> list[_Ta
                     if isinstance(target, ast.Name):
                         _add(target.id, "alias", getattr(node, "lineno", 1))
         elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and isinstance(node.value, (ast.Name, ast.Attribute)):
+            if isinstance(node.target, ast.Name) and isinstance(
+                node.value, (ast.Name, ast.Attribute)
+            ):
                 _add(node.target.id, "alias", getattr(node, "lineno", 1))
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
@@ -1949,6 +1989,7 @@ class CymbalCallerFinder:
 
         excerpts: list[CallerExcerpt] = []
         evidence_items: list[CallerEvidenceItem] = []
+        skipped_stale_line = False
 
         for hit in selected_pool:
             window = read_bounded_window(
@@ -1968,6 +2009,7 @@ class CymbalCallerFinder:
             hit_scopes = [*hit.scope, pool_scope]
 
             if not line_exists:
+                skipped_stale_line = True
                 _report_add_ambiguity(report, "stale index")
                 _report_add_diagnostic(
                     report, f"cymbal reported out-of-range line {hit.path}:{hit.line}"
@@ -2017,6 +2059,9 @@ class CymbalCallerFinder:
                     symbol=hit.symbol,
                     code=snippet,
                     limitations=(*unique_amb, *unique_trunc),
+                    line=hit.line,
+                    kind=hit.kind,
+                    source=hit.source,
                 )
             )
             evidence_items.append(
@@ -2070,6 +2115,16 @@ class CymbalCallerFinder:
                 ),
             )
             _report_add_truncation(report, "unmatched target symbols")
+
+        if skipped_stale_line:
+            selected_excerpts[-1] = replace(
+                selected_excerpts[-1],
+                limitations=_unique_ordered((*selected_excerpts[-1].limitations, "stale index")),
+            )
+            selected_items[-1] = replace(
+                selected_items[-1],
+                ambiguity=_unique_ordered((*selected_items[-1].ambiguity, "stale index")),
+            )
 
         for item in selected_items:
             _report_add_item(report, item)
@@ -2257,18 +2312,44 @@ class ReportingCompositeCallerFinder:
                             ),
                         )
 
+                    represented_lims = {lim for e in selected for lim in e.limitations}
+                    extra_report_lims = _unique_ordered(
+                        lim
+                        for lim in (
+                            *getattr(report, "ambiguity", ()),
+                            *getattr(report, "truncation", ()),
+                            *getattr(report, "limitations", ()),
+                        )
+                        if lim not in represented_lims
+                    )
+                    if extra_report_lims:
+                        selected[-1] = replace(
+                            selected[-1],
+                            limitations=_unique_ordered(
+                                (*selected[-1].limitations, *extra_report_lims)
+                            ),
+                        )
+
                     if isinstance(raw_items, list) and raw_items:
+                        extra_ambs = tuple(
+                            lim
+                            for lim in selected[-1].limitations
+                            if classify_limitation(lim) == "ambiguity"
+                        )
                         extra_truncs = tuple(
                             lim
                             for lim in selected[-1].limitations
                             if classify_limitation(lim) == "truncation"
                         )
-                        if extra_truncs:
+                        if extra_ambs or extra_truncs:
                             last_path = selected[-1].path
                             for idx, item in enumerate(raw_items):
                                 if item.path == last_path:
                                     raw_items[idx] = replace(
                                         item,
+                                        ambiguity=_unique_ordered(
+                                            (*item.ambiguity, *extra_ambs)
+                                        ),
                                         truncation=_unique_ordered(
                                             (*item.truncation, *extra_truncs)
                                         ),

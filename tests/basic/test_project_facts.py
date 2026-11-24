@@ -374,7 +374,10 @@ def test_model_candidates_cannot_be_created_confirmed_and_require_explicit_confi
 
 
 def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path):
-    """Record a decision, drop it during ChatSummary compaction, restart, then edit/delete sources."""
+    (
+        "Record a decision, drop it during ChatSummary compaction, "
+        "restart, then edit/delete sources."
+    )
     src_edited = tmp_path / "ledger.py"
     src_deleted = tmp_path / "legacy_adapter.py"
     src_edited.write_text("def balance_cents(entries): return sum(entries)\n", encoding="utf-8")
@@ -411,10 +414,16 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
     ]
     for turn in range(12):
         history.append(
-            {"role": "user", "content": f"Turn {turn}: refactor unrelated UI widgets " + ("word " * 12)}
+            {
+                "role": "user",
+                "content": f"Turn {turn}: refactor unrelated UI widgets " + ("word " * 12),
+            }
         )
         history.append(
-            {"role": "assistant", "content": f"Turn {turn}: updated unrelated UI widgets " + ("done " * 12)}
+            {
+                "role": "assistant",
+                "content": f"Turn {turn}: updated unrelated UI widgets " + ("done " * 12),
+            }
         )
 
     summarizer = ChatSummary([_LossyFakeModel()], max_tokens=60)
@@ -437,7 +446,8 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
         assert survived.provenance.commit_sha == "d2f5965"
         assert survived.provenance.sources[0].symbol == "balance_cents"
 
-        # Editing the bound source file must mark the fact stale while keeping original hash/provenance.
+        # Editing the bound source file must mark the fact stale while keeping
+        # original hash/provenance.
         src_edited.write_text(
             "def balance_cents(entries): return sum(entries) / 100.0\n", encoding="utf-8"
         )
@@ -452,7 +462,8 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
         assert stale_edited.source_hashes == {"ledger.py": orig_edited_hash}
         assert stale_edited.provenance.recorded_at == fact_edited.provenance.recorded_at
 
-        # Deleting a bound source file must also mark its fact stale while keeping original hash/provenance.
+        # Deleting a bound source file must also mark its fact stale while keeping
+        # original hash/provenance.
         src_deleted.unlink()
         report = restarted.revalidate()
         assert report.stale == 2
@@ -598,4 +609,3 @@ def test_shared_custom_db_isolates_revalidation_between_worktrees(tmp_path):
         assert [f.fact_id for f in store_b.search("schema v1")] == [fact_b.fact_id]
         stale_a = store_a.get(fact_a.fact_id)
         assert stale_a is not None and stale_a.is_stale
-
