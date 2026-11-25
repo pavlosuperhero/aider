@@ -444,6 +444,173 @@ while inspecting a large caller file safely and tracking a contract invariant.
      automatically marks the earlier `api.py` fact `stale` via its SHA-256 hash
      so outdated invariants are never silently injected.
 
+## Refactoring a large monolith within tight context budgets
+
+Splitting a large repository—such as decomposing a monolithic TypeScript SDK
+into workspace packages (`packages/sdk-types`, `packages/sdk-core`,
+`packages/sdk-http`, and a thin root barrel `src/index.ts`)—fails quickly when
+you keep one long-running chat open until it hits a 200k-token ceiling. Context
+bloat degrades edit precision and wastes tokens re-sending obsolete diffs.
+
+**Core rule: spawn one fresh Aider session per atomic extraction slice.** Never
+run a single 200k-token mega-session across a monolith split. Instead,
+externalize durable state out of chat history:
+
+- **Cymbal** holds the persistent, incremental Tree-sitter + SQLite symbol
+  index across sessions.
+- **`--facts`** holds durable architectural boundaries and DTO contracts in
+  worktree-scoped storage (`.aider.facts.jsonl` or `--facts-db`).
+
+Because structural discovery and invariants live outside the transcript, each
+fresh slice session starts clean at roughly **8k–25k tokens** with zero
+accumulated chat bloat.
+
+### Step 0: Order extraction leaves-first (0 LLM tokens)
+
+Before launching Aider, index the repository and query incoming fan-in and
+transitive blast radius with Cymbal at zero token cost:
+
+```sh
+cymbal index
+cymbal refs --json --no-federate SdkRequest
+cymbal impact --json --no-federate executeRequest
+```
+
+Use those reference and impact counts to plan an **inside-out** extraction order
+that respects the **Dependency Rule**—source dependencies point strictly inward,
+and inner layers never name outer frameworks or transport adapters (*Clean
+Architecture*, Oracle passage `20ffa68ba6bf8b44a07e02cc`):
+
+```text
+types / DTOs (sdk-types) -> core / ports (sdk-core) -> adapters (sdk-http) -> thin backwards-compatible barrel (src/index.ts)
+```
+
+Start with zero-dependency leaf types and pure helpers, then move outward so
+every extracted slice compiles and passes tests immediately.
+
+### Step 1: Seed architectural invariants once into `--facts`
+
+Open a short bootstrap session (`aider --facts`, with no editable files
+attached) to record repository-wide boundary rules once, and bind
+contract-specific invariants to their defining files as you create them. Cross
+package boundaries with plain, isolated DTOs and interfaces rather than
+internal concrete classes (*Clean Architecture*, Oracle passage
+`62436485f5653f4d006da35c`):
+
+```text
+/fact -t boundary -t architecture "packages/sdk-types and packages/sdk-core must depend strictly inward; never import packages/sdk-http, fetch/axios transports, or the root barrel src/index.ts"
+/fact -f packages/sdk-types/src/request.ts -t dto --symbol SdkRequestDto "Cross package boundaries with plain serializable DTO interfaces (SdkRequestDto, SdkResponseDto) instead of concrete Client or Transport instances"
+```
+
+Keep file-bound (`-f PATH`) facts focused on specific file contracts. Whenever
+a referenced file is edited or deleted during refactoring, `revalidate()`
+detects the SHA-256 mismatch and automatically transitions that fact to `stale`,
+preventing outdated file-bound notes from silently overriding newly refactored
+code. Re-record updated contracts after a slice stabilizes.
+
+### Step 2: Run the two-step atomic slice workflow
+
+Split every extraction into two phases so the LLM only handles high-signal
+structural edits while mechanical rewrites stay cheap or free.
+
+#### Step A: Extract + 1-line re-export shim (2–3 files per session)
+
+Start a fresh Aider session with only the 2–3 files for the current slice (the
+new package file, the monolith file being slimmed, and the slice test), capping
+the repo map and wiring a fast slice-scoped `--test-cmd`:
+
+```sh
+aider \
+  --model lm_studio/qwen/qwen3.5-9b \
+  --local-callers \
+  --local-callers-backend cymbal \
+  --local-callers-read-range \
+  --facts \
+  --map-tokens 1024 \
+  --test-cmd "npx tsc --noEmit && npm test -- retry" \
+  packages/sdk-core/src/retry.ts \
+  src/client.ts \
+  packages/sdk-core/test/retry.test.ts
+```
+
+When you need to inspect a giant monolith file for context without paying to
+load the whole file into editable chat, use `/read-range` instead of `/add`:
+
+```text
+/read-range src/monolith.ts:240-315
+```
+
+Write slice prompts with **specific desired outputs** and **positive
+instructions** rather than vague requests padded with long lists of negative
+constraints—reserving explicit constraints for strict architectural boundaries
+(*Google Prompt Engineering*, pp. 56–57, Oracle passages
+`bac1d6367a4987d87c1f7f18` and `a85c0612f27a0d4af6804b6d`). Pair each edit turn
+with deterministic tool feedback (`/test` or `--auto-test`) in a ReAct-style
+loop so the model observes exact `tsc` and unit-test output instead of guessing
+(*Google Prompt Engineering*, p. 37, Oracle passage `a6d4e6e89737d00ed31c0eac`).
+
+**DO (specific, positive, bounded slice):**
+
+```text
+Move RetryPolicyDto and withRetry from src/client.ts into packages/sdk-core/src/retry.ts.
+In packages/sdk-core/src/retry.ts: export RetryPolicyDto as a plain interface and withRetry as a pure function with no HTTP transport imports.
+In src/client.ts: replace the local definitions with a 1-line re-export shim (`export { withRetry, type RetryPolicyDto } from "@acme/sdk-core/retry";`).
+Add unit tests for backoff capping and abort handling in packages/sdk-core/test/retry.test.ts.
+Constraint: packages/sdk-core must not import from src/ or packages/sdk-http.
+```
+
+**DON'T (vague goal + negative-constraint laundry list):**
+
+```text
+Refactor retry logic out of the monolith. Don't break existing callers, don't touch unrelated files, don't introduce circular deps, don't change public types, don't rewrite tests unnecessarily, and don't leak HTTP details.
+```
+
+Once `/test` passes (`npx tsc --noEmit && npm test -- retry`), commit the green
+slice, refresh Cymbal, and exit Aider so the next slice starts clean:
+
+```text
+/exit
+```
+
+```sh
+cymbal index
+```
+
+#### Step B: Migrate callers cheaply
+
+Because the 1-line re-export shim keeps the repository green after Step A,
+caller migration does not need to share context with the extraction:
+
+- **Unchanged signatures (0 LLM tokens):** Run a deterministic codemod
+  (`ts-morph` or `jscodeshift`) to rewrite import paths from the monolith
+  barrel to `@acme/sdk-core` across the codebase, then run `cymbal index`.
+- **Changed signatures or DTO shapes (small batches):** Run fresh Aider
+  sessions over **5–8 caller files per batch** (using `--test-cmd` for type and
+  test checks), committing green batches and re-running `cymbal index` between
+  them until the temporary re-export shim has zero internal callers.
+
+### Step 3: Parallelize independent libraries with Git worktrees
+
+Once leaf packages (`sdk-types`, `sdk-core`) stabilize on the integration
+branch, extract independent outer libraries (for example `sdk-http` and
+`sdk-auth`) concurrently in separate Git worktrees:
+
+```sh
+git worktree add ../sdk-http-wt -b feat/extract-sdk-http
+git worktree add ../sdk-auth-wt -b feat/extract-sdk-auth
+```
+
+Run `cymbal index` inside each new worktree before starting its slice sessions.
+Both local-context backends remain strictly isolated across sibling checkouts:
+
+- **Cymbal isolation:** Aider unconditionally passes `--no-federate` on every
+  Cymbal JSON query, preventing symbol definitions or caller references from
+  leaking across sibling worktrees.
+- **Facts isolation:** `--facts` tags every entry with a deterministic
+  `worktree_id` (`wt:<24-char sha256>` of the resolved worktree root), so
+  worktree-specific notes and SHA-256 staleness checks never collide between
+  parallel branches.
+
 ## Limitations of AST and name-based resolution
 
 Local caller discovery and ReadRange are designed to reduce blind edits and
