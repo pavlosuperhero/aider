@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).parent))
 import run  # noqa: E402
@@ -685,6 +686,10 @@ def _extract_row_outcomes(row: dict) -> dict:
 
     commit_passed = bool(row["commit_passed"]) if row.get("commit_passed") is not None else None
     commit_outcome = row.get("commit_outcome")
+    if row.get("commits_added") is not None:
+        commit_passed = row["commits_added"] > 0
+    elif commit_outcome is not None:
+        commit_passed = commit_outcome == "committed"
     hidden_passed = bool(row["hidden_passed"]) if row.get("hidden_passed") is not None else None
     hidden_outcome = row.get("hidden_outcome")
     smoke_passed = bool(row["smoke_passed"]) if row.get("smoke_passed") is not None else None
@@ -1793,22 +1798,90 @@ def main(argv: list[str] | None = None):
     print(workdir, flush=True)
     rows = []
     for r, case_spec, spec, arm, backend, read_range, facts in jobs:
-        result = run.run_spec(
-            output=workdir,
-            case_spec=case_spec,
-            arm=arm,
-            round_id=r,
-            map_tokens=args.map_tokens,
-            spec=spec,
-            model=args.model,
-            backend=backend,
-            read_range=read_range,
-            facts=facts,
-            facts_db=args.facts_db,
-            facts_file=args.facts_file,
-            local_callers=args.local_callers_override,
-            metadata=row_meta,
-        )
+        job_start = time.monotonic()
+        try:
+            result = run.run_spec(
+                output=workdir,
+                case_spec=case_spec,
+                arm=arm,
+                round_id=r,
+                map_tokens=args.map_tokens,
+                spec=spec,
+                model=args.model,
+                backend=backend,
+                read_range=read_range,
+                facts=facts,
+                facts_db=args.facts_db,
+                facts_file=args.facts_file,
+                local_callers=args.local_callers_override,
+                metadata=row_meta,
+            )
+        except Exception as exc:
+            local_callers_enabled = (
+                bool(args.local_callers_override)
+                if args.local_callers_override is not None
+                else normalize_arm(arm) != "baseline"
+            )
+            facts_backend = "sqlite" if facts and args.facts_db else ("jsonl" if facts else "off")
+            result = {
+                "schema_version": run.SCHEMA_VERSION,
+                "model": args.model,
+                "round": r,
+                "spec": spec,
+                "kind": case_spec.kind,
+                "language": case_spec.language,
+                "case": case_spec.name,
+                "arm": arm,
+                "local_callers_backend": backend,
+                "local_callers_read_range": read_range,
+                "local_callers_enabled": local_callers_enabled,
+                "local_callers_facts": local_callers_enabled,
+                "project_facts": facts,
+                "facts_backend": facts_backend,
+                "facts_db": args.facts_db,
+                "facts_file": args.facts_file,
+                "map_tokens": args.map_tokens,
+                "exit": -1,
+                "trial_error": f"{type(exc).__name__}: {exc}",
+                "oracle": False,
+                "evidence": False,
+                "read_range_attached": False,
+                "facts_attached": False,
+                "contract_rejected": False,
+                "audit_ran": False,
+                "audit_verdicts": [],
+                "audit_outcome": "not_run",
+                "audit_passed": None,
+                "audit_calls": 0,
+                "audit_failed": False,
+                "unknowns": 0,
+                "errors": 0,
+                "false_approval": False,
+                "commit_outcome": "error",
+                "commit_passed": False,
+                "only_target_modified": False,
+                "commits_added": 0,
+                "smoke_outcome": "error",
+                "smoke_passed": False,
+                "hidden_outcome": "error",
+                "hidden_passed": False,
+                "editor_calls": 0,
+                "extra_calls": 0,
+                "tokens": None,
+                "tokens_measured": False,
+                "editor_tokens": None,
+                "audit_tokens": None,
+                "first_editor_prompt_tokens": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "calls_by_role": {},
+                "tokens_by_role": {},
+                "passed": False,
+                "seconds": round(time.monotonic() - job_start, 1),
+                "patch": "",
+                "workdir": str(workdir),
+                "metadata": dict(row_meta),
+            }
         rows.append(result)
         print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)
         with out.open("a") as stream:

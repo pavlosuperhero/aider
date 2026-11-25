@@ -398,7 +398,7 @@ def classify_commit_outcome(
         return "error", False
     has_change = bool(gitdiff.strip()) or commits_added > 0
     if only_target_modified and has_change:
-        return ("committed" if commits_added > 0 else "applied"), True
+        return ("committed" if commits_added > 0 else "applied"), commits_added > 0
     if not changed_lines and not has_change:
         return "no_change", False
     return "out_of_scope", False
@@ -533,7 +533,7 @@ def _exclude_facts_artifacts(
     if facts_file:
         raw = facts_file.strip()
         if raw and not Path(raw).is_absolute() and not raw.startswith(".."):
-            patterns.append(raw)
+            patterns.extend([raw, f"{raw}.lock"])
     if facts_db:
         raw = facts_db.strip()
         if raw.lower().startswith("sqlite://"):
@@ -798,8 +798,7 @@ def run_spec(
     contract_rejected = "Local caller contract check:" in log_text
     verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
     usage_info = parse_trial_usage(log_text)
-    if code != 124 and usage_info["editor_calls"] == 0:
-        raise RuntimeError(f"No editor completion recorded. See {folder / 'aider.log'}")
+    missing_completion = code != 124 and usage_info["editor_calls"] == 0
 
     audit_outcome, audit_passed = classify_audit_outcome(verdicts)
     verification = run_verification_details(repo, case_spec)
@@ -827,9 +826,12 @@ def run_spec(
         only_target_modified = committed_files == set(targets)
     else:
         only_target_modified = set(changed_lines) == {f" M {target}" for target in targets}
-    commit_outcome, commit_passed = classify_commit_outcome(
+    commit_outcome, _ = classify_commit_outcome(
         code, changed_lines, gitdiff, only_target_modified, commits_added
     )
+
+    if missing_completion:
+        commit_outcome = "error"
 
     if metadata is not None:
         row_metadata = dict(metadata)
@@ -863,6 +865,7 @@ def run_spec(
         facts_file=facts_file,
         map_tokens=map_tokens,
         exit=code,
+        trial_error="No editor completion recorded" if missing_completion else None,
         oracle=oracle,
         evidence=evidence,
         read_range_attached=bool(re.search(r"^Read-range: attached ", log_text, re.M)),
@@ -878,7 +881,7 @@ def run_spec(
         errors=verdicts.count("ERROR"),
         false_approval=bool(audit_outcome == "pass" and not verified),
         commit_outcome=commit_outcome,
-        commit_passed=commit_passed,
+        commit_passed=commits_added > 0,
         only_target_modified=only_target_modified,
         commits_added=commits_added,
         smoke_outcome=verification["smoke_outcome"],
@@ -896,7 +899,7 @@ def run_spec(
         completion_tokens=usage_info["completion_tokens"],
         calls_by_role=usage_info["calls_by_role"],
         tokens_by_role=usage_info["tokens_by_role"],
-        passed=verified and only_target_modified,
+        passed=not missing_completion and verified and only_target_modified,
         seconds=round(time.monotonic() - start, 1),
         patch=gitdiff,
         workdir=str(output),

@@ -309,7 +309,8 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertEqual(ok_res["audit_outcome"], "pass")
         self.assertIs(ok_res["audit_passed"], True)
         self.assertEqual(ok_res["commit_outcome"], "applied")
-        self.assertIs(ok_res["commit_passed"], True)
+        self.assertIs(ok_res["commit_passed"], False)
+        self.assertEqual(ok_res["commits_added"], 0)
         self.assertEqual(ok_res["hidden_outcome"], "pass")
         self.assertIs(ok_res["hidden_passed"], True)
         self.assertIs(ok_res["smoke_passed"], True)
@@ -351,7 +352,7 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertEqual(bad_hidden["audit_outcome"], "pass")
         self.assertIs(bad_hidden["audit_passed"], True)
         self.assertEqual(bad_hidden["commit_outcome"], "applied")
-        self.assertIs(bad_hidden["commit_passed"], True)
+        self.assertIs(bad_hidden["commit_passed"], False)
         self.assertIs(bad_hidden["smoke_passed"], True)
         self.assertIs(bad_hidden["hidden_passed"], False)
         self.assertIs(bad_hidden["passed"], False)
@@ -398,6 +399,206 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(oos_res["commit_passed"], False)
         self.assertIs(oos_res["hidden_passed"], True)
         self.assertIs(oos_res["passed"], False)
+
+    def test_p2_4_applied_vs_committed_outcomes(self):
+        case_spec = heldout.CASE_BY_NAME["duration"]
+
+        # Direct unit check of classify_commit_outcome
+        self.assertEqual(
+            run.classify_commit_outcome(0, [" M api.py"], "diff", True, commits_added=0),
+            ("applied", False),
+        )
+        self.assertEqual(
+            run.classify_commit_outcome(0, [], "diff", True, commits_added=1),
+            ("committed", True),
+        )
+
+        # Applied edit with commits_added == 0 -> commit_outcome=="applied", commit_passed is False
+        def apply_only(repo: Path):
+            (repo / "api.py").write_text(
+                "def parse_duration(text):\n"
+                "    if text.endswith('m'):\n"
+                "        return int(text[:-1]) * 60\n"
+                "    return int(text)\n"
+            )
+
+        applied_res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="passive",
+            log_content="Trial usage: editor 500\n",
+            edit_fn=apply_only,
+        )
+        self.assertEqual(applied_res["commit_outcome"], "applied")
+        self.assertEqual(applied_res["commits_added"], 0)
+        self.assertIs(applied_res["commit_passed"], False)
+        self.assertIs(applied_res["passed"], True)
+
+        # Real git commit with commits_added == 1 -> commit_outcome=="committed", commit_passed True
+        def apply_and_commit(repo: Path):
+            apply_only(repo)
+            subprocess.run(["git", "add", "api.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Trial",
+                    "-c",
+                    "user.email=trial@localhost",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "fix duration",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+        committed_res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="passive",
+            log_content="Trial usage: editor 500\n",
+            edit_fn=apply_and_commit,
+        )
+        self.assertEqual(committed_res["commit_outcome"], "committed")
+        self.assertEqual(committed_res["commits_added"], 1)
+        self.assertIs(committed_res["commit_passed"], True)
+        self.assertIs(committed_res["only_target_modified"], True)
+        self.assertIs(committed_res["passed"], True)
+
+        # heldout._extract_row_outcomes derives commit_passed from commits_added / commit_outcome
+        self.assertIs(
+            heldout._extract_row_outcomes(
+                {"commit_outcome": "applied", "commit_passed": True, "commits_added": 0}
+            )["commit_passed"],
+            False,
+        )
+        self.assertIs(
+            heldout._extract_row_outcomes(
+                {"commit_outcome": "applied", "commit_passed": True}
+            )["commit_passed"],
+            False,
+        )
+        self.assertIs(
+            heldout._extract_row_outcomes(
+                {"commit_outcome": "committed", "commit_passed": False, "commits_added": 1}
+            )["commit_passed"],
+            True,
+        )
+        self.assertIs(
+            heldout._extract_row_outcomes({"commit_outcome": "committed"})["commit_passed"],
+            True,
+        )
+
+    def test_p2_5_missing_completion_recorded_as_error_without_raising(self):
+        case_spec = heldout.CASE_BY_NAME["duration"]
+        res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="passive",
+            log_content="APIError: provider disconnected before completion\n",
+            edit_fn=None,
+            exit_code=1,
+        )
+        self.assertEqual(res["exit"], 1)
+        self.assertEqual(res["editor_calls"], 0)
+        self.assertEqual(res["commit_outcome"], "error")
+        self.assertIs(res["commit_passed"], False)
+        self.assertEqual(res["trial_error"], "No editor completion recorded")
+        self.assertIs(res["passed"], False)
+
+    def test_p2_5_heldout_main_records_error_row_and_continues_after_exception(self):
+        with tempfile.TemporaryDirectory(prefix="aider-heldout-resilient-") as tmp:
+            out_path = Path(tmp) / "results.jsonl"
+            seen_cases: list[str] = []
+
+            def fake_run_spec(**kwargs):
+                case_spec = kwargs["case_spec"]
+                seen_cases.append(case_spec.name)
+                if len(seen_cases) == 1:
+                    raise ConnectionError("LM Studio socket reset")
+                return {
+                    "schema_version": run.SCHEMA_VERSION,
+                    "model": kwargs["model"],
+                    "round": kwargs["round_id"],
+                    "spec": kwargs["spec"],
+                    "kind": case_spec.kind,
+                    "language": case_spec.language,
+                    "case": case_spec.name,
+                    "arm": kwargs["arm"],
+                    "local_callers_backend": kwargs["backend"],
+                    "local_callers_read_range": kwargs["read_range"],
+                    "local_callers_enabled": False,
+                    "local_callers_facts": False,
+                    "project_facts": kwargs["facts"],
+                    "facts_backend": "off",
+                    "exit": 0,
+                    "trial_error": None,
+                    "evidence": False,
+                    "audit_ran": False,
+                    "audit_outcome": "not_run",
+                    "audit_passed": None,
+                    "commit_outcome": "applied",
+                    "commit_passed": False,
+                    "commits_added": 0,
+                    "smoke_outcome": "pass",
+                    "smoke_passed": True,
+                    "hidden_outcome": "pass",
+                    "hidden_passed": True,
+                    "tokens": 500,
+                    "tokens_measured": True,
+                    "passed": True,
+                    "seconds": 2.0,
+                    "patch": "",
+                    "metadata": dict(kwargs["metadata"]),
+                }
+
+            buf = io.StringIO()
+            with mock.patch.object(heldout.run, "run_spec", side_effect=fake_run_spec):
+                with contextlib.redirect_stdout(buf):
+                    heldout.main(
+                        [
+                            "--cases",
+                            "duration,names",
+                            "--arms",
+                            "baseline",
+                            "--specs",
+                            "vague",
+                            "--rounds",
+                            "1",
+                            "--seed",
+                            "1",
+                            "--out",
+                            str(out_path),
+                        ]
+                    )
+
+            self.assertEqual(len(seen_cases), 2)
+            recorded = heldout.load_results(out_path)
+            self.assertEqual(len(recorded), 2)
+
+            err_row, ok_row = recorded[0], recorded[1]
+            self.assertEqual(err_row["case"], seen_cases[0])
+            self.assertEqual(err_row["arm"], "baseline")
+            self.assertEqual(err_row["round"], 0)
+            self.assertEqual(err_row["spec"], "vague")
+            self.assertEqual(err_row["exit"], -1)
+            self.assertEqual(err_row["trial_error"], "ConnectionError: LM Studio socket reset")
+            self.assertEqual(err_row["commit_outcome"], "error")
+            self.assertIs(err_row["commit_passed"], False)
+            self.assertEqual(err_row["hidden_outcome"], "error")
+            self.assertIs(err_row["hidden_passed"], False)
+            self.assertEqual(err_row["smoke_outcome"], "error")
+            self.assertIs(err_row["smoke_passed"], False)
+            self.assertEqual(err_row["audit_outcome"], "not_run")
+            self.assertIsNone(err_row["audit_passed"])
+            self.assertIs(err_row["passed"], False)
+            self.assertIsInstance(err_row["seconds"], float)
+            self.assertEqual(err_row["metadata"]["seed"], 1)
+
+            self.assertEqual(ok_row["case"], seen_cases[1])
+            self.assertIs(ok_row["passed"], True)
+            self.assertIsNone(ok_row["trial_error"])
 
     def test_run_spec_complete_within_scope_and_project_facts_fields(self):
         import issue5_cases
@@ -576,7 +777,8 @@ class TestReportingAndPairedIntervals(unittest.TestCase):
                     "audit_passed": True,
                     "audit_failed": False,
                     "commit_outcome": "applied",
-                    "commit_passed": True,
+                    "commit_passed": False,
+                    "commits_added": 0,
                     "hidden_outcome": "fail",
                     "hidden_passed": False,
                     "smoke_passed": True,
@@ -609,7 +811,8 @@ class TestReportingAndPairedIntervals(unittest.TestCase):
                     "audit_passed": True,
                     "audit_failed": False,
                     "commit_outcome": "applied",
-                    "commit_passed": True,
+                    "commit_passed": False,
+                    "commits_added": 0,
                     "hidden_outcome": "pass",
                     "hidden_passed": True,
                     "smoke_passed": True,
@@ -647,7 +850,7 @@ class TestReportingAndPairedIntervals(unittest.TestCase):
         self.assertIn("Run metadata:", output)
         self.assertIn("git=deadbeef12", output)
         self.assertIn("hidden=3/3", output)
-        self.assertIn("commit=3/3", output)
+        self.assertIn("commit=0/3", output)
         self.assertIn("audit=3/3", output)
         self.assertIn("tokens=+310.0", output)
 

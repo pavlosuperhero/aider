@@ -550,10 +550,12 @@ def normalize_row(
         verdicts.count("ERROR"),
         1 if audit_outcome == "error" else 0,
     )
+    trial_error = raw.get("trial_error")
     is_error = (
         (exit_code is not None and exit_code not in (0, 124))
         or commit_outcome == "error"
         or audit_errors > 0
+        or bool(trial_error)
     )
 
     tokens_measured = bool(outcomes["tokens_measured"])
@@ -605,6 +607,7 @@ def normalize_row(
         "model": raw.get("model"),
         "map_tokens": raw.get("map_tokens"),
         "exit": exit_code,
+        "trial_error": str(trial_error) if trial_error else None,
         "hidden_passed": hidden_passed,
         "hidden_outcome": hidden_outcome,
         "smoke_passed": smoke_passed,
@@ -747,10 +750,10 @@ def compute_paired_comparison(
     keys: Sequence[tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     """Compute paired binary (McNemar + Newcombe 95% CI) and matched-pair numeric deltas."""
-    if keys is None:
-        shared_keys = sorted(set(treat_by_key.keys()) & set(ref_by_key.keys()))
-    else:
-        shared_keys = [k for k in keys if k in treat_by_key and k in ref_by_key]
+    selected = set(keys) if keys is not None else set(treat_by_key) | set(ref_by_key)
+    treatment_keys = selected.intersection(treat_by_key)
+    reference_keys = selected.intersection(ref_by_key)
+    shared_keys = sorted(treatment_keys & reference_keys)
 
     both_pass = wins = losses = both_fail = 0
     for key in shared_keys:
@@ -788,6 +791,12 @@ def compute_paired_comparison(
 
     return {
         "n_pairs": n_pairs,
+        "new_timeouts": sum(
+            bool(treat_by_key[k]["is_timeout"]) and not ref_by_key[k]["is_timeout"]
+            for k in shared_keys
+        ),
+        "treatment_only": len(treatment_keys - reference_keys),
+        "reference_only": len(reference_keys - treatment_keys),
         "both_pass": both_pass,
         "wins": wins,
         "losses": losses,
@@ -829,8 +838,7 @@ def evaluate_control_non_inferiority(
     ctrl_errors = sum(1 for k in shared_ctrl if treat_by_key[k]["is_error"])
     ctrl_out_of_scope = sum(1 for k in shared_ctrl if treat_by_key[k]["is_out_of_scope"])
     ctrl_timeouts = sum(1 for k in shared_ctrl if treat_by_key[k]["is_timeout"])
-    ref_ctrl_timeouts = sum(1 for k in shared_ctrl if ref_by_key[k]["is_timeout"])
-    new_ctrl_timeouts = max(0, ctrl_timeouts - ref_ctrl_timeouts)
+    new_ctrl_timeouts = paired["new_timeouts"]
     catastrophic_failures = (
         ctrl_false_approvals + ctrl_errors + ctrl_out_of_scope + new_ctrl_timeouts
     )
@@ -908,17 +916,18 @@ def evaluate_shipping_gate(
     arm_name: str,
     stage: str,
     arm_metrics: Mapping[str, Any],
-    ref_metrics: Mapping[str, Any],
+    required_pairs: int,
+    frozen: bool,
     overall_paired: Mapping[str, Any],
     caller_paired: Mapping[str, Any],
     control_ni: Mapping[str, Any],
     alpha: float = DEFAULT_ALPHA,
 ) -> dict[str, Any]:
-    """Emit an evidence-only OPT_IN / DEFAULT_ON / BLOCKED shipping gate verdict."""
+    """Emit an evidence-only OPT_IN / DEFAULT_ON / BLOCKED / INCOMPLETE shipping gate verdict."""
     false_approvals = int(arm_metrics["false_approval_count"])
     errors = int(arm_metrics["errors"])
     out_of_scope = int(arm_metrics["out_of_scope"])
-    new_timeouts = max(0, int(arm_metrics["timeouts"]) - int(ref_metrics["timeouts"]))
+    new_timeouts = int(overall_paired["new_timeouts"])
     safety_ok = (
         false_approvals == 0
         and errors == 0
@@ -926,7 +935,21 @@ def evaluate_shipping_gate(
         and new_timeouts == 0
     )
 
+    n_pairs = int(overall_paired["n_pairs"])
+    treatment_only = int(overall_paired.get("treatment_only", 0))
+    reference_only = int(overall_paired.get("reference_only", 0))
+    manifest_frozen = bool(frozen)
+    coverage_complete = (
+        required_pairs > 0
+        and n_pairs == required_pairs
+        and treatment_only == 0
+        and reference_only == 0
+    )
+
     control_operational_ok = bool(control_ni["operational_pass"])
+    control_blocked = (not control_operational_ok) and (
+        coverage_complete or int(control_ni.get("n_pairs", 0)) > 0
+    )
     control_ci_ok = bool(control_ni["ci_non_inferior"])
 
     caller_delta = caller_paired.get("delta")
@@ -988,7 +1011,7 @@ def evaluate_shipping_gate(
             f"false_approvals={false_approvals}, errors={errors}, "
             f"out_of_scope={out_of_scope}, new_timeouts={new_timeouts}"
         )
-    if not control_operational_ok:
+    if control_blocked:
         reasons.append(
             "Control operational non-inferiority gate failed "
             f"(net_regressions={control_ni['net_regressions']}/{control_ni['n_pairs']}, "
@@ -1001,9 +1024,19 @@ def evaluate_shipping_gate(
             f"(caller_delta={_fmt_signed_pct(caller_delta)}, "
             f"overall_delta={_fmt_signed_pct(overall_delta)})"
         )
+    if not manifest_frozen or not coverage_complete:
+        reasons.append(
+            f"Frozen manifest and complete paired coverage required "
+            f"(frozen={manifest_frozen}); matched hidden outcomes "
+            f"{n_pairs}/{required_pairs}, "
+            f"treatment_only={treatment_only}, "
+            f"reference_only={reference_only}."
+        )
 
-    if not safety_ok or not control_operational_ok or sig_regression:
+    if not safety_ok or control_blocked or sig_regression:
         verdict = "BLOCKED"
+    elif not manifest_frozen or not coverage_complete:
+        verdict = "INCOMPLETE"
     elif control_ci_ok and empirical_lift_ok:
         verdict = "DEFAULT_ON"
         reasons.append(
@@ -1038,6 +1071,8 @@ def evaluate_shipping_gate(
         "stage": stage,
         "verdict": verdict,
         "checks": {
+            "frozen": manifest_frozen,
+            "coverage_complete": coverage_complete,
             "safety_ok": safety_ok,
             "control_operational_ok": control_operational_ok,
             "control_ci_ok": control_ci_ok,
@@ -1095,6 +1130,7 @@ def build_failure_catalog(
                 "unknown_verdicts": int(r["unknown_verdicts"]),
                 "commit_outcome": r["commit_outcome"] or "n/a",
                 "exit": r["exit"],
+                "trial_error": r.get("trial_error"),
                 "seconds": r["seconds"],
             }
         )
@@ -1307,10 +1343,14 @@ def analyze_run(
     warnings: list[str] = []
     unmatched_cases = sorted({r["case_id"] for r in all_rows if not r["in_manifest"]})
     if unmatched_cases:
-        warnings.append(
+        raise ManifestVerificationError(
             f"Found {len(unmatched_cases)} case_id(s) not present in manifest: "
             + ", ".join(unmatched_cases)
         )
+
+    def required_pairs(treatment, reference):
+        rounds = {(spec, round_id) for _, spec, round_id in treatment.keys() | reference.keys()}
+        return len(cases_by_id) * len(rounds)
 
     # --- Stage 1 analysis ---
     s1_rows_by_arm: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1343,9 +1383,8 @@ def analyze_run(
         k for k, (cat, _lang) in s1_key_meta.items() if cat == "control"
     )
 
-    s1_ref_arm = "baseline" if "baseline" in s1_by_arm_key else (s1_arms[0] if s1_arms else "")
+    s1_ref_arm = "baseline"
     s1_ref_map = s1_by_arm_key.get(s1_ref_arm, {})
-    s1_ref_metrics = compute_arm_metrics(list(s1_ref_map.values())) if s1_ref_map else {}
 
     s1_table: list[dict[str, Any]] = []
     s1_control_ni: dict[str, dict[str, Any]] = {}
@@ -1387,7 +1426,8 @@ def analyze_run(
                     arm_name=arm,
                     stage="stage1",
                     arm_metrics=metrics,
-                    ref_metrics=s1_ref_metrics,
+                    required_pairs=required_pairs(arm_map, s1_ref_map),
+                    frozen=manifest_info["sha256_verified"],
                     overall_paired=paired_vs_ref,
                     caller_paired=caller_paired,
                     control_ni=ctrl_ni,
@@ -1525,7 +1565,8 @@ def analyze_run(
                         arm_name=factor,
                         stage="stage2",
                         arm_metrics=metrics,
-                        ref_metrics=s2_ref_metrics,
+                        required_pairs=required_pairs(f_map, s2_ref_map),
+                        frozen=manifest_info["sha256_verified"],
                         overall_paired=paired_vs_passive,
                         caller_paired=caller_paired,
                         control_ni=ctrl_ni,
@@ -1614,6 +1655,8 @@ def _aggregate_shipping_gates(model_reports: Sequence[Mapping[str, Any]]) -> lis
         verdicts = {label: str(gate["verdict"]) for label, gate in entries}
         if any(v == "BLOCKED" for v in verdicts.values()):
             overall = "BLOCKED"
+        elif "INCOMPLETE" in verdicts.values():
+            overall = "INCOMPLETE"
         elif verdicts and all(v == "DEFAULT_ON" for v in verdicts.values()):
             overall = "DEFAULT_ON"
         else:
@@ -1750,6 +1793,57 @@ def _fmt_audit_rate(count: int, audit_ran: int) -> str:
     if audit_ran == 0:
         return f"{count}/0 (n/a)"
     return f"{count}/{audit_ran} ({(count / audit_ran) * 100.0:.1f}%)"
+
+
+def _fmt_paired_wl(paired: Mapping[str, Any] | None) -> str:
+    if paired is None:
+        return "ref"
+    treat_only = int(paired.get("treatment_only") or 0)
+    ref_only = int(paired.get("reference_only") or 0)
+    if treat_only > 0 or ref_only > 0:
+        return (
+            f"+{paired['wins']}/-{paired['losses']} "
+            f"(n={paired['n_pairs']}, treat_only={treat_only}, ref_only={ref_only})"
+        )
+    return f"+{paired['wins']}/-{paired['losses']} (n={paired['n_pairs']})"
+
+
+def _fmt_timeouts(metrics: Mapping[str, Any], paired: Mapping[str, Any] | None) -> str:
+    total = int(metrics["timeouts"])
+    if paired is None:
+        return str(total)
+    new_to = int(paired.get("new_timeouts") or 0)
+    return f"{total} (new={new_to})"
+
+
+def _append_pairing_notes(
+    lines: list[str],
+    table_rows: Sequence[Mapping[str, Any]],
+    *,
+    label_key: str,
+) -> None:
+    unmatched_notes: list[str] = []
+    timeout_notes: list[str] = []
+    for row in table_rows:
+        paired = row.get("paired")
+        if paired is None:
+            continue
+        name = row[label_key]
+        treat_only = int(paired.get("treatment_only") or 0)
+        ref_only = int(paired.get("reference_only") or 0)
+        new_to = int(paired.get("new_timeouts") or 0)
+        if treat_only > 0 or ref_only > 0:
+            unmatched_notes.append(
+                f"`{name}` (treatment_only={treat_only}, reference_only={ref_only})"
+            )
+        if new_to > 0:
+            timeout_notes.append(f"`{name}` (new_timeouts={new_to})")
+    if unmatched_notes:
+        lines.append(f"> **Unmatched Attempts:** {', '.join(unmatched_notes)}")
+        lines.append("")
+    if timeout_notes:
+        lines.append(f"> **Matched-Pair Timeout Regressions:** {', '.join(timeout_notes)}")
+        lines.append("")
 
 
 def _render_stratified_table(
@@ -1891,7 +1985,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 "| Arm | Hidden Pass | Wilson 95% CI | Paired vs Ref (+w/-l) | "
                 "Diff (Newcombe 95% CI) | McNemar p | False Approvals | UNKNOWN Verdicts | "
                 "Mean 1st-Prompt | Mean Cum-Prompt | Mean Compl | Mean Calls / Refl | "
-                "Latency p50 / p95 (s) | Timeouts |"
+                "Latency p50 / p95 (s) | Timeouts (New) |"
             )
             lines.append(
                 "| --- | --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | "
@@ -1900,11 +1994,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             for row in s1["table"]:
                 m = row["metrics"]
                 p = row["paired"]
-                paired_wl = (
-                    "ref"
-                    if p is None
-                    else f"+{p['wins']}/-{p['losses']} (n={p['n_pairs']})"
-                )
+                paired_wl = _fmt_paired_wl(p)
                 paired_ci = (
                     "ref"
                     if p is None
@@ -1930,9 +2020,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     f"{_fmt_measured_mean(m['first_prompt_tokens'])} | "
                     f"{_fmt_measured_mean(m['cumulative_prompt_tokens'])} | "
                     f"{_fmt_measured_mean(m['completion_tokens'])} | "
-                    f"{calls_refl} | {lat_p50_p95} | {m['timeouts']} |"
+                    f"{calls_refl} | {lat_p50_p95} | {_fmt_timeouts(m, p)} |"
                 )
             lines.append("")
+            _append_pairing_notes(lines, s1["table"], label_key="arm")
 
             _render_stratified_table(
                 lines,
@@ -1969,7 +2060,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 "| Factor | Hidden Pass | Wilson 95% CI | Paired vs `passive` (+w/-l) | "
                 "Diff (Newcombe 95% CI) | McNemar p | Paired 1st-Prompt Delta | "
                 "Paired Total-Tok Delta | Paired Latency Delta | Latency p50 / p95 (s) | "
-                "Timeouts |"
+                "Timeouts (New) |"
             )
             lines.append(
                 "| --- | --- | --- | --- | --- | ---: | --- | --- | --- | ---: | ---: |"
@@ -1977,11 +2068,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             for row in s2["table"]:
                 m = row["metrics"]
                 p = row["paired"]
-                paired_wl = (
-                    "ref"
-                    if p is None
-                    else f"+{p['wins']}/-{p['losses']} (n={p['n_pairs']})"
-                )
+                paired_wl = _fmt_paired_wl(p)
                 paired_ci = (
                     "ref"
                     if p is None
@@ -2000,9 +2087,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     f"{_fmt_rate(m['hidden_passed'], m['hidden_n'])} | "
                     f"{_fmt_wilson(m['wilson_ci_low'], m['wilson_ci_high'])} | "
                     f"{paired_wl} | {paired_ci} | {p_str} | {d_first} | {d_tok} | {d_lat} | "
-                    f"{lat_p50_p95} | {m['timeouts']} |"
+                    f"{lat_p50_p95} | {_fmt_timeouts(m, p)} |"
                 )
             lines.append("")
+            _append_pairing_notes(lines, s2["table"], label_key="display_label")
 
             has_s2_ref = any(r["is_reference"] for r in s2["table"])
             s2_arms_order = (["passive"] if has_s2_ref else []) + s2["factors"]
@@ -2110,7 +2198,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         lines.append("")
 
     # 5. Explicit Opt-In vs Default-On Shipping Gate Verdict
-    lines.append("## 5. Shipping Gate Verdict (`OPT_IN` vs. `DEFAULT_ON` vs. `BLOCKED`)")
+    lines.append("## 5. Shipping Gate Verdict (`OPT_IN`, `DEFAULT_ON`, `BLOCKED`, or `INCOMPLETE`)")
     lines.append("")
     gates = report["overall_shipping_gates"]
     if not gates:

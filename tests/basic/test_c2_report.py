@@ -771,3 +771,232 @@ def test_parse_run_spec_validation():
 
     with pytest.raises(ValueError, match="Empty model label"):
         c2_report.parse_run_spec(":/tmp/s1.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: P1 #2, P2 #6, and trial_error handling
+# ---------------------------------------------------------------------------
+
+
+def test_p1_2_unregistered_cases_raise_manifest_verification_error(tmp_path: Path):
+    """1-task frozen manifest + 79 unregistered rows must fail closed."""
+    manifest_entries = [_make_manifest_case("registered_00", "direct_caller", "python")]
+    manifest_path, _ = _write_mini_manifest(tmp_path / "one_case.json", manifest_entries)
+
+    rows: list[dict] = []
+    all_case_ids = ["registered_00"] + [f"unregistered_{i:02d}" for i in range(1, 80)]
+    for cid in all_case_ids:
+        rows.append(_make_row(cid, "baseline", hidden_passed=False))
+        rows.append(_make_row(cid, "passive", hidden_passed=True))
+
+    s1_path = _write_jsonl(tmp_path / "unregistered_s1.jsonl", rows)
+    spec = c2_report.ModelRunSpec(label="m1", stage1_paths=(s1_path,))
+    with pytest.raises(c2_report.ManifestVerificationError, match="79 case_id\\(s\\) not present"):
+        c2_report.analyze_report(manifest_path, [spec], probe_host_cymbal=False)
+
+
+def test_p1_2_incomplete_unfrozen_zero_pairs_and_blocked_precedence(tmp_path: Path):
+    """Incomplete, zero-pair, or unfrozen runs never emit DEFAULT_ON; safety failure -> BLOCKED."""
+    entries = [
+        _make_manifest_case(
+            f"caller_{i:02d}",
+            "direct_caller" if i < 10 else "indirect_caller",
+            "python",
+        )
+        for i in range(20)
+    ] + [
+        _make_manifest_case(f"ctrl_{i:02d}", "control", "rust")
+        for i in range(60)
+    ]
+
+    def _build_default_on_rows() -> list[dict]:
+        rows: list[dict] = []
+        for i, e in enumerate(entries):
+            is_caller = i < 20
+            rows.append(
+                _make_row(e.case_id, "baseline", hidden_passed=(i < 5) if is_caller else True)
+            )
+            rows.append(
+                _make_row(e.case_id, "passive", hidden_passed=(i < 15) if is_caller else True)
+            )
+        return rows
+
+    # 1. Unfrozen manifest with strong lift -> INCOMPLETE (never DEFAULT_ON)
+    unfrozen_manifest, _ = _write_mini_manifest(
+        tmp_path / "unfrozen_80.json", entries, frozen=False
+    )
+    full_s1 = _write_jsonl(tmp_path / "full_s1.jsonl", _build_default_on_rows())
+    unfrozen_rep = c2_report.analyze_report(
+        unfrozen_manifest,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(full_s1,))],
+        require_frozen=False,
+        probe_host_cymbal=False,
+    )
+    unfrozen_gate = unfrozen_rep["models"][0]["shipping_gates"]["stage1"][0]
+    assert unfrozen_gate["verdict"] == "INCOMPLETE"
+    assert unfrozen_rep["overall_shipping_gates"][0]["overall_verdict"] == "INCOMPLETE"
+
+    # 2. Missing pair on frozen manifest -> INCOMPLETE (never DEFAULT_ON)
+    frozen_manifest, _ = _write_mini_manifest(tmp_path / "frozen_80.json", entries, frozen=True)
+    missing_pair_rows = [
+        r
+        for r in _build_default_on_rows()
+        if not (r["case"] == "caller_19" and r["arm"] == "passive")
+    ]
+    partial_s1 = _write_jsonl(tmp_path / "partial_s1.jsonl", missing_pair_rows)
+    partial_rep = c2_report.analyze_report(
+        frozen_manifest,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(partial_s1,))],
+        probe_host_cymbal=False,
+    )
+    partial_gate = partial_rep["models"][0]["shipping_gates"]["stage1"][0]
+    assert partial_gate["verdict"] == "INCOMPLETE"
+    assert "79/80" in " ".join(partial_gate["reasons"])
+    assert "reference_only=1" in " ".join(partial_gate["reasons"])
+
+    # 3. Zero-pairs edge case (required_pairs == 0, n_pairs == 0) -> INCOMPLETE
+    zero_paired = c2_report.compute_paired_comparison({}, {})
+    zero_ctrl_ni = c2_report.evaluate_control_non_inferiority({}, {}, [])
+    zero_metrics = c2_report.compute_arm_metrics([])
+    zero_gate = c2_report.evaluate_shipping_gate(
+        arm_name="passive",
+        stage="stage1",
+        arm_metrics=zero_metrics,
+        required_pairs=0,
+        frozen=True,
+        overall_paired=zero_paired,
+        caller_paired=zero_paired,
+        control_ni=zero_ctrl_ni,
+    )
+    assert zero_gate["verdict"] == "INCOMPLETE"
+    assert zero_gate["checks"]["coverage_complete"] is False
+
+    # 4. Incomplete run WITH a safety failure -> BLOCKED (while still reporting incompleteness)
+    unsafe_partial_rows = _build_default_on_rows()
+    unsafe_partial_rows = [
+        r for r in unsafe_partial_rows if not (r["case"] == "caller_19" and r["arm"] == "passive")
+    ]
+    for r in unsafe_partial_rows:
+        if r["case"] == "caller_18" and r["arm"] == "passive":
+            r["hidden_passed"] = False
+            r["audit_ran"] = True
+            r["audit_outcome"] = "pass"
+            r["audit_verdicts"] = ["PASS"]
+    unsafe_s1 = _write_jsonl(tmp_path / "unsafe_partial_s1.jsonl", unsafe_partial_rows)
+    unsafe_rep = c2_report.analyze_report(
+        frozen_manifest,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(unsafe_s1,))],
+        probe_host_cymbal=False,
+    )
+    unsafe_gate = unsafe_rep["models"][0]["shipping_gates"]["stage1"][0]
+    assert unsafe_gate["verdict"] == "BLOCKED"
+    reasons_text = " ".join(unsafe_gate["reasons"])
+    assert "false_approvals=1" in reasons_text
+    assert "79/80" in reasons_text
+    assert "reference_only=1" in reasons_text
+
+
+def test_p2_6_matched_pair_new_timeouts_and_unmatched_reporting(tmp_path: Path):
+    """Baseline timeout on A + treatment timeout on B must report new_timeouts=1 and BLOCK."""
+    entries = [
+        _make_manifest_case("task_a", "direct_caller", "python"),
+        _make_manifest_case("task_b", "direct_caller", "python"),
+        _make_manifest_case("ctrl_01", "control", "rust"),
+    ]
+    manifest_path, _ = _write_mini_manifest(tmp_path / "to_manifest.json", entries)
+
+    # Stage 1: baseline times out on task_a (passive passes), passive times out on task_b
+    # (baseline passes). Aggregate timeouts are 1 vs 1, but matched-pair new_timeouts == 1!
+    s1_rows = [
+        _make_row("task_a", "baseline", hidden_passed=False, smoke_passed=False, exit_code=124),
+        _make_row("task_a", "passive", hidden_passed=True),
+        _make_row("task_b", "baseline", hidden_passed=True),
+        _make_row("task_b", "passive", hidden_passed=False, smoke_passed=False, exit_code=124),
+        _make_row("ctrl_01", "baseline", hidden_passed=True),
+        _make_row("ctrl_01", "passive", hidden_passed=True),
+        # Contract arm has unmatched treatment-only (round 1) and reference-only (missing task_b r0)
+        _make_row("task_a", "contract", hidden_passed=True, round_id=0),
+        _make_row("ctrl_01", "contract", hidden_passed=True, round_id=0),
+        _make_row("task_a", "contract", hidden_passed=True, round_id=1),
+    ]
+    # Stage 2: cymbal has unmatched treatment_only=1 (round 1) and reference_only=1 (missing task_b)
+    s2_rows = [
+        _make_row("task_a", "passive", backend="cymbal", hidden_passed=True, round_id=0),
+        _make_row("ctrl_01", "passive", backend="cymbal", hidden_passed=True, round_id=0),
+        _make_row("task_a", "passive", backend="cymbal", hidden_passed=True, round_id=1),
+    ]
+    s1_path = _write_jsonl(tmp_path / "to_s1.jsonl", s1_rows)
+    s2_path = _write_jsonl(tmp_path / "to_s2.jsonl", s2_rows)
+    rep = c2_report.analyze_report(
+        manifest_path,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(s1_path,), stage2_paths=(s2_path,))],
+        probe_host_cymbal=False,
+    )
+    md = c2_report.render_markdown(rep)
+
+    s1_by_arm = {row["arm"]: row for row in rep["models"][0]["stage1"]["table"]}
+    assert s1_by_arm["baseline"]["metrics"]["timeouts"] == 1
+    assert s1_by_arm["passive"]["metrics"]["timeouts"] == 1
+    assert s1_by_arm["passive"]["paired"]["new_timeouts"] == 1
+
+    gates = {g["arm"]: g for g in rep["models"][0]["shipping_gates"]["stage1"]}
+    assert gates["passive"]["verdict"] == "BLOCKED"
+    assert "new_timeouts=1" in " ".join(gates["passive"]["reasons"])
+
+    assert s1_by_arm["contract"]["paired"]["treatment_only"] == 1
+    assert s1_by_arm["contract"]["paired"]["reference_only"] == 1
+    assert gates["contract"]["verdict"] == "INCOMPLETE"
+
+    s2_by_factor = {row["factor"]: row for row in rep["models"][0]["stage2"]["table"]}
+    assert s2_by_factor["cymbal"]["paired"]["treatment_only"] == 1
+    assert s2_by_factor["cymbal"]["paired"]["reference_only"] == 1
+    s2_gates = {g["arm"]: g for g in rep["models"][0]["shipping_gates"]["stage2"]}
+    assert s2_gates["cymbal"]["verdict"] == "INCOMPLETE"
+
+    assert "1 (new=1)" in md
+    assert "new_timeouts=1" in md
+    assert "treat_only=1, ref_only=1" in md
+    assert "treatment_only=1, reference_only=1" in md
+    assert "`cymbal (backend=cymbal)` (treatment_only=1, reference_only=1)" in md
+
+
+def test_trial_error_row_counts_as_error_and_blocks_gate(tmp_path: Path):
+    """Rows carrying trial_error are normalized as is_error=True, cataloged, and block shipping."""
+    entries = [
+        _make_manifest_case("caller_01", "direct_caller", "python"),
+        _make_manifest_case("ctrl_01", "control", "rust"),
+    ]
+    manifest_path, _ = _write_mini_manifest(tmp_path / "err_manifest.json", entries)
+
+    # Even if exit=0 and commit_outcome="applied", trial_error must mark is_error=True!
+    err_row = _make_row("caller_01", "passive", hidden_passed=False, exit_code=0)
+    err_row["trial_error"] = "ConnectionError: upstream reset"
+
+    s1_rows = [
+        _make_row("caller_01", "baseline", hidden_passed=False),
+        err_row,
+        _make_row("ctrl_01", "baseline", hidden_passed=True),
+        _make_row("ctrl_01", "passive", hidden_passed=True),
+    ]
+    s1_path = _write_jsonl(tmp_path / "err_s1.jsonl", s1_rows)
+    rep = c2_report.analyze_report(
+        manifest_path,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(s1_path,))],
+        probe_host_cymbal=False,
+    )
+
+    s1_by_arm = {row["arm"]: row for row in rep["models"][0]["stage1"]["table"]}
+    assert s1_by_arm["passive"]["metrics"]["errors"] == 1
+
+    gates = {g["arm"]: g for g in rep["models"][0]["shipping_gates"]["stage1"]}
+    assert gates["passive"]["verdict"] == "BLOCKED"
+    assert gates["passive"]["checks"]["safety_ok"] is False
+
+    catalog_matches = [
+        item
+        for item in rep["failure_catalog"]
+        if item["case_id"] == "caller_01" and item["arm"] == "passive"
+    ]
+    assert len(catalog_matches) == 1
+    assert "ERROR" in catalog_matches[0]["tags"]
+    assert catalog_matches[0]["trial_error"] == "ConnectionError: upstream reset"
