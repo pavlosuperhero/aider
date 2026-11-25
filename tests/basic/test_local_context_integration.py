@@ -202,6 +202,7 @@ def test_cli_flags_defaults_and_opt_in_values():
     assert defaults.local_callers_backend == "builtin"
     assert defaults.local_callers_read_range is False
     assert defaults.facts is False
+    assert defaults.facts_file is None
     assert defaults.facts_db is None
 
     configured = parser.parse_args(
@@ -211,6 +212,8 @@ def test_cli_flags_defaults_and_opt_in_values():
             "auto",
             "--local-callers-read-range",
             "--facts",
+            "--facts-file",
+            "custom/facts.jsonl",
             "--facts-db",
             "custom/facts.sqlite3",
         ]
@@ -219,7 +222,12 @@ def test_cli_flags_defaults_and_opt_in_values():
     assert configured.local_callers_backend == "auto"
     assert configured.local_callers_read_range is True
     assert configured.facts is True
+    assert configured.facts_file == "custom/facts.jsonl"
     assert configured.facts_db == "custom/facts.sqlite3"
+
+    url_args = parser.parse_args(["--facts", "--facts-db", "sqlite:///tmp/facts.sqlite3"])
+    assert url_args.facts is True
+    assert url_args.facts_db == "sqlite:///tmp/facts.sqlite3"
 
     cymbal_args = parser.parse_args(["--local-callers-backend", "cymbal", "--no-facts"])
     assert cymbal_args.local_callers_backend == "cymbal"
@@ -233,6 +241,7 @@ def test_gitignore_covers_cymbal_and_facts_db():
     gitignore = Path(__file__).resolve().parents[2] / ".gitignore"
     lines = {line.strip() for line in gitignore.read_text(encoding="utf-8").splitlines()}
     assert ".cymbal/" in lines
+    assert ".aider.facts.jsonl" in lines
     assert ".aider.facts.sqlite3" in lines
     assert ".aider.facts.sqlite3-journal" in lines
     assert ".aider.facts.sqlite3-wal" in lines
@@ -245,7 +254,10 @@ def test_gitignore_covers_cymbal_and_facts_db():
 def test_disabled_features_perform_no_io_and_keep_optional_imports_lazy(project, monkeypatch):
     parser = get_parser([], str(project))
     db_path = project / "should_not_be_created.sqlite3"
-    args = parser.parse_args(["--no-facts", "--facts-db", str(db_path)])
+    jsonl_path = project / "should_not_be_created.jsonl"
+    args = parser.parse_args(
+        ["--no-facts", "--facts-db", str(db_path), "--facts-file", str(jsonl_path)]
+    )
 
     optional_mods = ("aider.project_facts", "aider.read_range", "aider.cymbal_callers")
     for mod_name in optional_mods:
@@ -259,6 +271,8 @@ def test_disabled_features_perform_no_io_and_keep_optional_imports_lazy(project,
     assert "read_range_reader" not in kwargs
     assert "local_caller_finder" not in kwargs
     assert not db_path.exists()
+    assert not jsonl_path.exists()
+    assert not (project / ".aider.facts.jsonl").exists()
     assert not (project / ".aider.facts.sqlite3").exists()
 
     coder = make_coder(**kwargs)
@@ -267,6 +281,8 @@ def test_disabled_features_perform_no_io_and_keep_optional_imports_lazy(project,
     assert coder.read_range_reader is None
     assert coder.local_caller_finder is None
     assert not db_path.exists()
+    assert not jsonl_path.exists()
+    assert not (project / ".aider.facts.jsonl").exists()
     assert not (project / ".aider.facts.sqlite3").exists()
     for mod_name in optional_mods:
         assert mod_name not in sys.modules
@@ -277,7 +293,12 @@ def test_disabled_features_perform_no_io_and_keep_optional_imports_lazy(project,
 
 def test_composition_wires_real_cymbal_read_range_and_facts_factories(project):
     from aider.cymbal_callers import FallbackCallerFinder
-    from aider.project_facts import DEFAULT_FACTS_FILENAME, ProjectFactStore
+    from aider.project_facts import (
+        DEFAULT_FACTS_FILENAME,
+        DEFAULT_FACTS_JSONL_FILENAME,
+        ProjectFactStore,
+        chat_scope_id,
+    )
 
     parser = get_parser([], str(project))
     default_args = parser.parse_args(
@@ -302,23 +323,52 @@ def test_composition_wires_real_cymbal_read_range_and_facts_factories(project):
         assert reader.cymbal_client is finder.cymbal_finder.client
         assert isinstance(store, ProjectFactStore)
         assert store.active is True
+        assert store.backend == "jsonl"
         assert store.read_only is False
-        expected_db = (project / DEFAULT_FACTS_FILENAME).resolve()
-        assert store.db_path == expected_db
-        assert Path(kwargs["facts_db"]) == expected_db
-        assert expected_db.exists()
+        expected_jsonl = (project / DEFAULT_FACTS_JSONL_FILENAME).resolve()
+        assert store.storage_path == expected_jsonl
+        assert store.db_path == expected_jsonl
+        assert store.chat_id == chat_scope_id(project, default_args.chat_history_file)
+        assert Path(kwargs["facts_file"]) == expected_jsonl
+        assert kwargs["facts_db"] is None
+        assert expected_jsonl.exists()
+        assert not (project / DEFAULT_FACTS_FILENAME).exists()
     finally:
         kwargs["facts_store"].close()
+
+    custom_jsonl_args = parser.parse_args(["--facts", "--facts-file", "state/custom.jsonl"])
+    custom_jsonl_kwargs = compose_local_context_kwargs(custom_jsonl_args, root=project)
+    try:
+        expected_custom_jsonl = (project / "state/custom.jsonl").resolve()
+        assert custom_jsonl_kwargs["facts_store"].backend == "jsonl"
+        assert custom_jsonl_kwargs["facts_store"].storage_path == expected_custom_jsonl
+        assert Path(custom_jsonl_kwargs["facts_file"]) == expected_custom_jsonl
+        assert expected_custom_jsonl.exists()
+    finally:
+        custom_jsonl_kwargs["facts_store"].close()
 
     custom_args = parser.parse_args(["--facts", "--facts-db", "state/custom.sqlite3"])
     custom_kwargs = compose_local_context_kwargs(custom_args, root=project)
     try:
         expected_custom = (project / "state/custom.sqlite3").resolve()
+        assert custom_kwargs["facts_store"].backend == "sqlite"
         assert custom_kwargs["facts_store"].db_path == expected_custom
         assert Path(custom_kwargs["facts_db"]) == expected_custom
         assert expected_custom.exists()
     finally:
         custom_kwargs["facts_store"].close()
+
+    url_target = (project / "state" / "url_facts.sqlite3").resolve()
+    url_str = f"sqlite:///{url_target.as_posix().lstrip('/')}"
+    url_args = parser.parse_args(["--facts", "--facts-db", url_str])
+    url_kwargs = compose_local_context_kwargs(url_args, root=project)
+    try:
+        assert url_kwargs["facts_store"].backend == "sqlite"
+        assert url_kwargs["facts_store"].storage_path == url_target
+        assert Path(url_kwargs["facts_db"]) == url_target
+        assert url_target.exists()
+    finally:
+        url_kwargs["facts_store"].close()
 
 
 def test_auto_backend_falls_back_with_diagnostics_and_cymbal_mode_errors_explicitly(
@@ -401,6 +451,8 @@ def test_adapters_and_flags_propagate_through_coder_switches(project):
         read_range_reader=reader,
         facts=True,
         facts_db=str(project / ".aider.facts.sqlite3"),
+        facts_file=str(project / ".aider.facts.jsonl"),
+        chat_history_file=str(project / "custom.chat.history.md"),
         facts_store=store,
     )
     coder.commands.cmd_read_range("pkg/consumer.py:1-3")
@@ -414,6 +466,8 @@ def test_adapters_and_flags_propagate_through_coder_switches(project):
     assert switched.read_range_reader is reader
     assert switched.facts_enabled is True
     assert switched.facts_db == str(project / ".aider.facts.sqlite3")
+    assert switched.facts_file == str(project / ".aider.facts.jsonl")
+    assert switched.chat_history_file == str(project / "custom.chat.history.md")
     assert switched.facts_store is store
     assert len(switched.read_only_ranges) == 1
 
@@ -423,6 +477,8 @@ def test_adapters_and_flags_propagate_through_coder_switches(project):
     assert restored.local_caller_finder is finder
     assert restored.read_range_reader is reader
     assert restored.facts_store is store
+    assert restored.facts_file == str(project / ".aider.facts.jsonl")
+    assert restored.chat_history_file == str(project / "custom.chat.history.md")
     assert restored.facts_enabled is True
     assert restored.local_callers_backend == "cymbal"
 
@@ -467,7 +523,7 @@ def test_cmd_read_range_uses_real_read_range_and_is_read_only(project):
 
 
 def test_cmd_fact_disabled_unavailable_and_read_write_lifecycle(project, monkeypatch):
-    # 1. Disabled by default: /fact errors and creates no DB.
+    # 1. Disabled by default: /fact errors and creates neither JSONL nor SQLite file.
     disabled_coder = make_coder(facts=False)
     disabled_errors = []
     disabled_coder.io.tool_error = lambda *a, **kw: disabled_errors.append(
@@ -478,9 +534,11 @@ def test_cmd_fact_disabled_unavailable_and_read_write_lifecycle(project, monkeyp
     disabled_coder.commands.cmd_fact("-f pricing.py format_price returns plain decimal")
     assert len(disabled_errors) == 2
     assert all("disabled" in msg.lower() for msg in disabled_errors)
+    assert not (project / ".aider.facts.jsonl").exists()
     assert not (project / ".aider.facts.sqlite3").exists()
 
-    # 2. Unavailable sqlite3 degrades with explicit diagnostic and creates no DB.
+    # 2. Explicit --facts-db degrades when sqlite3 is unavailable or URL scheme is unsupported,
+    # creating no DB and no fallback JSONL; meanwhile default --facts (JSONL) still works!
     import aider.project_facts as pf
 
     with monkeypatch.context() as mp:
@@ -489,12 +547,13 @@ def test_cmd_fact_disabled_unavailable_and_read_write_lifecycle(project, monkeyp
         io = InputOutput(yes=True, pretty=False, fancy_input=False)
         io.tool_warning = lambda *a, **kw: io_warnings.append(" ".join(str(x) for x in a))
         parser = get_parser([], str(project))
-        args = parser.parse_args(["--facts"])
+        args = parser.parse_args(["--facts", "--facts-db", "custom.sqlite3"])
         unavail_kwargs = compose_local_context_kwargs(args, root=project, io=io)
         assert unavail_kwargs["facts_store"].active is False
         assert "sqlite3" in unavail_kwargs["facts_store"].diagnostic.lower()
         assert any("sqlite3" in w.lower() for w in io_warnings)
-        assert not (project / ".aider.facts.sqlite3").exists()
+        assert not (project / "custom.sqlite3").exists()
+        assert not (project / ".aider.facts.jsonl").exists()
 
         unavail_coder = make_coder(**unavail_kwargs)
         unavail_errors = []
@@ -504,12 +563,36 @@ def test_cmd_fact_disabled_unavailable_and_read_write_lifecycle(project, monkeyp
         unavail_coder.commands.cmd_fact("format_price returns plain decimal")
         assert any("sqlite3" in e.lower() for e in unavail_errors)
 
-    # 3. Enabled real SQLite FTS5 store: read/write /fact, candidate isolation, source invalidation.
+        bad_url_warnings = []
+        bad_io = InputOutput(yes=True, pretty=False, fancy_input=False)
+        bad_io.tool_warning = lambda *a, **kw: bad_url_warnings.append(
+            " ".join(str(x) for x in a)
+        )
+        bad_url_args = parser.parse_args(["--facts", "--facts-db", "postgresql://localhost/aider"])
+        bad_url_kwargs = compose_local_context_kwargs(bad_url_args, root=project, io=bad_io)
+        assert bad_url_kwargs["facts_store"].active is False
+        assert any("scheme" in w.lower() for w in bad_url_warnings)
+        assert not (project / ".aider.facts.jsonl").exists()
+
+        # Default --facts uses JSONL and succeeds even when sqlite3 is None!
+        jsonl_no_sqlite_args = parser.parse_args(["--facts"])
+        jsonl_no_sqlite_kwargs = compose_local_context_kwargs(
+            jsonl_no_sqlite_args, root=project
+        )
+        try:
+            assert jsonl_no_sqlite_kwargs["facts_store"].active is True
+            assert jsonl_no_sqlite_kwargs["facts_store"].backend == "jsonl"
+            assert (project / ".aider.facts.jsonl").exists()
+        finally:
+            jsonl_no_sqlite_kwargs["facts_store"].close()
+
+    # 3. Enabled default JSONL store: read/write /fact, chat_id, candidate isolation, staleness.
     parser = get_parser([], str(project))
     args = parser.parse_args(["--facts"])
     kwargs = compose_local_context_kwargs(args, root=project)
     coder = make_coder(**kwargs)
     try:
+        assert coder.facts_store.backend == "jsonl"
         outputs = []
         errors = []
         coder.io.tool_output = lambda *a, **kw: outputs.append(" ".join(str(x) for x in a))
@@ -534,6 +617,7 @@ def test_cmd_fact_disabled_unavailable_and_read_write_lifecycle(project, monkeyp
         recorded = coder.facts_store.search("currency")
         assert len(recorded) == 1
         fact_id = recorded[0].fact_id
+        assert recorded[0].provenance.chat_id == coder.facts_store.chat_id
 
         outputs.clear()
         coder.commands.cmd_fact(f"show {fact_id}")
@@ -550,6 +634,7 @@ def test_cmd_fact_disabled_unavailable_and_read_write_lifecycle(project, monkeyp
             query="pricing", paths=("pricing.py",)
         )
         assert "never prepend a currency symbol" in prompt_ctx
+        assert f"chat={coder.facts_store.chat_id}" in prompt_ctx
         assert "unverified model speculation" not in prompt_ctx
 
         coder.commands.cmd_fact(f"confirm {cand.fact_id}")

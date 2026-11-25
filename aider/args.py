@@ -190,18 +190,29 @@ def get_parser(default_config_files, git_root):
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Enable project facts context injection and the /fact command "
-            "(default: False)"
+            "Enable project facts context injection and the /fact command; "
+            "defaults to .aider.facts.jsonl with a chat hash ID (default: False)"
         ),
     )
 
     group.add_argument(
-        "--facts-db",
+        "--facts-file",
         metavar="PATH",
         default=None,
         help=(
-            "Path to the SQLite database file for project facts "
-            "(default: .aider.facts.sqlite3 in the project root when --facts is enabled)"
+            "Path to the JSONL file for project facts when --facts is enabled "
+            "without --facts-db (default: .aider.facts.jsonl in the project root)"
+        ),
+    ).complete = shtab.FILE
+
+    group.add_argument(
+        "--facts-db",
+        metavar="PATH_OR_URL",
+        default=None,
+        help=(
+            "SQLite database path or sqlite:// URL for project facts "
+            "(e.g., .aider.facts.sqlite3, sqlite:///abs/path, sqlite://rel/path; "
+            "overrides the JSONL default when --facts is enabled)"
         ),
     ).complete = shtab.FILE
 

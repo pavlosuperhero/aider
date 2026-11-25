@@ -1,4 +1,6 @@
 import hashlib
+import json
+import os
 import shutil
 import sqlite3 as real_sqlite3
 from pathlib import Path
@@ -8,24 +10,30 @@ import pytest
 from aider.history import ChatSummary
 from aider.project_facts import (
     DEFAULT_FACTS_FILENAME,
+    DEFAULT_FACTS_JSONL_FILENAME,
     MAX_TOP_K,
     FactProvenance,
     FactStatus,
+    FactStoreError,
     FactStoreReadOnlyError,
     FactValidationError,
     FakeFactRepository,
     Fts5UnavailableError,
+    JsonlFactRepository,
     ProjectFact,
     SourceSnapshot,
     SqliteFtsFactRepository,
     SqliteUnavailableError,
     VerificationState,
     capture_source_snapshots,
+    chat_scope_id,
     format_facts_context,
     hash_worktree_file,
     open_project_fact_store,
     parse_fact_command_args,
+    parse_facts_db_url,
     resolve_facts_db_path,
+    resolve_facts_jsonl_path,
     worktree_scope_id,
 )
 
@@ -77,20 +85,27 @@ class _LossyFakeModel:
 def _make_repository(backend: str, tmp_path: Path):
     if backend == "fake":
         return FakeFactRepository()
+    if backend == "jsonl":
+        return JsonlFactRepository(tmp_path / "facts.jsonl")
     if backend == "sqlite":
         return SqliteFtsFactRepository(tmp_path / "facts.sqlite3")
     raise ValueError(f"Unknown backend: {backend}")
 
 
 def test_disabled_mode_does_not_open_or_create_store(tmp_path):
+    default_jsonl = tmp_path / DEFAULT_FACTS_JSONL_FILENAME
     default_db = tmp_path / DEFAULT_FACTS_FILENAME
+    custom_jsonl = tmp_path / "custom" / "facts.jsonl"
     custom_db = tmp_path / "custom" / "facts.sqlite3"
 
     with open_project_fact_store(tmp_path, enabled=False) as store:
         assert not store.enabled
         assert not store.available
         assert not store.active
+        assert store.backend == "disabled"
+        assert store.storage_path is None
         assert store.db_path is None
+        assert store.chat_id == chat_scope_id(tmp_path)
         assert "disabled" in store.diagnostic.lower()
         assert store.search("anything") == ()
         assert store.list_for_paths(["app.py"]) == ()
@@ -98,51 +113,225 @@ def test_disabled_mode_does_not_open_or_create_store(tmp_path):
         assert not res.ok
         assert "disabled" in res.message.lower()
 
-    with open_project_fact_store(tmp_path, enabled=False, facts_db=custom_db) as store:
+    with open_project_fact_store(
+        tmp_path, enabled=False, facts_db=custom_db, facts_file=custom_jsonl
+    ) as store:
         assert not store.active
+        assert store.backend == "disabled"
 
+    assert not default_jsonl.exists()
     assert not default_db.exists()
+    assert not custom_jsonl.exists()
     assert not custom_db.exists()
     assert not custom_db.parent.exists()
 
 
-def test_default_and_custom_db_paths(tmp_path):
+def test_default_jsonl_custom_file_and_db_url_routing(tmp_path):
     (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
 
+    assert resolve_facts_jsonl_path(tmp_path) == (
+        tmp_path / DEFAULT_FACTS_JSONL_FILENAME
+    ).resolve()
+    assert resolve_facts_jsonl_path(tmp_path, "sub/custom.jsonl") == (
+        tmp_path / "sub" / "custom.jsonl"
+    ).resolve()
     assert resolve_facts_db_path(tmp_path) == (tmp_path / DEFAULT_FACTS_FILENAME).resolve()
     assert resolve_facts_db_path(tmp_path, "sub/custom.sqlite3") == (
         tmp_path / "sub" / "custom.sqlite3"
     ).resolve()
 
+    abs_url_target = (tmp_path / "url_abs" / "facts.sqlite3").resolve()
+    assert parse_facts_db_url(tmp_path, f"sqlite:///{abs_url_target.as_posix().lstrip('/')}") == (
+        abs_url_target
+    )
+    assert parse_facts_db_url(tmp_path, "sqlite://rel/facts.sqlite3") == (
+        tmp_path / "rel" / "facts.sqlite3"
+    ).resolve()
+    assert parse_facts_db_url(tmp_path, "plain/facts.sqlite3") == (
+        tmp_path / "plain" / "facts.sqlite3"
+    ).resolve()
+
+    for bad_url in (
+        "",
+        "   ",
+        ":memory:",
+        "sqlite:///:memory:",
+        "sqlite://:memory:",
+        "sqlite://",
+        "sqlite:///",
+        "postgres://user:pass@localhost/aider",
+        "postgresql://localhost/aider",
+        "mysql://localhost/aider",
+        "http://example.com/facts.db",
+    ):
+        with pytest.raises(FactValidationError):
+            parse_facts_db_url(tmp_path, bad_url)
+
+    # Default enabled store uses .aider.facts.jsonl with deterministic chat hash ID.
     with open_project_fact_store(tmp_path, enabled=True) as default_store:
         assert default_store.active
-        assert default_store.db_path == (tmp_path / DEFAULT_FACTS_FILENAME).resolve()
-        default_store.record_fact("Use UTC everywhere.", source_paths=["app.py"])
-    assert (tmp_path / DEFAULT_FACTS_FILENAME).is_file()
+        assert default_store.backend == "jsonl"
+        assert default_store.storage_path == (tmp_path / DEFAULT_FACTS_JSONL_FILENAME).resolve()
+        assert default_store.db_path == default_store.storage_path
+        expected_chat_id = chat_scope_id(tmp_path)
+        assert default_store.chat_id == expected_chat_id
+        assert expected_chat_id.startswith("chat:")
+        assert len(expected_chat_id) == len("chat:") + 16
+        recorded = default_store.record_fact("Use UTC everywhere.", source_paths=["app.py"])
+        assert recorded.provenance.chat_id == expected_chat_id
+    jsonl_file = tmp_path / DEFAULT_FACTS_JSONL_FILENAME
+    assert jsonl_file.is_file()
+    assert not (tmp_path / DEFAULT_FACTS_FILENAME).exists()
+    raw_lines = [line for line in jsonl_file.read_text(encoding="utf-8").splitlines() if line]
+    assert len(raw_lines) == 1
+    parsed_line = json.loads(raw_lines[0])
+    assert parsed_line["chat_id"] == expected_chat_id
+    assert parsed_line["provenance"]["chat_id"] == expected_chat_id
+    assert parsed_line["statement"] == "Use UTC everywhere."
 
+    # Custom JSONL path via facts_file.
+    custom_jsonl = tmp_path / "alt_jsonl" / "custom.jsonl"
+    with open_project_fact_store(
+        tmp_path, enabled=True, facts_file=custom_jsonl
+    ) as custom_jsonl_store:
+        assert custom_jsonl_store.active
+        assert custom_jsonl_store.backend == "jsonl"
+        assert custom_jsonl_store.storage_path == custom_jsonl.resolve()
+        custom_jsonl_store.record_fact("Custom JSONL fact.", source_paths=["app.py"])
+    assert custom_jsonl.is_file()
+
+    # Plain SQLite path via facts_db.
     custom_path = tmp_path / "alt_dir" / "custom_facts.sqlite3"
     with open_project_fact_store(tmp_path, enabled=True, facts_db=custom_path) as custom_store:
         assert custom_store.active
+        assert custom_store.backend == "sqlite"
+        assert custom_store.storage_path == custom_path.resolve()
         assert custom_store.db_path == custom_path.resolve()
-        custom_store.record_fact("Always validate inputs at boundary.", source_paths=["app.py"])
+        fact = custom_store.record_fact(
+            "Always validate inputs at boundary.", source_paths=["app.py"]
+        )
+        assert fact.provenance.chat_id == custom_store.chat_id
     assert custom_path.is_file()
 
+    # sqlite:// URL routing (absolute and relative).
+    abs_url = f"sqlite:///{abs_url_target.as_posix().lstrip('/')}"
+    with open_project_fact_store(tmp_path, enabled=True, facts_db=abs_url) as url_store:
+        assert url_store.active
+        assert url_store.backend == "sqlite"
+        assert url_store.storage_path == abs_url_target
+        url_store.record_fact("Opened via sqlite:/// URL.", source_paths=["app.py"])
+    assert abs_url_target.is_file()
 
-def test_works_without_standalone_sqlite_cli_executable(tmp_path, monkeypatch):
+    with open_project_fact_store(
+        tmp_path, enabled=True, facts_db="sqlite://rel_url/facts.sqlite3"
+    ) as rel_url_store:
+        assert rel_url_store.active
+        assert rel_url_store.backend == "sqlite"
+        assert rel_url_store.storage_path == (tmp_path / "rel_url" / "facts.sqlite3").resolve()
+    assert (tmp_path / "rel_url" / "facts.sqlite3").is_file()
+
+    # Unsupported URL scheme or :memory: returns inactive store and creates no file.
+    isolated = tmp_path / "isolated_bad_url"
+    isolated.mkdir()
+    for bad_db in ("postgresql://localhost/aider", "mysql://localhost/aider", ":memory:"):
+        with open_project_fact_store(isolated, enabled=True, facts_db=bad_db) as bad_store:
+            assert bad_store.enabled
+            assert not bad_store.available
+            assert not bad_store.active
+            assert bad_store.storage_path is None
+            assert bad_store.diagnostic
+            assert bad_store.search("anything") == ()
+    assert list(isolated.iterdir()) == []
+
+
+def test_chat_scope_id_determinism_and_provenance_serialization(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    link = tmp_path / "repo_link"
+    link.symlink_to(repo)
+
+    id_default = chat_scope_id(repo)
+    id_explicit = chat_scope_id(repo, repo / ".aider.chat.history.md")
+    id_relative = chat_scope_id(repo, ".aider.chat.history.md")
+    id_symlink = chat_scope_id(link)
+    id_other_history = chat_scope_id(repo, "sessions/chat-b.md")
+    other_repo = tmp_path / "other_repo"
+    other_repo.mkdir()
+    id_other_repo = chat_scope_id(other_repo)
+
+    assert id_default == id_explicit == id_relative == id_symlink
+    assert id_default != id_other_history
+    assert id_default != id_other_repo
+    assert id_default.startswith("chat:") and len(id_default) == 21
+
+    (repo / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    snaps = capture_source_snapshots(repo, ["mod.py"])
+    fact = ProjectFact.confirmed(
+        worktree_id=worktree_scope_id(repo),
+        statement="Round-trip test.",
+        sources=snaps,
+        chat_id=id_default,
+    )
+    payload = fact.to_dict()
+    assert payload["chat_id"] == id_default
+    assert payload["provenance"]["chat_id"] == id_default
+    assert ProjectFact.from_dict(payload) == fact
+
+    # Backwards-compatible provenance dict without chat_id defaults to "".
+    legacy_prov = FactProvenance.from_dict(
+        {
+            "origin": "user:/fact",
+            "worktree_id": worktree_scope_id(repo),
+            "recorded_at": "2026-01-01T00:00:00Z",
+            "sources": [],
+        }
+    )
+    assert legacy_prov.chat_id == ""
+
+    rendered = format_facts_context([fact])
+    assert f"chat={id_default}" in rendered
+
+
+def test_default_jsonl_works_without_python_sqlite_and_sqlite_works_without_cli(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("PATH", "")
     assert shutil.which("sqlite3") is None
 
     (tmp_path / "service.py").write_text("def handle():\n    return 'ok'\n", encoding="utf-8")
-    with open_project_fact_store(tmp_path, enabled=True) as store:
-        assert store.active
-        fact = store.record_fact(
+
+    # Default JSONL works even when Python's sqlite3 module is completely unavailable.
+    with monkeypatch.context() as mp:
+        mp.setattr("aider.project_facts.sqlite3", None)
+        with open_project_fact_store(tmp_path, enabled=True) as jsonl_store:
+            assert jsonl_store.active
+            assert jsonl_store.backend == "jsonl"
+            fact = jsonl_store.record_fact(
+                "Service handlers return normalized ISO timestamps.",
+                source_paths=["service.py"],
+                tags=["convention"],
+            )
+            assert fact.provenance.chat_id == jsonl_store.chat_id
+            found = jsonl_store.search("normalized ISO timestamps")
+            assert [f.fact_id for f in found] == [fact.fact_id]
+            by_path = jsonl_store.list_for_paths(["service.py"])
+            assert [f.fact_id for f in by_path] == [fact.fact_id]
+        assert (tmp_path / DEFAULT_FACTS_JSONL_FILENAME).is_file()
+        assert not (tmp_path / DEFAULT_FACTS_FILENAME).exists()
+
+    # Explicit --facts-db uses embedded sqlite3 without needing the standalone CLI executable.
+    db_path = tmp_path / DEFAULT_FACTS_FILENAME
+    with open_project_fact_store(tmp_path, enabled=True, facts_db=db_path) as sqlite_store:
+        assert sqlite_store.active
+        assert sqlite_store.backend == "sqlite"
+        fact = sqlite_store.record_fact(
             "Service handlers return normalized ISO timestamps.",
             source_paths=["service.py"],
             tags=["convention"],
         )
-        found = store.search("normalized ISO timestamps")
+        found = sqlite_store.search("normalized ISO timestamps")
         assert [f.fact_id for f in found] == [fact.fact_id]
-        by_path = store.list_for_paths(["service.py"])
+        by_path = sqlite_store.list_for_paths(["service.py"])
         assert [f.fact_id for f in by_path] == [fact.fact_id]
 
 
@@ -160,7 +349,7 @@ def test_missing_python_sqlite_degrades_gracefully_without_touching_existing_db(
     with pytest.raises(SqliteUnavailableError):
         SqliteFtsFactRepository(existing_db)
 
-    with open_project_fact_store(tmp_path, enabled=True) as store:
+    with open_project_fact_store(tmp_path, enabled=True, facts_db=existing_db) as store:
         assert store.enabled
         assert not store.available
         assert not store.active
@@ -174,6 +363,7 @@ def test_missing_python_sqlite_degrades_gracefully_without_touching_existing_db(
 
     assert existing_db.read_bytes() == sentinel
     assert existing_db.stat().st_mtime_ns == before_mtime
+    assert not (tmp_path / DEFAULT_FACTS_JSONL_FILENAME).exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == before_files
 
 
@@ -188,7 +378,9 @@ def test_missing_fts5_degrades_gracefully_without_touching_existing_db(tmp_path)
     with pytest.raises(Fts5UnavailableError):
         SqliteFtsFactRepository(existing_db, sqlite_module=no_fts5)
 
-    with open_project_fact_store(tmp_path, enabled=True, sqlite_module=no_fts5) as store:
+    with open_project_fact_store(
+        tmp_path, enabled=True, facts_db=existing_db, sqlite_module=no_fts5
+    ) as store:
         assert store.enabled
         assert not store.available
         assert not store.active
@@ -201,10 +393,11 @@ def test_missing_fts5_degrades_gracefully_without_touching_existing_db(tmp_path)
 
     assert existing_db.read_bytes() == sentinel
     assert existing_db.stat().st_mtime_ns == before_mtime
+    assert not (tmp_path / DEFAULT_FACTS_JSONL_FILENAME).exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == before_files
 
 
-@pytest.mark.parametrize("backend", ["fake", "sqlite"])
+@pytest.mark.parametrize("backend", ["fake", "jsonl", "sqlite"])
 def test_repository_add_search_list_for_paths_and_provenance(backend, tmp_path):
     wt_root = tmp_path / "repo"
     wt_root.mkdir()
@@ -212,6 +405,7 @@ def test_repository_add_search_list_for_paths_and_provenance(backend, tmp_path):
     (wt_root / "pkg" / "pricing.py").write_text("def cents(v): return int(v * 100)\n")
     (wt_root / "pkg" / "auth.py").write_text("def verify(tok): return bool(tok)\n")
     wt_id = worktree_scope_id(wt_root)
+    cid = chat_scope_id(wt_root)
 
     with _make_repository(backend, tmp_path) as repo:
         pricing_snaps = capture_source_snapshots(
@@ -227,6 +421,7 @@ def test_repository_add_search_list_for_paths_and_provenance(backend, tmp_path):
             tags=("money", "invariant"),
             commit_sha="abc1234",
             note="Confirmed in billing review",
+            chat_id=cid,
         )
         f_auth = ProjectFact.confirmed(
             worktree_id=wt_id,
@@ -234,11 +429,13 @@ def test_repository_add_search_list_for_paths_and_provenance(backend, tmp_path):
             sources=auth_snaps,
             origin="user:/fact",
             tags=("security",),
+            chat_id=cid,
         )
         f_candidate = ProjectFact.model_candidate(
             worktree_id=wt_id,
             statement="Monetary rounding uses banker's rounding in pricing.",
             sources=pricing_snaps,
+            chat_id=cid,
         )
 
         repo.add(f_pricing)
@@ -249,6 +446,7 @@ def test_repository_add_search_list_for_paths_and_provenance(backend, tmp_path):
         assert fetched == f_pricing
         assert fetched.provenance.commit_sha == "abc1234"
         assert fetched.provenance.note == "Confirmed in billing review"
+        assert fetched.provenance.chat_id == cid
         assert fetched.provenance.sources[0].symbol == "cents"
         assert fetched.provenance.sources[0].start_line == 1
 
@@ -277,7 +475,7 @@ def test_repository_add_search_list_for_paths_and_provenance(backend, tmp_path):
         assert repo.search("!!!", worktree_id=wt_id) == ()
 
 
-@pytest.mark.parametrize("backend", ["fake", "sqlite"])
+@pytest.mark.parametrize("backend", ["fake", "jsonl", "sqlite"])
 def test_worktree_isolation_and_bounded_top_k(backend, tmp_path):
     wt_a = tmp_path / "wt_a"
     wt_b = tmp_path / "wt_b"
@@ -373,7 +571,8 @@ def test_model_candidates_cannot_be_created_confirmed_and_require_explicit_confi
         assert [f.fact_id for f in store.search("caches results")] == [cand.fact_id]
 
 
-def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path):
+@pytest.mark.parametrize("backend", ["jsonl", "sqlite"])
+def test_compaction_restart_provenance_survival_and_source_invalidation(backend, tmp_path):
     (
         "Record a decision, drop it during ChatSummary compaction, "
         "restart, then edit/delete sources."
@@ -387,7 +586,12 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
     orig_deleted_hash = hashlib.sha256(src_deleted.read_bytes()).hexdigest()
     assert hash_worktree_file(tmp_path, "ledger.py") == orig_edited_hash
 
-    with open_project_fact_store(tmp_path, enabled=True) as store:
+    open_kwargs = (
+        {"facts_db": tmp_path / DEFAULT_FACTS_FILENAME} if backend == "sqlite" else {}
+    )
+    with open_project_fact_store(tmp_path, enabled=True, **open_kwargs) as store:
+        assert store.backend == backend
+        expected_chat_id = store.chat_id
         cmd_edited = store.handle_fact_command(
             "--file ledger.py --tag billing --symbol balance_cents "
             "Ledger balances must always be computed in integer cents.",
@@ -395,6 +599,7 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
         )
         assert cmd_edited.ok and cmd_edited.fact is not None
         fact_edited = cmd_edited.fact
+        assert fact_edited.provenance.chat_id == expected_chat_id
 
         cmd_deleted = store.handle_fact_command(
             "--file legacy_adapter.py Legacy export must preserve empty list contract.",
@@ -432,8 +637,9 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
     compacted_text = "\n".join(m["content"] for m in compacted)
     assert "integer cents" not in compacted_text
 
-    # Restart: open a fresh store instance pointing at the same worktree DB.
-    with open_project_fact_store(tmp_path, enabled=True) as restarted:
+    # Restart: open a fresh store instance pointing at the same worktree store.
+    with open_project_fact_store(tmp_path, enabled=True, **open_kwargs) as restarted:
+        assert restarted.backend == backend
         recalled = restarted.search("integer cents")
         assert len(recalled) == 1
         survived = recalled[0]
@@ -442,6 +648,7 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
         assert survived.is_active
         assert survived.source_hashes == {"ledger.py": orig_edited_hash}
         assert survived.provenance.origin == "user:/fact"
+        assert survived.provenance.chat_id == expected_chat_id
         assert survived.provenance.recorded_at == fact_edited.provenance.recorded_at
         assert survived.provenance.commit_sha == "d2f5965"
         assert survived.provenance.sources[0].symbol == "balance_cents"
@@ -460,6 +667,7 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
         assert "source hash changed" in stale_edited.stale_reason
         assert "ledger.py" in stale_edited.stale_reason
         assert stale_edited.source_hashes == {"ledger.py": orig_edited_hash}
+        assert stale_edited.provenance.chat_id == expected_chat_id
         assert stale_edited.provenance.recorded_at == fact_edited.provenance.recorded_at
 
         # Deleting a bound source file must also mark its fact stale while keeping
@@ -480,11 +688,11 @@ def test_compaction_restart_provenance_survival_and_source_invalidation(tmp_path
         assert stale_deleted.source_hashes == {"legacy_adapter.py": orig_deleted_hash}
 
 
-def test_atomic_rollback_and_read_only_mode(tmp_path):
+def test_atomic_rollback_and_read_only_mode(tmp_path, monkeypatch):
     (tmp_path / "mod.py").write_text("VAL = 10\n", encoding="utf-8")
     db_path = tmp_path / DEFAULT_FACTS_FILENAME
 
-    with open_project_fact_store(tmp_path, enabled=True) as store:
+    with open_project_fact_store(tmp_path, enabled=True, facts_db=db_path) as store:
         fact = store.record_fact("Module exposes VAL as integer.", source_paths=["mod.py"])
 
         # Force a mid-transaction failure during add() and confirm prior state survives atomically.
@@ -518,7 +726,9 @@ def test_atomic_rollback_and_read_only_mode(tmp_path):
 
     # Read-only mode must allow reads and in-memory staleness checks without mutating DB bytes.
     before_bytes = db_path.read_bytes()
-    with open_project_fact_store(tmp_path, enabled=True, read_only=True) as ro_store:
+    with open_project_fact_store(
+        tmp_path, enabled=True, facts_db=db_path, read_only=True
+    ) as ro_store:
         assert ro_store.active
         assert [f.fact_id for f in ro_store.search("VAL integer")] == [fact.fact_id]
         with pytest.raises(FactStoreReadOnlyError):
@@ -533,6 +743,145 @@ def test_atomic_rollback_and_read_only_mode(tmp_path):
         assert len(stale_view) == 1 and stale_view[0].is_stale
 
     assert db_path.read_bytes() == before_bytes
+
+    # JSONL atomic write preserves existing file on replace error and cleans temp file.
+    jsonl_dir = tmp_path / "jsonl_atomic"
+    jsonl_dir.mkdir()
+    (jsonl_dir / "mod.py").write_text("VAL = 10\n", encoding="utf-8")
+    jsonl_path = jsonl_dir / DEFAULT_FACTS_JSONL_FILENAME
+    with open_project_fact_store(jsonl_dir, enabled=True) as jstore:
+        jfact = jstore.record_fact("Original JSONL fact.", source_paths=["mod.py"])
+        original_jsonl_bytes = jsonl_path.read_bytes()
+
+        def _fail_replace(src, dst):
+            raise OSError("simulated atomic replace failure")
+
+        monkeypatch.setattr(os, "replace", _fail_replace)
+        with pytest.raises(FactStoreError):
+            jstore.record_fact("Should fail atomically.", source_paths=["mod.py"])
+
+    assert jsonl_path.read_bytes() == original_jsonl_bytes
+    assert [p.name for p in jsonl_dir.iterdir() if p.name.endswith(".tmp")] == []
+    with open_project_fact_store(jsonl_dir, enabled=True, read_only=True) as ro_jsonl:
+        assert ro_jsonl.active
+        assert [f.fact_id for f in ro_jsonl.search("Original JSONL")] == [jfact.fact_id]
+        with pytest.raises(FactStoreReadOnlyError):
+            ro_jsonl.record_fact("Blocked in read-only.", source_paths=["mod.py"])
+    assert jsonl_path.read_bytes() == original_jsonl_bytes
+
+
+def test_jsonl_malformed_and_missing_read_only_semantics(tmp_path):
+    missing = tmp_path / "missing.jsonl"
+    with pytest.raises(FactStoreError):
+        JsonlFactRepository(missing, read_only=True)
+    assert not missing.exists()
+
+    with open_project_fact_store(
+        tmp_path, enabled=True, facts_file=missing, read_only=True
+    ) as ro_missing:
+        assert not ro_missing.active
+        assert ro_missing.backend == "jsonl"
+        assert "read-only" in ro_missing.diagnostic.lower()
+    assert not missing.exists()
+
+    bad_json = tmp_path / "bad.jsonl"
+    bad_json.write_text("{not valid json\n", encoding="utf-8")
+    with pytest.raises(FactStoreError):
+        JsonlFactRepository(bad_json)
+
+    non_obj = tmp_path / "non_obj.jsonl"
+    non_obj.write_text('["not", "an", "object"]\n', encoding="utf-8")
+    with pytest.raises(FactStoreError):
+        JsonlFactRepository(non_obj)
+
+
+def test_sqlite_legacy_schema_migration_and_read_only_missing_chat_id(tmp_path):
+    legacy_db = tmp_path / "legacy.sqlite3"
+    wt_id = worktree_scope_id(tmp_path)
+    conn = real_sqlite3.connect(str(legacy_db))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE facts (
+            worktree_id TEXT NOT NULL,
+            fact_id TEXT NOT NULL,
+            statement TEXT NOT NULL,
+            verification TEXT NOT NULL,
+            status TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            commit_sha TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            stale_reason TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (worktree_id, fact_id)
+        );
+        CREATE TABLE fact_sources (
+            worktree_id TEXT NOT NULL,
+            fact_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            start_line INTEGER,
+            end_line INTEGER,
+            symbol TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (worktree_id, fact_id, seq)
+        );
+        CREATE VIRTUAL TABLE facts_fts USING fts5(
+            worktree_id UNINDEXED,
+            fact_id UNINDEXED,
+            statement,
+            tags,
+            paths,
+            symbols,
+            tokenize = 'unicode61'
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO facts (
+            worktree_id, fact_id, statement, verification, status,
+            origin, recorded_at, updated_at, commit_sha, note, tags_json, stale_reason
+        ) VALUES (?, ?, ?, 'confirmed', 'active', 'user:/fact',
+            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '', '', '[]', '')
+        """,
+        (wt_id, "legacy_1", "Legacy SQLite fact without chat_id column."),
+    )
+    conn.execute(
+        "INSERT INTO facts_fts VALUES (?, ?, ?, '', '', '')",
+        (wt_id, "legacy_1", "Legacy SQLite fact without chat_id column."),
+    )
+    conn.commit()
+    conn.close()
+
+    # Read-only open tolerates missing chat_id column as "" without modifying DB bytes.
+    before_bytes = legacy_db.read_bytes()
+    with open_project_fact_store(
+        tmp_path, enabled=True, facts_db=legacy_db, read_only=True
+    ) as ro_store:
+        assert ro_store.active
+        got = ro_store.get("legacy_1")
+        assert got is not None
+        assert got.provenance.chat_id == ""
+        found = ro_store.search("Legacy SQLite")
+        assert [f.fact_id for f in found] == ["legacy_1"]
+    assert legacy_db.read_bytes() == before_bytes
+
+    # Writable open runs safe idempotent ALTER TABLE migration and stores new chat_id.
+    with open_project_fact_store(tmp_path, enabled=True, facts_db=legacy_db) as rw_store:
+        assert rw_store.active
+        got = rw_store.get("legacy_1")
+        assert got is not None and got.provenance.chat_id == ""
+        added = rw_store.record_fact("Post-migration fact with chat_id.")
+        assert added.provenance.chat_id == rw_store.chat_id
+
+    # Re-opening again is idempotent.
+    with open_project_fact_store(tmp_path, enabled=True, facts_db=legacy_db) as reopened:
+        assert reopened.get("legacy_1") is not None
+        got_new = reopened.get(added.fact_id)
+        assert got_new is not None and got_new.provenance.chat_id == reopened.chat_id
 
 
 def test_parse_fact_command_args_and_path_guards_and_formatting(tmp_path):
@@ -582,19 +931,23 @@ def test_parse_fact_command_args_and_path_guards_and_formatting(tmp_path):
     assert len(format_facts_context([fact], max_chars=40)) <= 40
 
 
-def test_shared_custom_db_isolates_revalidation_between_worktrees(tmp_path):
+@pytest.mark.parametrize("backend", ["jsonl", "sqlite"])
+def test_shared_custom_store_isolates_revalidation_between_worktrees(backend, tmp_path):
     wt_a = tmp_path / "worktree_a"
     wt_b = tmp_path / "worktree_b"
     wt_a.mkdir()
     wt_b.mkdir()
-    shared_db = tmp_path / "shared.sqlite3"
+    shared_path = tmp_path / (f"shared.{backend}")
 
     (wt_a / "api.py").write_text("VERSION = 1\n", encoding="utf-8")
     (wt_b / "api.py").write_text("VERSION = 1\n", encoding="utf-8")
 
+    open_kwargs = (
+        {"facts_db": shared_path} if backend == "sqlite" else {"facts_file": shared_path}
+    )
     with (
-        open_project_fact_store(wt_a, enabled=True, facts_db=shared_db) as store_a,
-        open_project_fact_store(wt_b, enabled=True, facts_db=shared_db) as store_b,
+        open_project_fact_store(wt_a, enabled=True, **open_kwargs) as store_a,
+        open_project_fact_store(wt_b, enabled=True, **open_kwargs) as store_b,
     ):
         fact_a = store_a.record_fact("Worktree A uses schema v1.", source_paths=["api.py"])
         fact_b = store_b.record_fact("Worktree B uses schema v1.", source_paths=["api.py"])

@@ -449,6 +449,7 @@ def sanity_check_repo(repo, io):
 
 
 _VALID_LOCAL_CALLERS_BACKENDS = ("auto", "builtin", "cymbal")
+DEFAULT_FACTS_JSONL_FILENAME = ".aider.facts.jsonl"
 DEFAULT_FACTS_FILENAME = ".aider.facts.sqlite3"
 
 
@@ -588,28 +589,58 @@ def create_read_range_reader(root=None, *, backend="builtin", cymbal_client=None
     )
 
 
-def resolve_facts_db_path(facts_db=None, *, root=None):
-    """Compute the default project facts SQLite path without performing I/O."""
+def resolve_facts_db_path(facts_db=None, *, root=None, facts_file=None):
+    """Compute the default project facts path without performing I/O."""
     root_path = Path(root).expanduser().resolve() if root else Path.cwd().resolve()
     if facts_db is None or (isinstance(facts_db, str) and not facts_db.strip()):
-        return str(root_path / DEFAULT_FACTS_FILENAME)
-    candidate = Path(facts_db).expanduser()
+        if facts_file is None or (isinstance(facts_file, str) and not facts_file.strip()):
+            return str(root_path / DEFAULT_FACTS_JSONL_FILENAME)
+        raw_file = facts_file.strip() if isinstance(facts_file, str) else facts_file
+        candidate = Path(raw_file).expanduser()
+        if not candidate.is_absolute():
+            candidate = root_path / candidate
+        return str(candidate.resolve())
+    raw = facts_db.strip() if isinstance(facts_db, str) else str(facts_db).strip()
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+        if scheme.strip().lower() != "sqlite":
+            return raw
+        path_part = rest.split("?", 1)[0].split("#", 1)[0]
+        if not path_part or path_part == "/" or path_part.lstrip("/").lower() == ":memory:":
+            return raw
+        candidate = Path(path_part).expanduser()
+        if not candidate.is_absolute():
+            candidate = root_path / candidate
+        return str(candidate.resolve())
+    candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         candidate = root_path / candidate
     return str(candidate.resolve())
 
 
 def create_project_facts_store(
-    db_path=None, *, root=None, enabled=True, read_only=False, io=None
+    db_path=None,
+    *,
+    root=None,
+    enabled=True,
+    facts_file=None,
+    chat_history_file=None,
+    read_only=False,
+    io=None,
 ):
     """Open the worktree-scoped ProjectFactStore via aider.project_facts."""
     from aider.project_facts import open_project_fact_store
 
     root_path = Path(root).expanduser().resolve() if root is not None else Path.cwd().resolve()
+    effective_chat_history = chat_history_file
+    if effective_chat_history is None and io is not None:
+        effective_chat_history = getattr(io, "chat_history_file", None)
     store = open_project_fact_store(
         root_path,
         enabled=enabled,
         facts_db=db_path,
+        facts_file=facts_file,
+        chat_history_file=effective_chat_history,
         read_only=read_only,
     )
     if enabled and not store.active and store.diagnostic and io is not None:
@@ -629,12 +660,18 @@ def compose_local_context_kwargs(args, *, root=None, io=None):
     read_range_enabled = bool(getattr(args, "local_callers_read_range", False))
     facts_enabled = bool(getattr(args, "facts", False))
     facts_db = getattr(args, "facts_db", None)
+    facts_file = getattr(args, "facts_file", None)
+    chat_history_file = getattr(args, "chat_history_file", None)
+    if chat_history_file is None and io is not None:
+        chat_history_file = getattr(io, "chat_history_file", None)
 
     kwargs = {
         "local_callers_backend": backend,
         "local_callers_read_range": read_range_enabled,
         "facts": facts_enabled,
         "facts_db": facts_db,
+        "facts_file": facts_file,
+        "chat_history_file": chat_history_file,
     }
 
     cymbal_client = None
@@ -652,12 +689,28 @@ def compose_local_context_kwargs(args, *, root=None, io=None):
         )
 
     if facts_enabled:
-        store = create_project_facts_store(facts_db, root=root, enabled=True, io=io)
-        kwargs["facts_db"] = (
-            str(store.db_path)
-            if store.db_path is not None
-            else resolve_facts_db_path(facts_db, root=root)
+        store = create_project_facts_store(
+            facts_db,
+            root=root,
+            enabled=True,
+            facts_file=facts_file,
+            chat_history_file=chat_history_file,
+            io=io,
         )
+        has_facts_db = facts_db is not None and (
+            not isinstance(facts_db, str) or bool(facts_db.strip())
+        )
+        if has_facts_db:
+            kwargs["facts_db"] = (
+                str(store.storage_path) if store.storage_path is not None else facts_db
+            )
+        else:
+            kwargs["facts_db"] = None
+            kwargs["facts_file"] = (
+                str(store.storage_path)
+                if store.storage_path is not None
+                else resolve_facts_db_path(None, root=root, facts_file=facts_file)
+            )
         kwargs["facts_store"] = store
 
     return kwargs

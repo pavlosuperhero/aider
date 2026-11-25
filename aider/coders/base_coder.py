@@ -193,6 +193,8 @@ class Coder:
                 read_range_reader=from_coder.read_range_reader,
                 facts=from_coder.facts_enabled,
                 facts_db=from_coder.facts_db,
+                facts_file=from_coder.facts_file,
+                chat_history_file=from_coder.chat_history_file,
                 facts_store=from_coder.facts_store,
                 read_only_ranges=list(from_coder.read_only_ranges),
             )
@@ -378,6 +380,8 @@ class Coder:
         read_range_reader=None,
         facts=False,
         facts_db=None,
+        facts_file=None,
+        chat_history_file=None,
         facts_store=None,
         read_only_ranges=None,
     ):
@@ -408,6 +412,12 @@ class Coder:
         self.read_range_reader = read_range_reader
         self.facts_enabled = bool(facts)
         self.facts_db = facts_db
+        self.facts_file = facts_file
+        self.chat_history_file = (
+            chat_history_file
+            if chat_history_file is not None
+            else getattr(io, "chat_history_file", None)
+        )
         self.facts_store = facts_store
         self.read_only_ranges = list(read_only_ranges or ())
         self._turn_supplementary_evidence = ()
@@ -1210,14 +1220,24 @@ class Coder:
             return None
         from aider.main import create_project_facts_store
 
+        chat_history_file = (
+            self.chat_history_file
+            if self.chat_history_file is not None
+            else getattr(self.io, "chat_history_file", None)
+        )
         store = create_project_facts_store(
             self.facts_db,
             root=self.root,
             enabled=True,
+            facts_file=self.facts_file,
+            chat_history_file=chat_history_file,
             io=self.io,
         )
-        if store.db_path is not None:
-            self.facts_db = str(store.db_path)
+        if store.storage_path is not None:
+            if store.backend == "sqlite":
+                self.facts_db = str(store.storage_path)
+            elif store.backend == "jsonl":
+                self.facts_file = str(store.storage_path)
         self.facts_store = store
         if not store.active and store.diagnostic:
             self._facts_diagnostic_shown = True

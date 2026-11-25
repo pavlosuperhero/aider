@@ -1,16 +1,18 @@
-"""Worktree-scoped persistent project facts with SQLite FTS5 and source-hash invalidation.
+"""Worktree-scoped persistent project facts with JSONL default and SQLite FTS5 routing.
 
 Architecture (Repository Pattern / Clean Architecture):
 - Pure domain value objects (`SourceSnapshot`, `FactProvenance`, `ProjectFact`) and
   validation/formatting helpers have zero dependency on SQLite, Coder, or git CLI.
 - `FactRepository` defines the persistence port (`add`, `search`, `list_for_paths`,
-  `get`, `list_all`, `update_status`) with two interchangeable implementations:
-  `FakeFactRepository` (in-memory) and `SqliteFtsFactRepository` (embedded Python
-  `sqlite3` + FTS5 with atomic transactions and atomic initial DB creation).
+  `get`, `list_all`, `update_status`) with three interchangeable implementations:
+  `FakeFactRepository` (in-memory), `JsonlFactRepository` (zero-dependency UTF-8
+  JSONL with chat hash ID and atomic rewrites), and `SqliteFtsFactRepository`
+  (embedded Python `sqlite3` + FTS5 with atomic transactions and initial DB creation).
 - `ProjectFactStore` / `open_project_fact_store` orchestrates worktree isolation,
-  source-hash provenance capture and revalidation, explicit `/fact` confirmation,
-  unverified model-candidate separation, read-only enforcement, and graceful
-  degradation when disabled or when Python `sqlite3` / FTS5 is unavailable.
+  chat hash ID provenance, source-hash capture and revalidation, explicit `/fact`
+  confirmation, unverified model-candidate separation, read-only enforcement, and
+  graceful degradation when disabled, given an unsupported URL, or when Python
+  `sqlite3` / FTS5 is unavailable for `--facts-db`.
 """
 
 from __future__ import annotations
@@ -29,19 +31,21 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import unquote
 
 try:
     import sqlite3  # type: ignore[assignment]
 except ImportError:  # pragma: no cover - exercised via monkeypatching in tests
     sqlite3 = None  # type: ignore[assignment]
 
+DEFAULT_FACTS_JSONL_FILENAME = ".aider.facts.jsonl"
 DEFAULT_FACTS_FILENAME = ".aider.facts.sqlite3"
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 20
 MAX_FACT_STATEMENT_CHARS = 2000
 MAX_PROMPT_FACTS_CHARS = 4000
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _HASH_CHUNK_BYTES = 65536
 _MAX_QUERY_TOKENS = 32
@@ -72,6 +76,7 @@ _SCHEMA_STATEMENTS = (
         note TEXT NOT NULL DEFAULT '',
         tags_json TEXT NOT NULL DEFAULT '[]',
         stale_reason TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (worktree_id, fact_id)
     )
     """,
@@ -216,15 +221,118 @@ def worktree_scope_id(root: Path | str) -> str:
     return f"wt:{digest}"
 
 
+def chat_scope_id(
+    root: Path | str,
+    chat_history_file: Path | str | None = None,
+) -> str:
+    """Return a deterministic canonical chat hash ID ('chat:<16-char sha256 hex>')."""
+    root_real = os.path.realpath(str(Path(root).expanduser()))
+    if chat_history_file is None or (
+        isinstance(chat_history_file, str) and not chat_history_file.strip()
+    ):
+        history_candidate = Path(root_real) / ".aider.chat.history.md"
+    else:
+        raw_history = (
+            chat_history_file.strip()
+            if isinstance(chat_history_file, str)
+            else chat_history_file
+        )
+        history_path = Path(raw_history).expanduser()
+        if not history_path.is_absolute():
+            history_candidate = Path(root_real) / history_path
+        else:
+            history_candidate = history_path
+    history_real = os.path.realpath(str(history_candidate))
+    payload = f"{root_real}\x00{history_real}".encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    return f"chat:{digest}"
+
+
+def resolve_facts_jsonl_path(
+    root: Path | str,
+    facts_file: Path | str | None = None,
+) -> Path:
+    """Resolve the JSONL facts path for a worktree (defaulting to `.aider.facts.jsonl`)."""
+    root_path = Path(root).expanduser().resolve()
+    if facts_file is None or (isinstance(facts_file, str) and not facts_file.strip()):
+        return root_path / DEFAULT_FACTS_JSONL_FILENAME
+    raw = facts_file.strip() if isinstance(facts_file, str) else facts_file
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root_path / candidate
+    return candidate.resolve()
+
+
+def parse_facts_db_url(root: Path | str, facts_db: Path | str) -> Path:
+    """Parse a local SQLite file path or sqlite:// URL into a resolved filesystem Path."""
+    if isinstance(facts_db, Path):
+        raw = str(facts_db).strip()
+    elif isinstance(facts_db, str):
+        raw = facts_db.strip()
+    else:
+        raise FactValidationError(
+            f"Database path/URL must be a string or Path, got {type(facts_db).__name__}"
+        )
+    if not raw or "\x00" in raw:
+        raise FactValidationError("Database path/URL must be a non-empty string.")
+    if raw.lower() == ":memory:":
+        raise FactValidationError(
+            "In-memory SQLite databases (':memory:') are not supported for project facts."
+        )
+
+    root_path = Path(root).expanduser().resolve()
+
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+        scheme_lower = scheme.strip().lower()
+        if scheme_lower != "sqlite":
+            raise FactValidationError(
+                f"Unsupported database URL scheme {scheme!r}; "
+                "only local file paths and 'sqlite://' URLs are supported."
+            )
+        path_part, _, query_and_frag = rest.partition("?")
+        path_part = path_part.split("#", 1)[0]
+        if "mode=memory" in query_and_frag.lower():
+            raise FactValidationError(
+                "In-memory SQLite URLs are not supported for project facts."
+            )
+        path_part = unquote(path_part)
+        if not path_part or path_part == "/" or path_part.lstrip("/").lower() == ":memory:":
+            raise FactValidationError(
+                f"Invalid SQLite database URL {facts_db!r}: expected a filesystem path."
+            )
+        if path_part.startswith("//"):
+            stripped = path_part.lstrip("/")
+            if not stripped or stripped.lower() == ":memory:":
+                raise FactValidationError(
+                    f"Invalid SQLite database URL {facts_db!r}: expected a filesystem path."
+                )
+            path_part = "/" + stripped
+        if path_part.startswith("/") and _WINDOWS_DRIVE_RE.match(path_part[1:]):
+            path_part = path_part[1:]
+        candidate = Path(path_part).expanduser()
+        if not candidate.is_absolute():
+            candidate = root_path / candidate
+        return candidate.resolve()
+
+    if raw.lower().startswith(("sqlite:", "file:")):
+        raise FactValidationError(
+            f"Unsupported database URL format {facts_db!r}; "
+            "use a file path, 'sqlite:///abs/path', or 'sqlite://rel/path'."
+        )
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root_path / candidate
+    return candidate.resolve()
+
+
 def resolve_facts_db_path(root: Path | str, facts_db: Path | str | None = None) -> Path:
     """Resolve the database path for a worktree (defaulting to `.aider.facts.sqlite3`)."""
     root_path = Path(root).expanduser().resolve()
     if facts_db is None or (isinstance(facts_db, str) and not facts_db.strip()):
         return root_path / DEFAULT_FACTS_FILENAME
-    candidate = Path(facts_db).expanduser()
-    if not candidate.is_absolute():
-        candidate = root_path / candidate
-    return candidate.resolve()
+    return parse_facts_db_url(root_path, facts_db)
 
 
 def _resolve_worktree_file(root: Path | str, rel_path: str) -> tuple[Path, Path]:
@@ -286,6 +394,48 @@ class SourceSnapshot:
                 raise FactValidationError("end_line must be >= start_line")
         object.__setattr__(self, "symbol", (self.symbol or "").strip())
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "sha256": self.sha256,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "symbol": self.symbol,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SourceSnapshot:
+        if not isinstance(data, Mapping):
+            raise FactValidationError("Source snapshot record must be a mapping.")
+        path = data.get("path")
+        if not isinstance(path, str):
+            raise FactValidationError("Source snapshot 'path' must be a string.")
+        sha256 = data.get("sha256", "")
+        if sha256 is None:
+            sha256 = ""
+        if not isinstance(sha256, str):
+            raise FactValidationError("Source snapshot 'sha256' must be a string.")
+        start_line = data.get("start_line")
+        if start_line is not None and (
+            isinstance(start_line, bool) or not isinstance(start_line, int)
+        ):
+            raise FactValidationError("Source snapshot 'start_line' must be an integer or null.")
+        end_line = data.get("end_line")
+        if end_line is not None and (isinstance(end_line, bool) or not isinstance(end_line, int)):
+            raise FactValidationError("Source snapshot 'end_line' must be an integer or null.")
+        symbol = data.get("symbol", "")
+        if symbol is None:
+            symbol = ""
+        if not isinstance(symbol, str):
+            raise FactValidationError("Source snapshot 'symbol' must be a string.")
+        return cls(
+            path=path,
+            sha256=sha256,
+            start_line=start_line,
+            end_line=end_line,
+            symbol=symbol,
+        )
+
 
 def capture_source_snapshots(
     root: Path | str,
@@ -331,6 +481,7 @@ class FactProvenance:
     sources: tuple[SourceSnapshot, ...] = ()
     commit_sha: str = ""
     note: str = ""
+    chat_id: str = ""
 
     def __post_init__(self) -> None:
         origin = (self.origin or "").strip()
@@ -348,6 +499,62 @@ class FactProvenance:
         object.__setattr__(self, "sources", tuple(self.sources))
         object.__setattr__(self, "commit_sha", (self.commit_sha or "").strip())
         object.__setattr__(self, "note", (self.note or "").strip())
+        object.__setattr__(self, "chat_id", (self.chat_id or "").strip())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "origin": self.origin,
+            "worktree_id": self.worktree_id,
+            "recorded_at": self.recorded_at,
+            "sources": [src.to_dict() for src in self.sources],
+            "commit_sha": self.commit_sha,
+            "note": self.note,
+            "chat_id": self.chat_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> FactProvenance:
+        if not isinstance(data, Mapping):
+            raise FactValidationError("Fact provenance record must be a mapping.")
+        origin = data.get("origin")
+        worktree_id = data.get("worktree_id")
+        recorded_at = data.get("recorded_at")
+        if not isinstance(origin, str):
+            raise FactValidationError("Fact provenance 'origin' must be a string.")
+        if not isinstance(worktree_id, str):
+            raise FactValidationError("Fact provenance 'worktree_id' must be a string.")
+        if not isinstance(recorded_at, str):
+            raise FactValidationError("Fact provenance 'recorded_at' must be a string.")
+        raw_sources = data.get("sources", ())
+        if raw_sources is None:
+            raw_sources = ()
+        if not isinstance(raw_sources, (list, tuple)):
+            raise FactValidationError("Fact provenance 'sources' must be a list.")
+        sources = tuple(SourceSnapshot.from_dict(item) for item in raw_sources)
+        commit_sha = data.get("commit_sha", "")
+        if commit_sha is None:
+            commit_sha = ""
+        if not isinstance(commit_sha, str):
+            raise FactValidationError("Fact provenance 'commit_sha' must be a string.")
+        note = data.get("note", "")
+        if note is None:
+            note = ""
+        if not isinstance(note, str):
+            raise FactValidationError("Fact provenance 'note' must be a string.")
+        chat_id = data.get("chat_id", "")
+        if chat_id is None:
+            chat_id = ""
+        if not isinstance(chat_id, str):
+            raise FactValidationError("Fact provenance 'chat_id' must be a string.")
+        return cls(
+            origin=origin,
+            worktree_id=worktree_id,
+            recorded_at=recorded_at,
+            sources=sources,
+            commit_sha=commit_sha,
+            note=note,
+            chat_id=chat_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -425,6 +632,7 @@ class ProjectFact:
         tags: Sequence[str] = (),
         commit_sha: str = "",
         note: str = "",
+        chat_id: str = "",
         fact_id: str | None = None,
         recorded_at: str | None = None,
     ) -> ProjectFact:
@@ -443,6 +651,7 @@ class ProjectFact:
                 sources=tuple(sources),
                 commit_sha=commit_sha,
                 note=note,
+                chat_id=chat_id,
             ),
             tags=tuple(tags),
             updated_at=ts,
@@ -459,6 +668,7 @@ class ProjectFact:
         tags: Sequence[str] = (),
         commit_sha: str = "",
         note: str = "",
+        chat_id: str = "",
         fact_id: str | None = None,
         recorded_at: str | None = None,
     ) -> ProjectFact:
@@ -477,10 +687,85 @@ class ProjectFact:
                 sources=tuple(sources),
                 commit_sha=commit_sha,
                 note=note,
+                chat_id=chat_id,
             ),
             tags=tuple(tags),
             updated_at=ts,
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "worktree_id": self.worktree_id,
+            "chat_id": self.provenance.chat_id,
+            "statement": self.statement,
+            "verification": self.verification.value,
+            "status": self.status.value,
+            "provenance": self.provenance.to_dict(),
+            "tags": list(self.tags),
+            "stale_reason": self.stale_reason,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ProjectFact:
+        if not isinstance(data, Mapping):
+            raise FactValidationError("ProjectFact record must be a mapping.")
+        fact_id = data.get("fact_id")
+        worktree_id = data.get("worktree_id")
+        statement = data.get("statement")
+        if not isinstance(fact_id, str):
+            raise FactValidationError("ProjectFact 'fact_id' must be a string.")
+        if not isinstance(worktree_id, str):
+            raise FactValidationError("ProjectFact 'worktree_id' must be a string.")
+        if not isinstance(statement, str):
+            raise FactValidationError("ProjectFact 'statement' must be a string.")
+        prov_raw = data.get("provenance")
+        if not isinstance(prov_raw, Mapping):
+            raise FactValidationError("ProjectFact 'provenance' must be a mapping.")
+        provenance = FactProvenance.from_dict(prov_raw)
+        top_chat_id = data.get("chat_id", "")
+        if top_chat_id is None:
+            top_chat_id = ""
+        if not isinstance(top_chat_id, str):
+            raise FactValidationError("ProjectFact 'chat_id' must be a string.")
+        top_chat_id = top_chat_id.strip()
+        if top_chat_id and not provenance.chat_id:
+            provenance = replace(provenance, chat_id=top_chat_id)
+        verification = data.get("verification", VerificationState.UNVERIFIED.value)
+        status = data.get("status", FactStatus.ACTIVE.value)
+        raw_tags = data.get("tags", ())
+        if raw_tags is None:
+            raw_tags = ()
+        if not isinstance(raw_tags, (list, tuple)) or any(
+            not isinstance(tag, str) for tag in raw_tags
+        ):
+            raise FactValidationError("ProjectFact 'tags' must be a list of strings.")
+        stale_reason = data.get("stale_reason", "")
+        if stale_reason is None:
+            stale_reason = ""
+        if not isinstance(stale_reason, str):
+            raise FactValidationError("ProjectFact 'stale_reason' must be a string.")
+        updated_at = data.get("updated_at", "")
+        if updated_at is None:
+            updated_at = ""
+        if not isinstance(updated_at, str):
+            raise FactValidationError("ProjectFact 'updated_at' must be a string.")
+        return cls(
+            fact_id=fact_id,
+            worktree_id=worktree_id,
+            statement=statement,
+            provenance=provenance,
+            verification=VerificationState(str(verification)),
+            status=FactStatus(str(status)),
+            tags=tuple(raw_tags),
+            stale_reason=stale_reason,
+            updated_at=updated_at,
+        )
+
+    @property
+    def chat_id(self) -> str:
+        return self.provenance.chat_id
 
     @property
     def is_confirmed(self) -> bool:
@@ -674,6 +959,123 @@ class FactRepository(abc.ABC):
         self.close()
 
 
+def _matches_fact_filters(
+    fact: ProjectFact,
+    *,
+    worktree_id: str,
+    include_unverified: bool,
+    include_stale: bool,
+) -> bool:
+    if fact.worktree_id != worktree_id:
+        return False
+    if not include_unverified and fact.verification != VerificationState.CONFIRMED:
+        return False
+    if not include_stale and fact.status != FactStatus.ACTIVE:
+        return False
+    return True
+
+
+def _search_facts_collection(
+    facts: Iterable[ProjectFact],
+    query: str,
+    *,
+    worktree_id: str,
+    limit: int,
+    include_unverified: bool,
+    include_stale: bool,
+) -> tuple[ProjectFact, ...]:
+    tokens = _tokenize_query(query)
+    if limit == 0 or not tokens:
+        return ()
+
+    scored: list[tuple[int, str, str, ProjectFact]] = []
+    for fact in facts:
+        if not _matches_fact_filters(
+            fact,
+            worktree_id=worktree_id,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        ):
+            continue
+        corpus = " ".join(
+            (
+                fact.statement,
+                " ".join(fact.tags),
+                " ".join(s.path for s in fact.provenance.sources),
+                " ".join(s.symbol for s in fact.provenance.sources if s.symbol),
+            )
+        )
+        doc_tokens = _tokenize_text(corpus)
+        if not doc_tokens:
+            continue
+        doc_token_set = set(doc_tokens)
+        if not all(tok in doc_token_set for tok in tokens):
+            continue
+        hits = sum(doc_tokens.count(tok) for tok in tokens)
+        scored.append((hits, fact.updated_at, fact.fact_id, fact))
+
+    # Sort primary by hits desc, then updated_at desc, then fact_id asc.
+    scored.sort(key=lambda item: item[2])
+    scored.sort(key=lambda item: item[1], reverse=True)
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return tuple(item[3] for item in scored[:limit])
+
+
+def _list_facts_collection_for_paths(
+    facts: Iterable[ProjectFact],
+    paths: Sequence[str],
+    *,
+    worktree_id: str,
+    limit: int,
+    include_unverified: bool,
+    include_stale: bool,
+) -> tuple[ProjectFact, ...]:
+    normalized_paths = {normalize_rel_path(p) for p in paths}
+    if limit == 0 or not normalized_paths:
+        return ()
+
+    matched: list[tuple[int, str, str, ProjectFact]] = []
+    for fact in facts:
+        if not _matches_fact_filters(
+            fact,
+            worktree_id=worktree_id,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        ):
+            continue
+        overlap = len(normalized_paths.intersection(fact.source_paths))
+        if overlap <= 0:
+            continue
+        matched.append((overlap, fact.updated_at, fact.fact_id, fact))
+
+    matched.sort(key=lambda item: item[2])
+    matched.sort(key=lambda item: item[1], reverse=True)
+    matched.sort(key=lambda item: item[0], reverse=True)
+    return tuple(item[3] for item in matched[:limit])
+
+
+def _list_all_facts_collection(
+    facts: Iterable[ProjectFact],
+    *,
+    worktree_id: str,
+    include_unverified: bool,
+    include_stale: bool,
+) -> tuple[ProjectFact, ...]:
+    items = [
+        fact
+        for fact in facts
+        if _matches_fact_filters(
+            fact,
+            worktree_id=worktree_id,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
+    ]
+    items.sort(key=lambda f: f.fact_id)
+    items.sort(key=lambda f: f.updated_at, reverse=True)
+    return tuple(items)
+
+
 class FakeFactRepository(FactRepository):
     """In-memory Repository Pattern implementation with worktree isolation and bounded top-K."""
 
@@ -700,22 +1102,6 @@ class FakeFactRepository(FactRepository):
     def get(self, fact_id: str, *, worktree_id: str) -> ProjectFact | None:
         return self._facts.get((worktree_id, fact_id))
 
-    def _matches_filters(
-        self,
-        fact: ProjectFact,
-        *,
-        worktree_id: str,
-        include_unverified: bool,
-        include_stale: bool,
-    ) -> bool:
-        if fact.worktree_id != worktree_id:
-            return False
-        if not include_unverified and fact.verification != VerificationState.CONFIRMED:
-            return False
-        if not include_stale and fact.status != FactStatus.ACTIVE:
-            return False
-        return True
-
     def search(
         self,
         query: str,
@@ -726,41 +1112,14 @@ class FakeFactRepository(FactRepository):
         include_stale: bool = False,
     ) -> tuple[ProjectFact, ...]:
         limit = _bound_top_k(top_k, max_top_k=self._max_top_k)
-        tokens = _tokenize_query(query)
-        if limit == 0 or not tokens:
-            return ()
-
-        scored: list[tuple[int, str, str, ProjectFact]] = []
-        for fact in self._facts.values():
-            if not self._matches_filters(
-                fact,
-                worktree_id=worktree_id,
-                include_unverified=include_unverified,
-                include_stale=include_stale,
-            ):
-                continue
-            corpus = " ".join(
-                (
-                    fact.statement,
-                    " ".join(fact.tags),
-                    " ".join(s.path for s in fact.provenance.sources),
-                    " ".join(s.symbol for s in fact.provenance.sources if s.symbol),
-                )
-            )
-            doc_tokens = _tokenize_text(corpus)
-            if not doc_tokens:
-                continue
-            doc_token_set = set(doc_tokens)
-            if not all(tok in doc_token_set for tok in tokens):
-                continue
-            hits = sum(doc_tokens.count(tok) for tok in tokens)
-            scored.append((hits, fact.updated_at, fact.fact_id, fact))
-
-        # Sort primary by hits desc, then updated_at desc, then fact_id asc.
-        scored.sort(key=lambda item: item[2])
-        scored.sort(key=lambda item: item[1], reverse=True)
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return tuple(item[3] for item in scored[:limit])
+        return _search_facts_collection(
+            self._facts.values(),
+            query,
+            worktree_id=worktree_id,
+            limit=limit,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
 
     def list_for_paths(
         self,
@@ -772,28 +1131,14 @@ class FakeFactRepository(FactRepository):
         include_stale: bool = False,
     ) -> tuple[ProjectFact, ...]:
         limit = _bound_top_k(top_k, max_top_k=self._max_top_k)
-        normalized_paths = {normalize_rel_path(p) for p in paths}
-        if limit == 0 or not normalized_paths:
-            return ()
-
-        matched: list[tuple[int, str, str, ProjectFact]] = []
-        for fact in self._facts.values():
-            if not self._matches_filters(
-                fact,
-                worktree_id=worktree_id,
-                include_unverified=include_unverified,
-                include_stale=include_stale,
-            ):
-                continue
-            overlap = len(normalized_paths.intersection(fact.source_paths))
-            if overlap <= 0:
-                continue
-            matched.append((overlap, fact.updated_at, fact.fact_id, fact))
-
-        matched.sort(key=lambda item: item[2])
-        matched.sort(key=lambda item: item[1], reverse=True)
-        matched.sort(key=lambda item: item[0], reverse=True)
-        return tuple(item[3] for item in matched[:limit])
+        return _list_facts_collection_for_paths(
+            self._facts.values(),
+            paths,
+            worktree_id=worktree_id,
+            limit=limit,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
 
     def list_all(
         self,
@@ -802,19 +1147,12 @@ class FakeFactRepository(FactRepository):
         include_unverified: bool = True,
         include_stale: bool = True,
     ) -> tuple[ProjectFact, ...]:
-        items = [
-            fact
-            for fact in self._facts.values()
-            if self._matches_filters(
-                fact,
-                worktree_id=worktree_id,
-                include_unverified=include_unverified,
-                include_stale=include_stale,
-            )
-        ]
-        items.sort(key=lambda f: f.fact_id)
-        items.sort(key=lambda f: f.updated_at, reverse=True)
-        return tuple(items)
+        return _list_all_facts_collection(
+            self._facts.values(),
+            worktree_id=worktree_id,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
 
     def update_status(
         self,
@@ -829,13 +1167,235 @@ class FakeFactRepository(FactRepository):
         existing = self._facts.get((worktree_id, fact_id))
         if existing is None:
             return None
+        new_status = status if isinstance(status, FactStatus) else FactStatus(str(status))
         updated = replace(
             existing,
-            status=status,
-            stale_reason=stale_reason,
+            status=new_status,
+            stale_reason=stale_reason.strip(),
             updated_at=updated_at or _utc_now_iso(),
         )
         self._facts[(worktree_id, fact_id)] = updated
+        return updated
+
+
+class JsonlFactRepository(FactRepository):
+    """Zero-dependency UTF-8 JSONL Repository Pattern implementation with atomic rewrites."""
+
+    def __init__(
+        self,
+        file_path: Path | str,
+        *,
+        max_top_k: int = MAX_TOP_K,
+        read_only: bool = False,
+    ) -> None:
+        self._file_path = Path(file_path).expanduser().resolve()
+        self._max_top_k = max(1, min(int(max_top_k), MAX_TOP_K))
+        self._read_only = bool(read_only)
+
+        if self._read_only and not self._file_path.exists():
+            raise FactStoreError(
+                f"Project facts file does not exist in read-only mode: {self._file_path}"
+            )
+
+        if not self._read_only and not self._file_path.exists():
+            self._ensure_file_initialized()
+
+        if self._file_path.exists():
+            self._load_facts()
+
+    @property
+    def file_path(self) -> Path:
+        return self._file_path
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def _ensure_writable(self) -> None:
+        if self._read_only:
+            raise FactStoreReadOnlyError("Project fact repository is read-only.")
+
+    def _ensure_file_initialized(self) -> None:
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(
+                str(self._file_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o666,
+            )
+        except FileExistsError:
+            return
+        except OSError as exc:
+            raise FactStoreError(
+                f"Failed to create project facts file at {self._file_path}: {exc}"
+            ) from exc
+        else:
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def _load_facts(self) -> dict[tuple[str, str], ProjectFact]:
+        if not self._file_path.exists():
+            if self._read_only:
+                raise FactStoreError(
+                    f"Project facts file does not exist in read-only mode: {self._file_path}"
+                )
+            return {}
+        facts: dict[tuple[str, str], ProjectFact] = {}
+        try:
+            with self._file_path.open("r", encoding="utf-8") as handle:
+                for lineno, raw_line in enumerate(handle, start=1):
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        payload = json.loads(stripped)
+                    except ValueError as exc:
+                        raise FactStoreError(
+                            f"Malformed JSONL in {self._file_path} at line {lineno}: {exc}"
+                        ) from exc
+                    if not isinstance(payload, dict):
+                        raise FactStoreError(
+                            f"Malformed JSONL record in {self._file_path} at line {lineno}: "
+                            "expected a JSON object."
+                        )
+                    try:
+                        fact = ProjectFact.from_dict(payload)
+                    except (FactValidationError, KeyError, TypeError, ValueError) as exc:
+                        raise FactStoreError(
+                            f"Invalid project fact record in {self._file_path} "
+                            f"at line {lineno}: {exc}"
+                        ) from exc
+                    facts[(fact.worktree_id, fact.fact_id)] = fact
+        except FactStoreError:
+            raise
+        except (OSError, UnicodeDecodeError) as exc:
+            raise FactStoreError(
+                f"Failed to read project facts file at {self._file_path}: {exc}"
+            ) from exc
+        return facts
+
+    def _write_facts(self, facts: dict[tuple[str, str], ProjectFact]) -> None:
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        ordered = sorted(facts.values(), key=lambda f: (f.worktree_id, f.fact_id))
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self._file_path.name}.",
+            suffix=".tmp",
+            dir=str(self._file_path.parent),
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                for fact in ordered:
+                    line = json.dumps(
+                        fact.to_dict(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self._file_path)
+        except Exception as exc:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            if isinstance(exc, FactStoreError):
+                raise
+            raise FactStoreError(
+                f"Failed to write project facts file at {self._file_path}: {exc}"
+            ) from exc
+
+    def add(self, fact: ProjectFact) -> ProjectFact:
+        self._ensure_writable()
+        if not isinstance(fact, ProjectFact):
+            raise FactValidationError("Expected a ProjectFact instance.")
+        facts = self._load_facts()
+        facts[(fact.worktree_id, fact.fact_id)] = fact
+        self._write_facts(facts)
+        return fact
+
+    def get(self, fact_id: str, *, worktree_id: str) -> ProjectFact | None:
+        return self._load_facts().get((worktree_id, fact_id))
+
+    def search(
+        self,
+        query: str,
+        *,
+        worktree_id: str,
+        top_k: int = DEFAULT_TOP_K,
+        include_unverified: bool = False,
+        include_stale: bool = False,
+    ) -> tuple[ProjectFact, ...]:
+        limit = _bound_top_k(top_k, max_top_k=self._max_top_k)
+        return _search_facts_collection(
+            self._load_facts().values(),
+            query,
+            worktree_id=worktree_id,
+            limit=limit,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
+
+    def list_for_paths(
+        self,
+        paths: Sequence[str],
+        *,
+        worktree_id: str,
+        top_k: int = DEFAULT_TOP_K,
+        include_unverified: bool = False,
+        include_stale: bool = False,
+    ) -> tuple[ProjectFact, ...]:
+        limit = _bound_top_k(top_k, max_top_k=self._max_top_k)
+        return _list_facts_collection_for_paths(
+            self._load_facts().values(),
+            paths,
+            worktree_id=worktree_id,
+            limit=limit,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
+
+    def list_all(
+        self,
+        *,
+        worktree_id: str,
+        include_unverified: bool = True,
+        include_stale: bool = True,
+    ) -> tuple[ProjectFact, ...]:
+        return _list_all_facts_collection(
+            self._load_facts().values(),
+            worktree_id=worktree_id,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )
+
+    def update_status(
+        self,
+        fact_id: str,
+        *,
+        worktree_id: str,
+        status: FactStatus,
+        stale_reason: str = "",
+        updated_at: str | None = None,
+    ) -> ProjectFact | None:
+        self._ensure_writable()
+        facts = self._load_facts()
+        existing = facts.get((worktree_id, fact_id))
+        if existing is None:
+            return None
+        new_status = status if isinstance(status, FactStatus) else FactStatus(str(status))
+        updated = replace(
+            existing,
+            status=new_status,
+            stale_reason=stale_reason.strip(),
+            updated_at=updated_at or _utc_now_iso(),
+        )
+        facts[(worktree_id, fact_id)] = updated
+        self._write_facts(facts)
         return updated
 
 
@@ -870,6 +1430,7 @@ class SqliteFtsFactRepository(FactRepository):
         if not self._read_only:
             self._ensure_database_initialized()
         self._conn = self._open_connection()
+        self._has_chat_id_column = self._detect_chat_id_column(self._conn)
 
     @property
     def db_path(self) -> Path:
@@ -882,6 +1443,10 @@ class SqliteFtsFactRepository(FactRepository):
     def _ensure_writable(self) -> None:
         if self._read_only:
             raise FactStoreReadOnlyError("Project fact repository is read-only.")
+
+    def _detect_chat_id_column(self, conn: Any) -> bool:
+        rows = conn.execute("PRAGMA table_info(facts)").fetchall()
+        return any(row["name"] == "chat_id" for row in rows)
 
     def _configure_connection(self, conn: Any) -> None:
         conn.row_factory = self._sqlite.Row
@@ -898,6 +1463,8 @@ class SqliteFtsFactRepository(FactRepository):
         try:
             for statement in _SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            if not self._detect_chat_id_column(conn):
+                conn.execute("ALTER TABLE facts ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
@@ -1026,6 +1593,7 @@ class SqliteFtsFactRepository(FactRepository):
             except (TypeError, ValueError):
                 tags = ()
             fact_sources = tuple(sources_by_fact.get(row["fact_id"], ()))
+            chat_id = row["chat_id"] if "chat_id" in row.keys() else ""
             hydrated.append(
                 ProjectFact(
                     fact_id=row["fact_id"],
@@ -1040,6 +1608,7 @@ class SqliteFtsFactRepository(FactRepository):
                         sources=fact_sources,
                         commit_sha=row["commit_sha"],
                         note=row["note"],
+                        chat_id=chat_id or "",
                     ),
                     tags=tags,
                     stale_reason=row["stale_reason"],
@@ -1084,8 +1653,9 @@ class SqliteFtsFactRepository(FactRepository):
                     commit_sha,
                     note,
                     tags_json,
-                    stale_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stale_reason,
+                    chat_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fact.worktree_id,
@@ -1100,6 +1670,7 @@ class SqliteFtsFactRepository(FactRepository):
                     fact.provenance.note,
                     tags_json,
                     fact.stale_reason,
+                    fact.provenance.chat_id,
                 ),
             )
             for seq, source in enumerate(fact.provenance.sources):
@@ -1158,8 +1729,9 @@ class SqliteFtsFactRepository(FactRepository):
 
     def get(self, fact_id: str, *, worktree_id: str) -> ProjectFact | None:
         conn = self._require_conn()
+        chat_id_expr = "chat_id" if self._has_chat_id_column else "'' AS chat_id"
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 worktree_id,
                 fact_id,
@@ -1172,7 +1744,8 @@ class SqliteFtsFactRepository(FactRepository):
                 commit_sha,
                 note,
                 tags_json,
-                stale_reason
+                stale_reason,
+                {chat_id_expr}
             FROM facts
             WHERE worktree_id = ? AND fact_id = ?
             """,
@@ -1207,6 +1780,7 @@ class SqliteFtsFactRepository(FactRepository):
         params.append(limit)
 
         conn = self._require_conn()
+        chat_id_expr = "f.chat_id" if self._has_chat_id_column else "'' AS chat_id"
         rows = conn.execute(
             f"""
             SELECT
@@ -1221,7 +1795,8 @@ class SqliteFtsFactRepository(FactRepository):
                 f.commit_sha,
                 f.note,
                 f.tags_json,
-                f.stale_reason
+                f.stale_reason,
+                {chat_id_expr}
             FROM facts_fts
             CROSS JOIN facts AS f
               ON f.worktree_id = facts_fts.worktree_id
@@ -1260,6 +1835,7 @@ class SqliteFtsFactRepository(FactRepository):
         params.append(limit)
 
         conn = self._require_conn()
+        chat_id_expr = "f.chat_id" if self._has_chat_id_column else "'' AS chat_id"
         rows = conn.execute(
             f"""
             SELECT
@@ -1275,6 +1851,7 @@ class SqliteFtsFactRepository(FactRepository):
                 f.note,
                 f.tags_json,
                 f.stale_reason,
+                {chat_id_expr},
                 COUNT(DISTINCT fs.path) AS match_count
             FROM facts AS f
             JOIN fact_sources AS fs
@@ -1306,6 +1883,7 @@ class SqliteFtsFactRepository(FactRepository):
             params.append(FactStatus.ACTIVE.value)
 
         conn = self._require_conn()
+        chat_id_expr = "chat_id" if self._has_chat_id_column else "'' AS chat_id"
         rows = conn.execute(
             f"""
             SELECT
@@ -1320,7 +1898,8 @@ class SqliteFtsFactRepository(FactRepository):
                 commit_sha,
                 note,
                 tags_json,
-                stale_reason
+                stale_reason,
+                {chat_id_expr}
             FROM facts
             WHERE {" AND ".join(clauses)}
             ORDER BY updated_at DESC, fact_id ASC
@@ -1537,6 +2116,8 @@ def format_facts_context(
             src_parts.append(loc)
 
         provenance_bits = [f"origin={fact.provenance.origin}"]
+        if fact.provenance.chat_id:
+            provenance_bits.append(f"chat={fact.provenance.chat_id}")
         if src_parts:
             provenance_bits.append("sources=" + ", ".join(src_parts))
         if fact.stale_reason:
@@ -1568,17 +2149,37 @@ class ProjectFactStore:
         enabled: bool,
         available: bool,
         repository: FactRepository | None = None,
+        storage_path: Path | None = None,
         db_path: Path | None = None,
+        backend: str = "",
+        chat_id: str | None = None,
+        chat_history_file: Path | str | None = None,
         diagnostic: str = "",
         read_only: bool = False,
         max_top_k: int = MAX_TOP_K,
     ) -> None:
         self._root = Path(root).expanduser().resolve()
         self._worktree_id = worktree_scope_id(self._root)
+        resolved_chat = (chat_id or "").strip()
+        self._chat_id = (
+            resolved_chat if resolved_chat else chat_scope_id(self._root, chat_history_file)
+        )
         self._enabled = bool(enabled)
         self._available = bool(available and repository is not None)
         self._repository = repository
-        self._db_path = db_path
+        self._storage_path = storage_path if storage_path is not None else db_path
+        if backend:
+            self._backend = backend
+        elif not self._enabled:
+            self._backend = "disabled"
+        elif isinstance(repository, JsonlFactRepository):
+            self._backend = "jsonl"
+        elif isinstance(repository, SqliteFtsFactRepository):
+            self._backend = "sqlite"
+        elif repository is not None:
+            self._backend = "custom"
+        else:
+            self._backend = "disabled"
         self._diagnostic = diagnostic.strip()
         self._read_only = bool(read_only)
         self._max_top_k = max(1, min(int(max_top_k), MAX_TOP_K))
@@ -1590,6 +2191,14 @@ class ProjectFactStore:
     @property
     def worktree_id(self) -> str:
         return self._worktree_id
+
+    @property
+    def chat_id(self) -> str:
+        return self._chat_id
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     @property
     def enabled(self) -> bool:
@@ -1604,8 +2213,12 @@ class ProjectFactStore:
         return self._enabled and self._available and self._repository is not None
 
     @property
+    def storage_path(self) -> Path | None:
+        return self._storage_path
+
+    @property
     def db_path(self) -> Path | None:
-        return self._db_path
+        return self._storage_path
 
     @property
     def diagnostic(self) -> str:
@@ -1640,6 +2253,7 @@ class ProjectFactStore:
         end_line: int | None = None,
         commit_sha: str = "",
         note: str = "",
+        chat_id: str = "",
         origin: str = "user:/fact",
         fact_id: str | None = None,
         allow_missing_sources: bool = False,
@@ -1654,6 +2268,7 @@ class ProjectFactStore:
             symbol=symbol,
             allow_missing=allow_missing_sources,
         )
+        effective_chat_id = (chat_id or "").strip() or self._chat_id
         fact = ProjectFact.confirmed(
             worktree_id=self._worktree_id,
             statement=statement,
@@ -1662,6 +2277,7 @@ class ProjectFactStore:
             tags=tags,
             commit_sha=commit_sha,
             note=note,
+            chat_id=effective_chat_id,
             fact_id=fact_id,
         )
         return repo.add(fact)
@@ -1677,6 +2293,7 @@ class ProjectFactStore:
         end_line: int | None = None,
         commit_sha: str = "",
         note: str = "",
+        chat_id: str = "",
         origin: str = "model_candidate",
         fact_id: str | None = None,
         allow_missing_sources: bool = False,
@@ -1691,6 +2308,7 @@ class ProjectFactStore:
             symbol=symbol,
             allow_missing=allow_missing_sources,
         )
+        effective_chat_id = (chat_id or "").strip() or self._chat_id
         fact = ProjectFact.model_candidate(
             worktree_id=self._worktree_id,
             statement=statement,
@@ -1699,6 +2317,7 @@ class ProjectFactStore:
             tags=tags,
             commit_sha=commit_sha,
             note=note,
+            chat_id=effective_chat_id,
             fact_id=fact_id,
         )
         return repo.add(fact)
@@ -1714,7 +2333,12 @@ class ProjectFactStore:
         existing = repo.get(fact_id, worktree_id=self._worktree_id)
         if existing is None:
             return None
-        new_provenance = replace(existing.provenance, origin=origin)
+        effective_chat_id = existing.provenance.chat_id or self._chat_id
+        new_provenance = replace(
+            existing.provenance,
+            origin=origin,
+            chat_id=effective_chat_id,
+        )
         confirmed = replace(
             existing,
             verification=VerificationState.CONFIRMED,
@@ -1995,6 +2619,9 @@ def open_project_fact_store(
     *,
     enabled: bool = False,
     facts_db: Path | str | None = None,
+    facts_file: Path | str | None = None,
+    chat_id: str | None = None,
+    chat_history_file: Path | str | None = None,
     read_only: bool = False,
     max_top_k: int = MAX_TOP_K,
     repository: FactRepository | None = None,
@@ -2003,75 +2630,153 @@ def open_project_fact_store(
     """Open or degrade a worktree-scoped ProjectFactStore.
 
     - When ``enabled`` is False, skips probing, opening, or creating any store.
-    - When Python's ``sqlite3`` driver or SQLite FTS5 is unavailable, reports a clear
-      diagnostic, leaves any existing database untouched, writes no fallback store,
-      and returns an inactive store so the session can continue cleanly.
+    - When ``facts_db`` is omitted/blank, opens the zero-dependency JSONL store at
+      ``resolve_facts_jsonl_path(root, facts_file)`` with deterministic ``chat_id``.
+    - When ``facts_db`` is provided, parses it via ``parse_facts_db_url`` and opens
+      the embedded SQLite FTS5 store. On invalid URL/scheme or missing ``sqlite3`` /
+      FTS5 support, reports a clear diagnostic, leaves existing files untouched,
+      writes no fallback store, and returns an inactive store.
     """
     root_path = Path(root).expanduser().resolve()
+    resolved_chat_id = (chat_id or "").strip() or chat_scope_id(root_path, chat_history_file)
+
     if not enabled:
         return ProjectFactStore(
             root_path,
             enabled=False,
             available=False,
             repository=None,
-            db_path=None,
+            storage_path=None,
+            backend="disabled",
+            chat_id=resolved_chat_id,
             diagnostic="Project facts are disabled.",
             read_only=read_only,
             max_top_k=max_top_k,
         )
 
     if repository is not None:
+        if isinstance(repository, JsonlFactRepository):
+            repo_backend = "jsonl"
+            repo_path: Path | None = repository.file_path
+        elif isinstance(repository, SqliteFtsFactRepository):
+            repo_backend = "sqlite"
+            repo_path = repository.db_path
+        else:
+            repo_backend = "custom"
+            repo_path = None
         return ProjectFactStore(
             root_path,
             enabled=True,
             available=True,
             repository=repository,
-            db_path=None,
+            storage_path=repo_path,
+            backend=repo_backend,
+            chat_id=resolved_chat_id,
             diagnostic="",
             read_only=read_only,
             max_top_k=max_top_k,
         )
 
-    resolved_db = resolve_facts_db_path(root_path, facts_db)
-    probe = check_sqlite_fts5_support(sqlite_module=sqlite_module)
-    if not probe.available:
+    has_facts_db = facts_db is not None and (
+        not isinstance(facts_db, str) or bool(facts_db.strip())
+    )
+    if has_facts_db:
+        try:
+            resolved_db = parse_facts_db_url(root_path, facts_db)
+        except FactValidationError as exc:
+            return ProjectFactStore(
+                root_path,
+                enabled=True,
+                available=False,
+                repository=None,
+                storage_path=None,
+                backend="sqlite",
+                chat_id=resolved_chat_id,
+                diagnostic=f"Project facts disabled: {exc}",
+                read_only=read_only,
+                max_top_k=max_top_k,
+            )
+
+        probe = check_sqlite_fts5_support(sqlite_module=sqlite_module)
+        if not probe.available:
+            return ProjectFactStore(
+                root_path,
+                enabled=True,
+                available=False,
+                repository=None,
+                storage_path=resolved_db,
+                backend="sqlite",
+                chat_id=resolved_chat_id,
+                diagnostic=probe.message,
+                read_only=read_only,
+                max_top_k=max_top_k,
+            )
+
+        if read_only and not resolved_db.exists():
+            return ProjectFactStore(
+                root_path,
+                enabled=True,
+                available=False,
+                repository=None,
+                storage_path=resolved_db,
+                backend="sqlite",
+                chat_id=resolved_chat_id,
+                diagnostic=(
+                    f"Project facts database does not exist at {resolved_db} (read-only mode)."
+                ),
+                read_only=True,
+                max_top_k=max_top_k,
+            )
+
+        repo = SqliteFtsFactRepository(
+            resolved_db,
+            max_top_k=max_top_k,
+            read_only=read_only,
+            sqlite_module=sqlite_module,
+        )
         return ProjectFactStore(
             root_path,
             enabled=True,
-            available=False,
-            repository=None,
-            db_path=resolved_db,
-            diagnostic=probe.message,
+            available=True,
+            repository=repo,
+            storage_path=resolved_db,
+            backend="sqlite",
+            chat_id=resolved_chat_id,
+            diagnostic="",
             read_only=read_only,
             max_top_k=max_top_k,
         )
 
-    if read_only and not resolved_db.exists():
+    resolved_jsonl = resolve_facts_jsonl_path(root_path, facts_file)
+    if read_only and not resolved_jsonl.exists():
         return ProjectFactStore(
             root_path,
             enabled=True,
             available=False,
             repository=None,
-            db_path=resolved_db,
+            storage_path=resolved_jsonl,
+            backend="jsonl",
+            chat_id=resolved_chat_id,
             diagnostic=(
-                f"Project facts database does not exist at {resolved_db} (read-only mode)."
+                f"Project facts file does not exist at {resolved_jsonl} (read-only mode)."
             ),
             read_only=True,
             max_top_k=max_top_k,
         )
 
-    repo = SqliteFtsFactRepository(
-        resolved_db,
+    jsonl_repo = JsonlFactRepository(
+        resolved_jsonl,
         max_top_k=max_top_k,
         read_only=read_only,
-        sqlite_module=sqlite_module,
     )
     return ProjectFactStore(
         root_path,
         enabled=True,
         available=True,
-        repository=repo,
-        db_path=resolved_db,
+        repository=jsonl_repo,
+        storage_path=resolved_jsonl,
+        backend="jsonl",
+        chat_id=resolved_chat_id,
         diagnostic="",
         read_only=read_only,
         max_top_k=max_top_k,
