@@ -1312,3 +1312,40 @@ def test_jsonl_concurrent_add_and_update_status_preserves_both(tmp_path):
     assert recovered_existing.status == FactStatus.STALE
     assert recovered_existing.stale_reason == "source hash changed"
     assert recovered_new == fact_new
+
+
+def test_jsonl_write_lock_errors_chain_to_fact_store_error(tmp_path, monkeypatch):
+    from filelock import Timeout as FileLockTimeout
+
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    jsonl_path = tmp_path / DEFAULT_FACTS_JSONL_FILENAME
+    wt_id = worktree_scope_id(tmp_path)
+    snaps = capture_source_snapshots(tmp_path, ["app.py"])
+    fact = ProjectFact.confirmed(
+        worktree_id=wt_id,
+        statement="Lock failures must raise chained FactStoreError.",
+        sources=snaps,
+    )
+
+    repo = JsonlFactRepository(jsonl_path)
+
+    def _raise_timeout(*args, **kwargs):
+        raise FileLockTimeout(str(jsonl_path) + ".lock")
+
+    monkeypatch.setattr(repo._write_lock, "acquire", _raise_timeout)
+    with pytest.raises(FactStoreError, match="Failed to acquire write lock") as exc_info:
+        repo.add(fact)
+    assert isinstance(exc_info.value.__cause__, FileLockTimeout)
+
+    def _raise_oserror(*args, **kwargs):
+        raise PermissionError("lock directory read-only")
+
+    monkeypatch.setattr(repo._write_lock, "acquire", _raise_oserror)
+    with pytest.raises(FactStoreError, match="Failed to acquire write lock") as status_exc:
+        repo.update_status(
+            fact.fact_id,
+            worktree_id=wt_id,
+            status=FactStatus.STALE,
+            stale_reason="changed",
+        )
+    assert isinstance(status_exc.value.__cause__, PermissionError)

@@ -27,14 +27,15 @@ import re
 import shlex
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import unquote
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 try:
     import sqlite3  # type: ignore[assignment]
@@ -1218,6 +1219,21 @@ class JsonlFactRepository(FactRepository):
         if self._read_only:
             raise FactStoreReadOnlyError("Project fact repository is read-only.")
 
+    @contextmanager
+    def _locked_write(self) -> Iterator[None]:
+        """Ensure the parent directory exists and hold the inter-process write lock."""
+        try:
+            self._file_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_lock.acquire()
+        except (OSError, FileLockTimeout) as exc:
+            raise FactStoreError(
+                f"Failed to acquire write lock for project facts file at {self._file_path}: {exc}"
+            ) from exc
+        try:
+            yield
+        finally:
+            self._write_lock.release()
+
     def _ensure_file_initialized(self) -> None:
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1316,8 +1332,7 @@ class JsonlFactRepository(FactRepository):
         self._ensure_writable()
         if not isinstance(fact, ProjectFact):
             raise FactValidationError("Expected a ProjectFact instance.")
-        self._file_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._write_lock:
+        with self._locked_write():
             facts = self._load_facts()
             facts[(fact.worktree_id, fact.fact_id)] = fact
             self._write_facts(facts)
@@ -1388,8 +1403,7 @@ class JsonlFactRepository(FactRepository):
         updated_at: str | None = None,
     ) -> ProjectFact | None:
         self._ensure_writable()
-        self._file_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._write_lock:
+        with self._locked_write():
             facts = self._load_facts()
             existing = facts.get((worktree_id, fact_id))
             if existing is None:

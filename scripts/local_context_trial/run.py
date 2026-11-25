@@ -826,12 +826,12 @@ def run_spec(
         only_target_modified = committed_files == set(targets)
     else:
         only_target_modified = set(changed_lines) == {f" M {target}" for target in targets}
-    commit_outcome, _ = classify_commit_outcome(
+    commit_outcome, commit_passed = classify_commit_outcome(
         code, changed_lines, gitdiff, only_target_modified, commits_added
     )
 
     if missing_completion:
-        commit_outcome = "error"
+        commit_outcome, commit_passed = "error", False
 
     if metadata is not None:
         row_metadata = dict(metadata)
@@ -881,7 +881,7 @@ def run_spec(
         errors=verdicts.count("ERROR"),
         false_approval=bool(audit_outcome == "pass" and not verified),
         commit_outcome=commit_outcome,
-        commit_passed=commits_added > 0,
+        commit_passed=commit_passed,
         only_target_modified=only_target_modified,
         commits_added=commits_added,
         smoke_outcome=verification["smoke_outcome"],

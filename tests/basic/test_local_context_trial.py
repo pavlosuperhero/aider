@@ -507,6 +507,48 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertEqual(res["trial_error"], "No editor completion recorded")
         self.assertIs(res["passed"], False)
 
+    def test_build_error_row_preserves_schema_and_controls(self):
+        case_spec = heldout.CASE_BY_NAME["duration"]
+        row = heldout._build_error_row(
+            case_spec=case_spec,
+            arm="passive",
+            round_id=2,
+            spec="explicit",
+            model="test-model",
+            map_tokens=512,
+            backend="cymbal",
+            read_range=True,
+            facts=True,
+            facts_db=".aider.facts.sqlite3",
+            facts_file=None,
+            local_callers_override=False,
+            exc=RuntimeError("boom"),
+            elapsed_seconds=1.24,
+            workdir=Path("/tmp/work"),
+            metadata={"seed": 7},
+        )
+        self.assertEqual(row["schema_version"], run.SCHEMA_VERSION)
+        self.assertEqual(row["case"], "duration")
+        self.assertEqual(row["arm"], "passive")
+        self.assertEqual(row["round"], 2)
+        self.assertIs(row["local_callers_enabled"], False)
+        self.assertIs(row["local_callers_facts"], False)
+        self.assertEqual(row["facts_backend"], "sqlite")
+        self.assertEqual(row["exit"], -1)
+        self.assertEqual(row["trial_error"], "RuntimeError: boom")
+        self.assertEqual(row["commit_outcome"], "error")
+        self.assertIs(row["commit_passed"], False)
+        self.assertEqual(row["hidden_outcome"], "error")
+        self.assertIs(row["hidden_passed"], False)
+        self.assertEqual(row["smoke_outcome"], "error")
+        self.assertIs(row["smoke_passed"], False)
+        self.assertEqual(row["audit_outcome"], "not_run")
+        self.assertIsNone(row["audit_passed"])
+        self.assertIs(row["passed"], False)
+        self.assertEqual(row["seconds"], 1.2)
+        self.assertEqual(row["workdir"], "/tmp/work")
+        self.assertEqual(row["metadata"], {"seed": 7})
+
     def test_p2_5_heldout_main_records_error_row_and_continues_after_exception(self):
         with tempfile.TemporaryDirectory(prefix="aider-heldout-resilient-") as tmp:
             out_path = Path(tmp) / "results.jsonl"
