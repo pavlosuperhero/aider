@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from typing import Callable, Sequence
 
@@ -861,17 +862,209 @@ def test_total_deadline_and_impact_transitive_handling(tmp_path):
         )
 
 
+def test_v0_18_0_verified_json_payloads_refs_impact_changed_and_show(tmp_path):
+    _write_basic_repo(tmp_path)
+    (tmp_path / "indirect.py").write_text(
+        "from consumer import handle\n\ndef outer(x):\n    return handle(x)\n",
+        encoding="utf-8",
+    )
+
+    refs_payload = {
+        "version": "0.1",
+        "results": [
+            {
+                "file": "/abs/consumer.py",
+                "rel_path": "consumer.py",
+                "line": 4,
+                "name": "parse",
+                "context": ["def handle(raw):", "    return parse(raw) + 1"],
+            }
+        ],
+    }
+    impact_payload = {
+        "version": "0.1",
+        "results": {
+            "definition_count": 2,
+            "depth": 2,
+            "limit": 50,
+            "metrics": {"elapsed_ms": 4},
+            "production_callers": 2,
+            "raw_rows": 2,
+            "resolve_scope": "family",
+            "results": [
+                {
+                    "hit_symbols": ["parse"],
+                    "row": {
+                        "symbol": "parse",
+                        "caller": "handle",
+                        "file": "/abs/consumer.py",
+                        "rel_path": "consumer.py",
+                        "line": 4,
+                        "depth": 1,
+                        "context": ["def handle(raw):", "    return parse(raw) + 1"],
+                    },
+                },
+                {
+                    "hit_symbols": ["parse"],
+                    "row": {
+                        "symbol": "parse",
+                        "caller": "outer",
+                        "file": "/abs/indirect.py",
+                        "rel_path": "indirect.py",
+                        "line": 4,
+                        "depth": 2,
+                        "context": ["def outer(x):", "    return handle(x)"],
+                    },
+                },
+            ],
+            "symbols": ["parse"],
+            "test_callers": 0,
+            "total_callers": 2,
+            "truncated": True,
+        },
+    }
+    changed_payload = {
+        "version": "0.1",
+        "results": {
+            "analyzed": 1,
+            "base": "working tree",
+            "changed_symbols": 1,
+            "resolve_scope": "family",
+            "results": [
+                {
+                    "symbol": "parse",
+                    "files": ["api.py"],
+                    "definition_count": 1,
+                    "references": {"count": 1},
+                    "impact": {"total_callers": 2},
+                }
+            ],
+            "truncated": False,
+        },
+    }
+    show_symbol_payload = {
+        "version": "0.1",
+        "results": {
+            "file": "/abs/api.py",
+            "lines": [
+                {"line": 1, "content": "def parse(value):"},
+                {"line": 2, "content": "    return int(value)"},
+            ],
+            "symbol": {
+                "name": "parse",
+                "kind": "function",
+                "file": "/abs/api.py",
+                "rel_path": "api.py",
+                "start_line": 1,
+                "end_line": 2,
+                "depth": 0,
+                "signature": "(value)",
+                "language": "python",
+                "body_hash": "abc123",
+            },
+        },
+    }
+    show_range_payload = {
+        "version": "0.1",
+        "results": {
+            "file": str(tmp_path.resolve() / "consumer.py"),
+            "lines": [
+                {"line": 3, "content": "def handle(raw):"},
+                {"line": 4, "content": "    return parse(raw) + 1"},
+            ],
+        },
+    }
+
+    runner = FakeCymbalRunner(
+        refs={"parse": refs_payload},
+        impact={"parse": impact_payload},
+        changed=changed_payload,
+        show={
+            "parse": show_symbol_payload,
+            "consumer.py:3-4": show_range_payload,
+        },
+    )
+    client = CymbalClient(CymbalConfig(enforce_pinned_version=True), runner=runner)
+
+    refs_res = client.refs(tmp_path, "parse")
+    assert len(refs_res.references) == 1
+    assert refs_res.references[0].path == "consumer.py"
+    assert refs_res.references[0].line == 4
+    assert refs_res.references[0].symbol == "parse"
+    assert refs_res.references[0].caller_symbol == ""
+    assert refs_res.references[0].snippet == "def handle(raw):\n    return parse(raw) + 1"
+
+    impact_res = client.impact(tmp_path, "parse")
+    assert impact_res.ambiguous is True
+    assert impact_res.truncated is True
+    assert len(impact_res.direct_callers) == 1
+    assert impact_res.direct_callers[0].path == "consumer.py"
+    assert impact_res.direct_callers[0].caller_symbol == "handle"
+    assert impact_res.direct_callers[0].transitive is False
+    assert impact_res.direct_callers[0].snippet == "def handle(raw):\n    return parse(raw) + 1"
+    assert len(impact_res.transitive_callers) == 1
+    assert impact_res.transitive_callers[0].path == "indirect.py"
+    assert impact_res.transitive_callers[0].caller_symbol == "outer"
+    assert impact_res.transitive_callers[0].transitive is True
+
+    changed_res = client.changed(tmp_path)
+    assert changed_res.changed_files == ("api.py",)
+    assert len(changed_res.entries) == 1
+    assert changed_res.entries[0].path == "api.py"
+    assert changed_res.entries[0].symbol == "parse"
+    assert changed_res.stale is False
+    assert changed_res.truncated is False
+
+    show_sym = client.show(tmp_path, "parse")
+    assert show_sym.stale is False
+    assert len(show_sym.slices) == 1
+    assert show_sym.slices[0].path == "api.py"
+    assert show_sym.slices[0].symbol == "parse"
+    assert show_sym.slices[0].kind == "function"
+    assert show_sym.slices[0].start_line == 1
+    assert show_sym.slices[0].end_line == 2
+    assert show_sym.slices[0].code == "def parse(value):\n    return int(value)"
+
+    show_range = client.show(tmp_path, "consumer.py:3-4")
+    assert show_range.stale is False
+    assert len(show_range.slices) == 1
+    assert show_range.slices[0].path == "consumer.py"
+    assert show_range.slices[0].start_line == 3
+    assert show_range.slices[0].end_line == 4
+    assert show_range.slices[0].code == "def handle(raw):\n    return parse(raw) + 1"
+
+    finder = build_caller_finder(BACKEND_CYMBAL, runner=runner)
+    lookup_res = finder.lookup(
+        tmp_path,
+        "fix parse",
+        ["api.py"],
+        ["consumer.py", "indirect.py"],
+    )
+    assert lookup_res.status == "INCOMPLETE"
+    assert lookup_res.source == BACKEND_CYMBAL
+    assert [e.path for e in lookup_res.excerpts] == ["consumer.py", "indirect.py"]
+    assert "duplicate symbol definition" in lookup_res.ambiguity
+    assert "transitive caller" in lookup_res.ambiguity
+    assert "cymbal impact truncated" in lookup_res.truncation
+    assert "working_tree_changed" in lookup_res.scope
+    assert "transitive_impact" in lookup_res.scope
+    assert "stale index" not in lookup_res.ambiguity
+
+
 def test_pinned_v0_18_0_cymbal_smoke(tmp_path):
     """Live smoke test validating real Cymbal v0.18.0 compatibility when installed."""
     binary = shutil.which("cymbal")
     if not binary:
         pytest.skip("cymbal binary is not installed in PATH")
+    git_bin = shutil.which("git")
+    if not git_bin:
+        pytest.skip("git binary is not installed in PATH")
 
     config = CymbalConfig(
         executable=binary,
         expected_version=PINNED_CYMBAL_VERSION,
         enforce_pinned_version=True,
-        use_changed_check=False,
+        use_changed_check=True,
     )
     client = CymbalClient(config)
     try:
@@ -882,20 +1075,79 @@ def test_pinned_v0_18_0_cymbal_smoke(tmp_path):
     assert version == PINNED_CYMBAL_VERSION
 
     _write_basic_repo(tmp_path)
+    subprocess.run([git_bin, "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [git_bin, "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git_bin, "config", "user.name", "Test User"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git_bin, "add", "api.py", "consumer.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git_bin, "-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run([binary, "index"], cwd=tmp_path, check=True, capture_output=True)
+
     refs_res = client.refs(tmp_path, "parse")
     assert isinstance(refs_res.references, tuple)
+    assert any(r.path == "consumer.py" and r.line == 4 for r in refs_res.references)
+
     impact_res = client.impact(tmp_path, "parse")
     assert isinstance(impact_res.direct_callers, tuple)
-    show_res = client.show(tmp_path, "parse")
-    assert isinstance(show_res.slices, tuple)
+    assert any(c.path == "consumer.py" and c.line == 4 for c in impact_res.direct_callers)
 
-    result = find_callers_with_backend(
+    changed_clean = client.changed(tmp_path)
+    assert isinstance(changed_clean.entries, tuple)
+    assert changed_clean.changed_files == ()
+
+    show_sym = client.show(tmp_path, "parse")
+    assert len(show_sym.slices) == 1
+    assert show_sym.slices[0].path == "api.py"
+    assert show_sym.slices[0].symbol == "parse"
+    assert show_sym.slices[0].start_line == 1
+    assert "def parse(value):" in show_sym.slices[0].code
+    assert show_sym.stale is False
+
+    show_range = client.show(tmp_path, "consumer.py:3-4")
+    assert len(show_range.slices) == 1
+    assert show_range.slices[0].path == "consumer.py"
+    assert show_range.slices[0].start_line == 3
+    assert show_range.slices[0].end_line == 4
+    assert "return parse(raw) + 1" in show_range.slices[0].code
+    assert show_range.stale is False
+
+    finder = build_caller_finder(BACKEND_CYMBAL, cymbal_config=config)
+    result = finder.lookup(
         tmp_path,
         "fix parse",
         ["api.py"],
         ["consumer.py"],
-        backend=BACKEND_CYMBAL,
-        cymbal_config=config,
     )
     assert result.source == BACKEND_CYMBAL
+    assert result.backend_requested == BACKEND_CYMBAL
+    assert result.fallback_used is False
     assert "no_federate" in result.scope
+    assert [e.path for e in result.excerpts] == ["consumer.py"]
+    assert "return parse(raw) + 1" in result.excerpts[0].code
+
+    (tmp_path / "api.py").write_text(
+        "def parse(value):\n    return int(value) + 0\n", encoding="utf-8"
+    )
+    changed_dirty = client.changed(tmp_path)
+    assert isinstance(changed_dirty.entries, tuple)
+    assert "api.py" in changed_dirty.changed_files
+    assert any(e.path == "api.py" and e.symbol == "parse" for e in changed_dirty.entries)

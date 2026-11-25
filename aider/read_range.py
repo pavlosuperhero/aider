@@ -704,8 +704,34 @@ def read_range(
     )
 
 
+def _relativize_cymbal_path(raw_path: str, root: Path | str | None) -> str:
+    if root is None or "\x00" in raw_path:
+        return raw_path
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        return raw_path
+    bases: list[Path] = []
+    root_path = Path(root)
+    try:
+        bases.append(root_path.resolve(strict=True))
+    except OSError:
+        pass
+    bases.append(root_path)
+    for base in bases:
+        try:
+            rel = candidate.relative_to(base)
+        except ValueError:
+            continue
+        if ".." in rel.parts:
+            return raw_path
+        return rel.as_posix()
+    return raw_path
+
+
 def _extract_cymbal_fields(
     payload: Mapping[str, Any] | str,
+    *,
+    root: Path | str | None = None,
 ) -> tuple[str, int, int, str, str | None, bool]:
     if isinstance(payload, str):
         try:
@@ -720,9 +746,89 @@ def _extract_cymbal_fields(
     if not isinstance(parsed, Mapping):
         raise CymbalShowError("Cymbal show JSON must decode to an object")
 
-    raw_path = parsed.get("path") or parsed.get("file") or parsed.get("file_path")
+    outer = parsed
+    results_obj = parsed.get("results")
+    if isinstance(results_obj, Mapping):
+        parsed = results_obj
+    elif results_obj is not None:
+        raise CymbalShowError("Cymbal show 'results' field must be an object")
+
+    raw_symbol_field = parsed.get("symbol")
+    symbol_meta: Mapping[str, Any] | None = None
+    if isinstance(raw_symbol_field, Mapping):
+        symbol_meta = raw_symbol_field
+        raw_symbol = symbol_meta.get("name") or symbol_meta.get("symbol") or ""
+        if not isinstance(raw_symbol, str):
+            raise CymbalShowError("Cymbal show symbol.name must be a string")
+    elif raw_symbol_field is None:
+        raw_symbol = parsed.get("name") or ""
+        if not isinstance(raw_symbol, str):
+            raise CymbalShowError("Cymbal show symbol must be a string")
+    elif isinstance(raw_symbol_field, str):
+        raw_symbol = raw_symbol_field
+    else:
+        raise CymbalShowError("Cymbal show symbol must be a string or object")
+
+    raw_path: Any = parsed.get("rel_path")
+    sym_rel = symbol_meta.get("rel_path") if symbol_meta is not None else None
+    sym_file = (
+        symbol_meta.get("file") or symbol_meta.get("path")
+        if symbol_meta is not None
+        else None
+    )
+    entry_file = parsed.get("path") or parsed.get("file") or parsed.get("file_path")
+
+    if not (isinstance(raw_path, str) and raw_path.strip()):
+        if isinstance(entry_file, str) and entry_file.strip():
+            relativized = _relativize_cymbal_path(entry_file, root)
+            if (
+                isinstance(sym_rel, str)
+                and sym_rel.strip()
+                and (entry_file == sym_file or Path(relativized).is_absolute())
+            ):
+                raw_path = sym_rel
+            else:
+                raw_path = relativized
+        elif isinstance(sym_rel, str) and sym_rel.strip():
+            raw_path = sym_rel
+        elif isinstance(sym_file, str) and sym_file.strip():
+            raw_path = _relativize_cymbal_path(sym_file, root)
+
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise CymbalShowError("Cymbal show payload is missing a valid path")
+
+    raw_lines = parsed.get("lines")
+    lines_start: int | None = None
+    lines_end: int | None = None
+    lines_body: str | None = None
+    if raw_lines is not None:
+        if not isinstance(raw_lines, list):
+            raise CymbalShowError("Cymbal show field 'lines' must be a list")
+        line_contents: list[str] = []
+        line_nums: list[int] = []
+        for item in raw_lines:
+            if isinstance(item, Mapping):
+                ln = item.get("line") if "line" in item else item.get("lineno")
+                if ln is not None:
+                    try:
+                        line_nums.append(_require_positive_int(ln, "lines[].line"))
+                    except ReadRangeError as exc:
+                        raise CymbalShowError(str(exc)) from exc
+                content = item.get("content") if "content" in item else item.get("text")
+                if content is None:
+                    content = ""
+                if not isinstance(content, str):
+                    raise CymbalShowError("Cymbal show lines[].content must be a string")
+                line_contents.append(content.rstrip("\r\n"))
+            elif isinstance(item, str):
+                line_contents.append(item.rstrip("\r\n"))
+            else:
+                raise CymbalShowError("Cymbal show 'lines' items must be objects or strings")
+        if line_nums:
+            lines_start = line_nums[0]
+            lines_end = line_nums[-1]
+        if raw_lines:
+            lines_body = "\n".join(line_contents)
 
     range_obj = parsed.get("range") or parsed.get("span")
     if isinstance(range_obj, Mapping):
@@ -744,6 +850,21 @@ def _extract_cymbal_fields(
         )
         raw_end = parsed.get("end_line")
 
+    if raw_start is None:
+        if lines_start is not None:
+            raw_start = lines_start
+        elif symbol_meta is not None:
+            raw_start = (
+                symbol_meta.get("start_line")
+                if "start_line" in symbol_meta
+                else symbol_meta.get("line")
+            )
+    if raw_end is None:
+        if lines_end is not None:
+            raw_end = lines_end
+        elif symbol_meta is not None and lines_body is None:
+            raw_end = symbol_meta.get("end_line")
+
     body: str | None = None
     for key in ("body", "code", "source", "content", "text"):
         val = parsed.get(key)
@@ -752,6 +873,8 @@ def _extract_cymbal_fields(
                 raise CymbalShowError(f"Cymbal show field {key!r} must be a string")
             body = val
             break
+    if body is None and lines_body is not None:
+        body = lines_body
 
     try:
         start_line = _require_positive_int(raw_start, "start_line")
@@ -773,11 +896,7 @@ def _extract_cymbal_fields(
     if end_line < start_line:
         raise CymbalShowError(f"Cymbal show end_line ({end_line}) < start_line ({start_line})")
 
-    raw_symbol = parsed.get("symbol") or parsed.get("name") or ""
-    if not isinstance(raw_symbol, str):
-        raise CymbalShowError("Cymbal show symbol must be a string")
-
-    upstream_truncated = bool(parsed.get("truncated", False))
+    upstream_truncated = bool(outer.get("truncated", False) or parsed.get("truncated", False))
     return raw_path, start_line, end_line, raw_symbol, body, upstream_truncated
 
 
@@ -835,7 +954,7 @@ def validate_cymbal_show(
           and ``limitations=("cymbal_stale",)``.
     """
     raw_path, start_line, end_line, symbol, body, upstream_truncated = _extract_cymbal_fields(
-        payload
+        payload, root=root
     )
     disk_excerpt = read_range(
         root,

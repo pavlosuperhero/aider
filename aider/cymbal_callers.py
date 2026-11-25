@@ -69,6 +69,7 @@ _DEFINITION_KINDS = frozenset({"definition", "def", "declaration", "decl"})
 
 _REFS_SCHEMA_KEYS = frozenset(
     {
+        "version",
         "references",
         "refs",
         "matches",
@@ -86,6 +87,7 @@ _REFS_SCHEMA_KEYS = frozenset(
 )
 _IMPACT_SCHEMA_KEYS = frozenset(
     {
+        "version",
         "direct_callers",
         "direct",
         "transitive_callers",
@@ -98,6 +100,16 @@ _IMPACT_SCHEMA_KEYS = frozenset(
         "references",
         "results",
         "definitions",
+        "definition_count",
+        "depth",
+        "limit",
+        "metrics",
+        "production_callers",
+        "raw_rows",
+        "resolve_scope",
+        "symbols",
+        "test_callers",
+        "total_callers",
         "symbol",
         "ambiguous",
         "stale",
@@ -106,6 +118,11 @@ _IMPACT_SCHEMA_KEYS = frozenset(
 )
 _CHANGED_SCHEMA_KEYS = frozenset(
     {
+        "version",
+        "analyzed",
+        "base",
+        "changed_symbols",
+        "resolve_scope",
         "changed",
         "changes",
         "symbols",
@@ -122,10 +139,12 @@ _CHANGED_SCHEMA_KEYS = frozenset(
 )
 _SHOW_SCHEMA_KEYS = frozenset(
     {
+        "version",
         "file",
         "path",
         "filename",
         "rel_path",
+        "symbol",
         "code",
         "content",
         "body",
@@ -1122,7 +1141,7 @@ class CymbalClient:
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue
-            raw_path = _extract_str(entry, ("file", "path", "filename", "rel_path"))
+            raw_path = _extract_str(entry, ("rel_path", "file", "path", "filename"))
             norm_path = normalize_repo_path(root, raw_path)
             if norm_path is None:
                 if raw_path:
@@ -1158,41 +1177,70 @@ class CymbalClient:
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue
-            raw_path = _extract_str(entry, ("file", "path", "filename", "rel_path"))
+            hit_symbols = entry.get("hit_symbols")
+            row_obj = entry.get("row")
+            item = row_obj if isinstance(row_obj, dict) else entry
+            raw_path = _extract_str(item, ("rel_path", "file", "path", "filename"))
             norm_path = normalize_repo_path(root, raw_path)
             if norm_path is None:
                 if raw_path:
                     diagnostics.append(f"rejected unsafe reference path: {raw_path}")
                 continue
             line = _coerce_positive_int(
-                entry.get("line")
-                or entry.get("start_line")
-                or entry.get("lineno")
-                or entry.get("line_number"),
+                item.get("line")
+                or item.get("start_line")
+                or item.get("lineno")
+                or item.get("line_number"),
                 default=0,
             )
             if line < 1:
                 diagnostics.append(f"skipped reference with invalid line in {norm_path}")
                 continue
             col = _coerce_positive_int(
-                entry.get("column") or entry.get("col") or entry.get("col_offset"),
+                item.get("column") or item.get("col") or item.get("col_offset"),
                 default=0,
             )
-            kind = _extract_str(entry, ("kind", "type", "role"), default=default_kind).lower()
-            sym = _extract_str(entry, ("symbol", "callee", "target"), default=default_symbol)
+            kind = _extract_str(item, ("kind", "type", "role"), default=default_kind).lower()
+            fallback_sym = default_symbol
+            if isinstance(hit_symbols, list):
+                for hs in hit_symbols:
+                    if isinstance(hs, str) and hs.strip():
+                        fallback_sym = hs.strip()
+                        break
+            sym = _extract_str(item, ("symbol", "callee", "target"), default=fallback_sym)
             caller_sym = _extract_str(
-                entry,
+                item,
                 ("caller", "caller_symbol", "enclosing_symbol", "function", "name"),
                 default="",
             )
-            if caller_sym == sym and "caller" not in entry and "caller_symbol" not in entry:
+            if caller_sym == sym and "caller" not in item and "caller_symbol" not in item:
                 caller_sym = ""
-            snippet = _extract_str(entry, ("snippet", "line_text", "text", "code", "content"))
+            snippet = _extract_str(item, ("snippet", "line_text", "text", "code", "content"))
+            if not snippet:
+                raw_context = item.get("context")
+                if isinstance(raw_context, str) and raw_context.strip():
+                    snippet = raw_context
+                elif isinstance(raw_context, list):
+                    ctx_lines = [
+                        line_text.rstrip("\r\n")
+                        for line_text in raw_context
+                        if isinstance(line_text, str)
+                    ]
+                    if ctx_lines:
+                        snippet = "\n".join(ctx_lines)
             is_alias = (
-                _extract_bool(entry, ("alias", "is_alias", "aliased"))
+                _extract_bool(item, ("alias", "is_alias", "aliased"))
                 or kind in _ALIAS_KINDS
             )
-            is_transitive = transitive or _extract_bool(entry, ("transitive", "indirect"))
+            depth = _coerce_positive_int(
+                item.get("depth") if "depth" in item else entry.get("depth"),
+                default=0,
+            )
+            is_transitive = (
+                transitive
+                or _extract_bool(item, ("transitive", "indirect"))
+                or depth > 1
+            )
             refs.append(
                 CymbalReference(
                     path=norm_path,
@@ -1313,6 +1361,14 @@ class CymbalClient:
                 f"Unrecognized cymbal impact JSON keys: {sorted(payload.keys())}"
             )
 
+        body = payload
+        if isinstance(payload.get("results"), dict):
+            body = payload["results"]
+            if body and not (set(body.keys()) & _IMPACT_SCHEMA_KEYS):
+                raise CymbalProtocolError(
+                    f"Unrecognized cymbal impact results JSON keys: {sorted(body.keys())}"
+                )
+
         raw_direct = None
         for key in (
             "direct_callers",
@@ -1323,23 +1379,28 @@ class CymbalClient:
             "references",
             "results",
         ):
-            if key in payload:
-                raw_direct = payload[key]
+            if key in body:
+                raw_direct = body[key]
                 break
         if raw_direct is not None and not isinstance(raw_direct, list):
             raise CymbalProtocolError("cymbal impact callers field must be a JSON array")
 
         raw_trans = None
         for key in ("transitive_callers", "transitive", "indirect_callers"):
-            if key in payload:
-                raw_trans = payload[key]
+            if key in body:
+                raw_trans = body[key]
                 break
         if raw_trans is not None and not isinstance(raw_trans, list):
             raise CymbalProtocolError("cymbal impact transitive_callers field must be a JSON array")
 
-        raw_defs = payload.get("definitions") or payload.get("candidates")
+        raw_defs = (
+            body.get("definitions")
+            or body.get("candidates")
+            or payload.get("definitions")
+            or payload.get("candidates")
+        )
         definitions = self._parse_definitions(resolved_root, raw_defs, clean_symbol, diagnostics)
-        direct_callers = self._parse_references(
+        parsed_direct = self._parse_references(
             resolved_root,
             raw_direct or [],
             default_symbol=clean_symbol,
@@ -1347,7 +1408,7 @@ class CymbalClient:
             transitive=False,
             diagnostics=diagnostics,
         )
-        transitive_callers = self._parse_references(
+        parsed_trans = self._parse_references(
             resolved_root,
             raw_trans or [],
             default_symbol=clean_symbol,
@@ -1355,11 +1416,28 @@ class CymbalClient:
             transitive=True,
             diagnostics=diagnostics,
         )
-        ambiguous = _extract_bool(
-            payload, ("ambiguous", "is_ambiguous", "multiple_definitions")
-        ) or len(definitions) > 1
-        stale = _extract_bool(payload, ("stale", "is_stale", "index_stale", "outdated"))
-        truncated = _extract_bool(payload, ("truncated", "is_truncated", "has_more", "capped"))
+        direct_callers = tuple(ref for ref in parsed_direct if not ref.transitive)
+        transitive_callers = tuple(
+            [*(ref for ref in parsed_direct if ref.transitive), *parsed_trans]
+        )
+        raw_def_count = (
+            body.get("definition_count")
+            if "definition_count" in body
+            else payload.get("definition_count")
+        )
+        definition_count = _coerce_positive_int(raw_def_count, default=0)
+        ambiguous = (
+            _extract_bool(payload, ("ambiguous", "is_ambiguous", "multiple_definitions"))
+            or _extract_bool(body, ("ambiguous", "is_ambiguous", "multiple_definitions"))
+            or len(definitions) > 1
+            or definition_count > 1
+        )
+        stale = _extract_bool(
+            payload, ("stale", "is_stale", "index_stale", "outdated")
+        ) or _extract_bool(body, ("stale", "is_stale", "index_stale", "outdated"))
+        truncated = _extract_bool(
+            payload, ("truncated", "is_truncated", "has_more", "capped")
+        ) or _extract_bool(body, ("truncated", "is_truncated", "has_more", "capped"))
 
         return CymbalImpactResult(
             symbol=clean_symbol,
@@ -1398,26 +1476,45 @@ class CymbalClient:
                 raise CymbalProtocolError(
                     f"Unrecognized cymbal changed JSON keys: {sorted(payload.keys())}"
                 )
+            body = payload
+            if isinstance(payload.get("results"), dict):
+                body = payload["results"]
+                if body and not (set(body.keys()) & _CHANGED_SCHEMA_KEYS):
+                    raise CymbalProtocolError(
+                        f"Unrecognized cymbal changed results JSON keys: {sorted(body.keys())}"
+                    )
             raw_entries = []
             for key in ("changed", "changes", "symbols", "entries", "items", "results"):
-                if key in payload:
-                    if not isinstance(payload[key], list):
+                if key in body:
+                    val = body[key]
+                    if val is None:
+                        raw_entries = []
+                    elif not isinstance(val, list):
                         raise CymbalProtocolError(
                             f"cymbal changed {key} field must be a JSON array"
                         )
-                    raw_entries = payload[key]
+                    else:
+                        raw_entries = val
                     break
             raw_files = []
             for key in ("files", "changed_files"):
-                if key in payload:
-                    if not isinstance(payload[key], list):
+                if key in body:
+                    val = body[key]
+                    if val is None:
+                        raw_files = []
+                    elif not isinstance(val, list):
                         raise CymbalProtocolError(
                             f"cymbal changed {key} field must be a JSON array"
                         )
-                    raw_files = payload[key]
+                    else:
+                        raw_files = val
                     break
-            stale = _extract_bool(payload, ("stale", "is_stale", "index_stale", "outdated"))
-            truncated = _extract_bool(payload, ("truncated", "is_truncated", "has_more", "capped"))
+            stale = _extract_bool(
+                payload, ("stale", "is_stale", "index_stale", "outdated")
+            ) or _extract_bool(body, ("stale", "is_stale", "index_stale", "outdated"))
+            truncated = _extract_bool(
+                payload, ("truncated", "is_truncated", "has_more", "capped")
+            ) or _extract_bool(body, ("truncated", "is_truncated", "has_more", "capped"))
 
         entries: list[CymbalChangedEntry] = []
         files_set: set[str] = set()
@@ -1432,29 +1529,47 @@ class CymbalClient:
                 continue
             if not isinstance(item, dict):
                 continue
-            raw_path = _extract_str(item, ("file", "path", "filename", "rel_path"))
-            norm = normalize_repo_path(resolved_root, raw_path)
-            if norm is None:
-                if raw_path:
-                    diagnostics.append(f"rejected unsafe changed path: {raw_path}")
-                continue
-            files_set.add(norm)
             if _extract_bool(item, ("stale", "is_stale", "unindexed")):
                 stale = True
-            entries.append(
-                CymbalChangedEntry(
-                    path=norm,
-                    symbol=_extract_str(item, ("symbol", "name")),
-                    line=_coerce_positive_int(
-                        item.get("line") or item.get("start_line") or item.get("lineno"),
-                        default=0,
-                    ),
-                    kind=_extract_str(item, ("kind", "type"), default="changed").lower(),
-                    status=_extract_str(
-                        item, ("status", "change_type"), default="modified"
-                    ).lower(),
-                )
+            item_symbol = _extract_str(item, ("symbol", "name"))
+            item_line = _coerce_positive_int(
+                item.get("line") or item.get("start_line") or item.get("lineno"),
+                default=0,
             )
+            item_kind = _extract_str(item, ("kind", "type"), default="changed").lower()
+            item_status = _extract_str(
+                item, ("status", "change_type"), default="modified"
+            ).lower()
+
+            candidate_paths: list[str] = []
+            raw_path = _extract_str(item, ("rel_path", "file", "path", "filename"))
+            if raw_path:
+                candidate_paths.append(raw_path)
+            item_files = item.get("files")
+            if isinstance(item_files, list):
+                for raw_file_item in item_files:
+                    if isinstance(raw_file_item, str) and raw_file_item.strip():
+                        candidate_paths.append(raw_file_item)
+
+            seen_item_paths: set[str] = set()
+            for candidate_path in candidate_paths:
+                norm = normalize_repo_path(resolved_root, candidate_path)
+                if norm is None:
+                    diagnostics.append(f"rejected unsafe changed path: {candidate_path}")
+                    continue
+                files_set.add(norm)
+                if norm in seen_item_paths:
+                    continue
+                seen_item_paths.add(norm)
+                entries.append(
+                    CymbalChangedEntry(
+                        path=norm,
+                        symbol=item_symbol,
+                        line=item_line,
+                        kind=item_kind,
+                        status=item_status,
+                    )
+                )
 
         for raw_file in raw_files:
             if not isinstance(raw_file, str):
@@ -1510,45 +1625,154 @@ class CymbalClient:
             truncated = _extract_bool(
                 payload, ("truncated", "is_truncated", "has_more", "capped")
             )
+            body = payload
+            if isinstance(payload.get("results"), dict):
+                body = payload["results"]
+                if body and not (set(body.keys()) & _SHOW_SCHEMA_KEYS):
+                    raise CymbalProtocolError(
+                        f"Unrecognized cymbal show results JSON keys: {sorted(body.keys())}"
+                    )
+                stale = stale or _extract_bool(
+                    body, ("stale", "is_stale", "index_stale", "outdated")
+                )
+                ambiguous = ambiguous or _extract_bool(
+                    body, ("ambiguous", "is_ambiguous", "multiple_definitions")
+                )
+                truncated = truncated or _extract_bool(
+                    body, ("truncated", "is_truncated", "has_more", "capped")
+                )
+
             container = None
             for key in ("slices", "matches", "definitions", "results", "items"):
-                if key in payload:
-                    container = payload[key]
+                if key in body:
+                    container = body[key]
                     break
             if container is not None:
                 if not isinstance(container, list):
                     raise CymbalProtocolError("cymbal show container field must be a JSON array")
                 raw_items = [item for item in container if isinstance(item, dict)]
             elif any(
-                k in payload
-                for k in ("file", "path", "filename", "rel_path", "code", "content", "body")
+                k in body
+                for k in (
+                    "file",
+                    "path",
+                    "filename",
+                    "rel_path",
+                    "code",
+                    "content",
+                    "body",
+                    "lines",
+                    "symbol",
+                )
             ):
-                raw_items = [payload]
+                raw_items = [body]
 
         slices: list[CymbalShowSlice] = []
         for entry in raw_items:
-            raw_path = _extract_str(entry, ("file", "path", "filename", "rel_path"))
+            sym_obj = entry.get("symbol") if isinstance(entry.get("symbol"), dict) else None
+            entry_rel = _extract_str(entry, ("rel_path",))
+            sym_rel = _extract_str(sym_obj, ("rel_path",)) if sym_obj is not None else ""
+            entry_file = _extract_str(entry, ("file", "path", "filename"))
+            sym_file = (
+                _extract_str(sym_obj, ("file", "path", "filename"))
+                if sym_obj is not None
+                else ""
+            )
+
+            raw_path = entry_rel
+            if not raw_path:
+                if entry_file:
+                    if sym_rel and (
+                        entry_file == sym_file
+                        or normalize_repo_path(resolved_root, entry_file) is None
+                    ):
+                        raw_path = sym_rel
+                    else:
+                        raw_path = entry_file
+                elif sym_rel:
+                    raw_path = sym_rel
+                else:
+                    raw_path = sym_file
+
             norm_path = normalize_repo_path(resolved_root, raw_path)
             if norm_path is None:
                 if raw_path:
                     diagnostics.append(f"rejected unsafe show path: {raw_path}")
                 continue
+
+            raw_lines = entry.get("lines")
+            derived_start = 0
+            derived_end = 0
+            parsed_line_texts: list[str] | None = None
+            if isinstance(raw_lines, list):
+                line_texts: list[str] = []
+                line_nums: list[int] = []
+                for line_item in raw_lines:
+                    if isinstance(line_item, dict):
+                        ln = _coerce_positive_int(
+                            line_item.get("line") or line_item.get("lineno"),
+                            default=0,
+                        )
+                        if ln >= 1:
+                            line_nums.append(ln)
+                        content = (
+                            line_item.get("content")
+                            if "content" in line_item
+                            else line_item.get("text")
+                        )
+                        line_texts.append(
+                            content.rstrip("\r\n") if isinstance(content, str) else ""
+                        )
+                    elif isinstance(line_item, str):
+                        line_texts.append(line_item.rstrip("\r\n"))
+                    else:
+                        line_texts.append(str(line_item))
+                if line_nums:
+                    derived_start = line_nums[0]
+                    derived_end = line_nums[-1]
+                if line_texts:
+                    parsed_line_texts = line_texts
+
+            sym_start = (
+                _coerce_positive_int(
+                    sym_obj.get("start_line") or sym_obj.get("line"), default=0
+                )
+                if sym_obj is not None
+                else 0
+            )
             start_line = _coerce_positive_int(
-                entry.get("start_line") or entry.get("line") or entry.get("lineno"),
+                entry.get("start_line")
+                or entry.get("line")
+                or entry.get("lineno")
+                or derived_start
+                or sym_start,
                 default=1,
             )
             if start_line < 1:
                 start_line = 1
+
             raw_code = _extract_str(entry, ("code", "content", "body", "text", "snippet"))
-            if not raw_code and isinstance(entry.get("lines"), list):
-                raw_code = "\n".join(str(x) for x in entry["lines"])
+            if raw_code:
+                code_lines = raw_code.splitlines()
+            elif parsed_line_texts is not None:
+                code_lines = list(parsed_line_texts)
+                raw_code = "\n".join(code_lines)
+            else:
+                code_lines = []
             if "\x00" in raw_code:
                 diagnostics.append(f"rejected binary show content for {norm_path}")
                 continue
 
-            code_lines = raw_code.splitlines() if raw_code else []
+            sym_end = (
+                _coerce_positive_int(sym_obj.get("end_line"), default=0)
+                if sym_obj is not None
+                else 0
+            )
             end_line = _coerce_positive_int(
-                entry.get("end_line") or entry.get("endLine"),
+                entry.get("end_line")
+                or entry.get("endLine")
+                or derived_end
+                or (sym_end if not code_lines else 0),
                 default=start_line + max(0, len(code_lines) - 1),
             )
             if end_line < start_line:
@@ -1608,13 +1832,24 @@ class CymbalClient:
             if slice_truncated:
                 truncated = True
 
+            if sym_obj is not None:
+                slice_symbol = _extract_str(sym_obj, ("name", "symbol"), default=clean_target)
+                slice_kind = _extract_str(
+                    entry,
+                    ("kind", "type"),
+                    default=_extract_str(sym_obj, ("kind", "type"), default="symbol"),
+                ).lower()
+            else:
+                slice_symbol = _extract_str(entry, ("symbol", "name"), default=clean_target)
+                slice_kind = _extract_str(entry, ("kind", "type"), default="symbol").lower()
+
             slices.append(
                 CymbalShowSlice(
                     path=norm_path,
                     start_line=start_line,
                     end_line=end_line,
-                    symbol=_extract_str(entry, ("symbol", "name"), default=clean_target),
-                    kind=_extract_str(entry, ("kind", "type"), default="symbol").lower(),
+                    symbol=slice_symbol,
+                    kind=slice_kind,
                     code=bounded_code,
                     stale=slice_stale,
                     truncated=slice_truncated,

@@ -427,9 +427,110 @@ def test_validate_cymbal_show_valid_truncated_stale_and_guarded(tmp_path):
         {"path": "pkg/models.py", "start_line": 0},
         {"path": "pkg/models.py", "start_line": 5, "end_line": 2},
         {"path": "pkg/models.py", "start_line": 1, "body": 123},
+        {"version": "0.1", "results": "not-an-object"},
+        {"version": "0.1", "results": {"file": "pkg/models.py", "lines": "not-a-list"}},
     ]:
         with pytest.raises(CymbalShowError):
             validate_cymbal_show(tmp_path, bad_payload)
+
+
+def test_validate_cymbal_show_v0_18_0_json_payloads(tmp_path):
+    (tmp_path / "api.py").write_text(
+        "def parse(x):\n    return int(x)\n", encoding="utf-8"
+    )
+    (tmp_path / "consumer.py").write_text(
+        "from api import parse\n\ndef run(v):\n    return parse(v) + 1\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path.parent / "outside_read_range_guard.py"
+    outside.write_text("secret = 1\n", encoding="utf-8")
+    (tmp_path / "link_outside.py").symlink_to(outside)
+
+    # 1. Live v0.18.0 symbol show payload with wrapped results dict, lines[], and symbol dict.
+    symbol_payload = {
+        "version": "0.1",
+        "results": {
+            "file": "/abs/api.py",
+            "lines": [
+                {"line": 1, "content": "def parse(x):"},
+                {"line": 2, "content": "    return int(x)"},
+            ],
+            "symbol": {
+                "name": "parse",
+                "kind": "function",
+                "file": "/abs/api.py",
+                "rel_path": "api.py",
+                "start_line": 1,
+                "end_line": 2,
+                "depth": 0,
+                "signature": "(x)",
+                "language": "python",
+                "body_hash": "deadbeef",
+            },
+        },
+    }
+    sym_excerpt = validate_cymbal_show(tmp_path, json.dumps(symbol_payload))
+    assert sym_excerpt.source == "cymbal"
+    assert sym_excerpt.path == "api.py"
+    assert sym_excerpt.symbol == "parse"
+    assert sym_excerpt.start_line == 1
+    assert sym_excerpt.end_line == 2
+    assert sym_excerpt.lines == ("def parse(x):", "    return int(x)")
+    assert sym_excerpt.stale is False
+    assert sym_excerpt.truncated is False
+
+    # 2. Live v0.18.0 file:start-end show payload without symbol dict, normalizing abs 'file'.
+    range_payload = {
+        "version": "0.1",
+        "results": {
+            "file": str(tmp_path.resolve() / "consumer.py"),
+            "lines": [
+                {"line": 3, "content": "def run(v):"},
+                {"line": 4, "content": "    return parse(v) + 1"},
+            ],
+        },
+    }
+    range_excerpt = validate_cymbal_show(tmp_path, range_payload)
+    assert range_excerpt.source == "cymbal"
+    assert range_excerpt.path == "consumer.py"
+    assert range_excerpt.symbol == ""
+    assert range_excerpt.start_line == 3
+    assert range_excerpt.end_line == 4
+    assert range_excerpt.lines == ("def run(v):", "    return parse(v) + 1")
+    assert range_excerpt.stale is False
+
+    # 3. Stale v0.18.0 lines content falls back to disk (or raises in strict mode).
+    stale_v018 = {
+        "version": "0.1",
+        "results": {
+            "file": str(tmp_path.resolve() / "consumer.py"),
+            "lines": [
+                {"line": 3, "content": "def run(v):"},
+                {"line": 4, "content": "    return OLD_CALL(v)"},
+            ],
+        },
+    }
+    stale_excerpt = validate_cymbal_show(tmp_path, stale_v018)
+    assert stale_excerpt.source == "native"
+    assert stale_excerpt.stale is True
+    assert stale_excerpt.limitations == ("cymbal_stale",)
+    assert stale_excerpt.lines == ("def run(v):", "    return parse(v) + 1")
+    with pytest.raises(CymbalShowError, match="does not match file on disk"):
+        validate_cymbal_show(tmp_path, stale_v018, strict=True)
+
+    # 4. Security guards: outside absolute 'file' and symlinked absolute 'file' are blocked.
+    for unsafe_file in (str(outside), str(tmp_path.resolve() / "link_outside.py")):
+        with pytest.raises(PathGuardError):
+            validate_cymbal_show(
+                tmp_path,
+                {
+                    "version": "0.1",
+                    "results": {
+                        "file": unsafe_file,
+                        "lines": [{"line": 1, "content": "secret = 1"}],
+                    },
+                },
+            )
 
 
 def test_measure_read_ranges_aggregates_and_deduplicates_file_size(tmp_path):
