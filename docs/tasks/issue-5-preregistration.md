@@ -73,7 +73,7 @@ were explicitly excluded prior to freeze:
 
 | Parameter | Pinned Value |
 | --- | --- |
-| **Primary Model** | `lm_studio/qwen3-coder-30b-a3b-instruct-mlx` |
+| **Primary Model** | `lm_studio/qwen/qwen3.6-35b-a3b` (thinking MoE; amended prior to C2 data collection) |
 | **Secondary 8B Model** | `lm_studio/meta-llama-3.1-8b-instruct` |
 | **Inference Endpoint** | LM Studio OpenAI-compatible API at `http://127.0.0.1:1234/v1` |
 | **Repo-Map Token Budget** | `--map-tokens 1024` (identical across all arms and stages) |
