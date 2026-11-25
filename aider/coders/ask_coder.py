@@ -7,3 +7,4 @@ class AskCoder(Coder):
 
     edit_format = "ask"
     gpt_prompts = AskPrompts()
+    allows_edits = False

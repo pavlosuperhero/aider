@@ -1,3 +1,5 @@
+import pytest
+
 from aider.exceptions import ExInfo, LiteLLMExceptions
 
 
@@ -102,3 +104,33 @@ def test_openrouter_error():
     assert "OpenRouter" in ex_info.description
     assert "overloaded" in ex_info.description
     assert "rate" in ex_info.description
+
+
+def test_new_litellm_exceptions():
+    """Test MissingMessageRoleError and RequestOverDeploymentTpmError are registered"""
+    for name in ("MissingMessageRoleError", "RequestOverDeploymentTpmError"):
+        assert name in LiteLLMExceptions.exception_info
+        ex_info = LiteLLMExceptions.exception_info[name]
+        assert ex_info == ExInfo(name, False, None)
+        assert ex_info.retry is False
+
+
+def test_unknown_litellm_error(monkeypatch):
+    """Test unknown litellm Error subclasses load with strict=False and fail with strict=True"""
+    import litellm
+
+    class FutureLiteLLMError(Exception):
+        pass
+
+    monkeypatch.setattr(litellm, "FutureLiteLLMError", FutureLiteLLMError, raising=False)
+    monkeypatch.setattr(litellm, "NotAClassError", "not a class", raising=False)
+    try:
+        ex = LiteLLMExceptions()
+        assert FutureLiteLLMError in ex.exceptions
+        assert ex.exceptions[FutureLiteLLMError] == ExInfo("FutureLiteLLMError", False, None)
+        assert ex.get_ex_info(FutureLiteLLMError()) == ExInfo("FutureLiteLLMError", False, None)
+
+        with pytest.raises(ValueError, match="FutureLiteLLMError"):
+            ex._load(strict=True)
+    finally:
+        LiteLLMExceptions.exceptions.pop(FutureLiteLLMError, None)

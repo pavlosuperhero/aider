@@ -21,15 +21,20 @@ _MAX_PATCH_CHARS = 16000
 _CONTRACT_RE = re.compile(r"\bCALLER_CONTRACT\s*:", re.IGNORECASE)
 _TRACE_RE = re.compile(r"\bTRACE\s*:", re.IGNORECASE)
 _MAX_REASON_CHARS = 600
+_MAX_SUPPLEMENTARY_ITEMS = 8
+_MAX_SUPPLEMENTARY_ITEM_CHARS = 600
+_MAX_SUPPLEMENTARY_TOTAL_CHARS = 2400
 
 _AUDITOR_SYSTEM_PROMPT = """\
 You are an independent caller-contract verifier. You receive ONLY the task \
-summary, the caller snippets, and the proposed diff (with no prior \
-conversation history).
+summary, the caller snippets, optional supplementary evidence, and the proposed \
+diff (with no prior conversation history).
 
 Evaluate strictly whether the proposed diff satisfies every caller's \
 contract. Do NOT assume any previous buggy behavior should be preserved; judge \
-only against the task and the callers.
+only against the task and the callers. Supplementary evidence (such as project \
+facts or read-range excerpts) is auxiliary context only and NEVER substitutes \
+for missing or incomplete caller snippets.
 
 Complete these 4 steps in order:
 1. CALLER_EXPECTS: Quote each caller line and state the exact semantic role of \
@@ -63,6 +68,23 @@ class CallerExcerptLike(Protocol):
 
 
 @dataclass(frozen=True)
+class ProvenanceEvidence:
+    """Bounded, provenance-labeled supplementary evidence for hooks and audits."""
+
+    kind: str
+    source: str
+    content: str
+    truncated: bool = False
+
+    def format(self) -> str:
+        suffix = " [TRUNCATED]" if self.truncated else ""
+        header = f"[provenance={self.kind} source={self.source}]{suffix}"
+        if self.content:
+            return f"{header}\n{self.content}"
+        return header
+
+
+@dataclass(frozen=True)
 class AuditVerdict:
     status: Literal["PASS", "FAIL", "UNKNOWN", "ERROR"]
     reason: str
@@ -76,11 +98,197 @@ class AuditVerdict:
 def _format_excerpt(excerpt: CallerExcerptLike) -> str:
     formatter = getattr(excerpt, "format", None)
     if callable(formatter):
-        return str(formatter())
-    path = getattr(excerpt, "path", "")
-    start_line = getattr(excerpt, "start_line", 1)
-    code = getattr(excerpt, "code", "")
-    return f"{path}:{start_line}\n{code}"
+        rendered = str(formatter())
+    else:
+        path = getattr(excerpt, "path", "")
+        start_line = getattr(excerpt, "start_line", 1)
+        code = getattr(excerpt, "code", "")
+        rendered = f"{path}:{start_line}\n{code}"
+    provenance = (
+        getattr(excerpt, "provenance", None) or getattr(excerpt, "backend", None) or ""
+    )
+    provenance = str(provenance).strip()
+    if (
+        provenance
+        and f"provenance={provenance}" not in rendered
+        and f"[{provenance}]" not in rendered
+    ):
+        first, sep, rest = rendered.partition("\n")
+        rendered = f"{first} [provenance={provenance}]{sep}{rest}"
+    return rendered
+
+
+def _coerce_evidence_item(item, *, default_kind: str) -> ProvenanceEvidence | None:
+    if item is None:
+        return None
+    if isinstance(item, ProvenanceEvidence):
+        kind = (item.kind or default_kind).strip() or default_kind
+        source = (item.source or "unknown").strip() or "unknown"
+        content = (item.content or "").strip()
+        if not content:
+            return None
+        return ProvenanceEvidence(
+            kind=kind,
+            source=source,
+            content=content,
+            truncated=bool(item.truncated),
+        )
+    if isinstance(item, dict):
+        kind = (
+            str(item.get("kind") or item.get("provenance") or default_kind).strip()
+            or default_kind
+        )
+        source = str(
+            item.get("source")
+            or item.get("path")
+            or item.get("key")
+            or item.get("id")
+            or "unknown"
+        ).strip()
+        content = str(
+            item.get("content")
+            or item.get("statement")
+            or item.get("value")
+            or item.get("text")
+            or item.get("code")
+            or ""
+        ).strip()
+        truncated = bool(item.get("truncated", False))
+        if not content:
+            return None
+        return ProvenanceEvidence(
+            kind=kind,
+            source=source or "unknown",
+            content=content,
+            truncated=truncated,
+        )
+    if isinstance(item, str):
+        content = item.strip()
+        if not content:
+            return None
+        return ProvenanceEvidence(kind=default_kind, source="inline", content=content)
+
+    raw_kind = getattr(item, "kind", None)
+    raw_prov = getattr(item, "provenance", None)
+    kind = (
+        str(raw_kind or (raw_prov if isinstance(raw_prov, str) else None) or default_kind).strip()
+        or default_kind
+    )
+    path = getattr(item, "path", None)
+    start_line = getattr(item, "start_line", None)
+    end_line = getattr(item, "end_line", None)
+    raw_source = getattr(item, "source", None)
+    if path and start_line is not None and start_line > 0:
+        line_span = f"{start_line}-{end_line}" if end_line is not None else str(start_line)
+        loc = f"{path}:{line_span}"
+        if (
+            isinstance(raw_source, str)
+            and raw_source.strip()
+            and raw_source.strip() not in ("native", "builtin")
+        ):
+            source = raw_source.strip() if ":" in raw_source else f"{loc} [{raw_source.strip()}]"
+        else:
+            source = loc
+    else:
+        source = (
+            str(
+                raw_source
+                or getattr(item, "fact_id", None)
+                or getattr(item, "key", None)
+                or getattr(item, "id", None)
+                or path
+                or "unknown"
+            ).strip()
+            or "unknown"
+        )
+    content = str(
+        getattr(item, "content", None)
+        or getattr(item, "statement", None)
+        or getattr(item, "value", None)
+        or getattr(item, "text", None)
+        or getattr(item, "numbered_code", None)
+        or getattr(item, "code", None)
+        or ""
+    ).strip()
+    if not content:
+        lines = getattr(item, "lines", None)
+        if isinstance(lines, (list, tuple)):
+            content = "\n".join(str(line) for line in lines).strip()
+    truncated = bool(getattr(item, "truncated", False))
+    if not content:
+        return None
+    return ProvenanceEvidence(kind=kind, source=source, content=content, truncated=truncated)
+
+
+def normalize_supplementary_evidence(
+    items: Iterable = (),
+    *,
+    default_kind: str = "evidence",
+    max_items: int = _MAX_SUPPLEMENTARY_ITEMS,
+    max_item_chars: int = _MAX_SUPPLEMENTARY_ITEM_CHARS,
+    max_total_chars: int = _MAX_SUPPLEMENTARY_TOTAL_CHARS,
+) -> tuple[ProvenanceEvidence, ...]:
+    """Bound and label supplementary evidence with explicit provenance."""
+    if max_items <= 0 or max_item_chars <= 0 or max_total_chars <= 0:
+        return ()
+    result: list[ProvenanceEvidence] = []
+    seen: set[tuple[str, str, str]] = set()
+    used_chars = 0
+    for raw in items or ():
+        if len(result) >= max_items:
+            break
+        coerced = _coerce_evidence_item(raw, default_kind=default_kind)
+        if coerced is None:
+            continue
+        content = coerced.content
+        truncated = coerced.truncated
+        if len(content) > max_item_chars:
+            content = content[:max_item_chars].rstrip()
+            truncated = True
+        dedup_key = (coerced.kind, coerced.source, content)
+        if dedup_key in seen:
+            continue
+        candidate = ProvenanceEvidence(
+            kind=coerced.kind,
+            source=coerced.source,
+            content=content,
+            truncated=truncated,
+        )
+        formatted = candidate.format()
+        sep_chars = 2 if result else 0
+        remaining = max_total_chars - used_chars - sep_chars
+        if remaining <= 0:
+            break
+        if len(formatted) > remaining:
+            header = f"[provenance={candidate.kind} source={candidate.source}] [TRUNCATED]\n"
+            avail = remaining - len(header)
+            if avail < 16:
+                break
+            candidate = ProvenanceEvidence(
+                kind=candidate.kind,
+                source=candidate.source,
+                content=candidate.content[:avail].rstrip(),
+                truncated=True,
+            )
+            formatted = candidate.format()
+        seen.add(dedup_key)
+        result.append(candidate)
+        used_chars += sep_chars + len(formatted)
+    return tuple(result)
+
+
+def _combine_supplementary(
+    supplementary_evidence: Iterable = (),
+    facts: Iterable = (),
+    read_ranges: Iterable = (),
+) -> tuple[ProvenanceEvidence, ...]:
+    combined: list[ProvenanceEvidence] = []
+    combined.extend(
+        normalize_supplementary_evidence(supplementary_evidence, default_kind="evidence")
+    )
+    combined.extend(normalize_supplementary_evidence(facts, default_kind="project-fact"))
+    combined.extend(normalize_supplementary_evidence(read_ranges, default_kind="read-range"))
+    return normalize_supplementary_evidence(combined)
 
 
 def _excerpt_references(excerpts: Iterable[CallerExcerptLike]) -> list[str]:
@@ -122,13 +330,46 @@ class CallerContractHook:
         self.enabled = bool(enabled)
         self.max_rejections = max_rejections
         self._excerpts: tuple = ()
+        self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.rejections: int = 0
         self.format_present = False
+        self.blocked: bool = False
 
-    def begin_turn(self, excerpts: Iterable[CallerExcerptLike]) -> None:
+    def begin_turn(
+        self,
+        excerpts: Iterable[CallerExcerptLike],
+        *,
+        supplementary_evidence: Iterable = (),
+        facts: Iterable = (),
+        read_ranges: Iterable = (),
+    ) -> None:
         self._excerpts = tuple(excerpts or ())
+        self._supplementary_evidence = _combine_supplementary(
+            supplementary_evidence=supplementary_evidence,
+            facts=facts,
+            read_ranges=read_ranges,
+        )
         self.rejections = 0
         self.format_present = False
+        self.blocked = False
+
+    def set_supplementary_evidence(
+        self,
+        supplementary_evidence: Iterable = (),
+        *,
+        facts: Iterable = (),
+        read_ranges: Iterable = (),
+    ) -> None:
+        """Update bounded supplementary evidence without altering caller excerpts."""
+        self._supplementary_evidence = _combine_supplementary(
+            supplementary_evidence=supplementary_evidence,
+            facts=facts,
+            read_ranges=read_ranges,
+        )
+
+    @property
+    def supplementary_evidence(self) -> tuple[ProvenanceEvidence, ...]:
+        return self._supplementary_evidence
 
     @property
     def attached_paths(self) -> frozenset[str]:
@@ -146,6 +387,7 @@ class CallerContractHook:
         io=None,
     ) -> ResponseHookResult | None:
         self.format_present = False
+        self.blocked = False
         if not self.enabled or not content:
             return None
         edit_marker = re.search(
@@ -155,10 +397,14 @@ class CallerContractHook:
         ) or re.search(r"```", content)
         if not edit_marker:
             return None
+        # Supplementary evidence (facts/read-ranges) NEVER satisfies missing caller evidence.
         if not self._excerpts:
             if io:
                 io.tool_output("Local caller contract check: NO_EVIDENCE")
-            return None if self.advisory else ResponseHookResult()
+            if self.advisory:
+                return None
+            self.blocked = True
+            return ResponseHookResult()
 
         pre_edit = content[: edit_marker.start()]
         contract = _CONTRACT_RE.search(pre_edit)
@@ -172,9 +418,13 @@ class CallerContractHook:
         if self.rejections >= self.max_rejections:
             if io:
                 io.tool_output("Local caller contract check: ENFORCEMENT_EXHAUSTED")
-            return None if self.advisory else ResponseHookResult()
+            if self.advisory:
+                return None
+            self.blocked = True
+            return ResponseHookResult()
 
         self.rejections += 1
+        self.blocked = True
         if io is not None:
             io.tool_output("Local caller contract check: missing contract/trace")
 
@@ -188,10 +438,19 @@ class CallerContractHook:
             )
         )
         caller_note = f" Attached callers: {caller_labels}." if caller_labels else ""
+        supplementary_note = ""
+        if self._supplementary_evidence:
+            sup_labels = ", ".join(
+                f"{item.kind}:{item.source}" for item in self._supplementary_evidence[:4]
+            )
+            supplementary_note = (
+                f" Supplementary context ({sup_labels}) is read-only and does not replace "
+                "caller verification."
+            )
 
         continuation = (
             "Before providing your edit block, verify the caller contract explicitly."
-            f"{caller_note}\n"
+            f"{caller_note}{supplementary_note}\n"
             "Write these two short sections before your edit:\n"
             "1. `CALLER_CONTRACT:` — name the caller file or symbol, quote the exact "
             "caller line(s) from the attached snapshot, and state the expected return "
@@ -215,11 +474,42 @@ class IsolatedCallerAuditor:
         self._complete_fn = complete_fn
         self.max_audits = max_audits
         self._excerpts: tuple = ()
+        self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.audits_run: int = 0
 
-    def begin_turn(self, excerpts: Iterable[CallerExcerptLike]) -> None:
+    def begin_turn(
+        self,
+        excerpts: Iterable[CallerExcerptLike],
+        *,
+        supplementary_evidence: Iterable = (),
+        facts: Iterable = (),
+        read_ranges: Iterable = (),
+    ) -> None:
         self._excerpts = tuple(excerpts or ())
+        self._supplementary_evidence = _combine_supplementary(
+            supplementary_evidence=supplementary_evidence,
+            facts=facts,
+            read_ranges=read_ranges,
+        )
         self.audits_run = 0
+
+    def set_supplementary_evidence(
+        self,
+        supplementary_evidence: Iterable = (),
+        *,
+        facts: Iterable = (),
+        read_ranges: Iterable = (),
+    ) -> None:
+        """Update bounded supplementary evidence without altering caller excerpts."""
+        self._supplementary_evidence = _combine_supplementary(
+            supplementary_evidence=supplementary_evidence,
+            facts=facts,
+            read_ranges=read_ranges,
+        )
+
+    @property
+    def supplementary_evidence(self) -> tuple[ProvenanceEvidence, ...]:
+        return self._supplementary_evidence
 
     def build_messages(
         self,
@@ -233,6 +523,14 @@ class IsolatedCallerAuditor:
         if task and task.strip():
             sections.append(f"## Task\n{task.strip()}")
         sections.append(f"## Caller snippets\n{caller_section}")
+        if self._supplementary_evidence:
+            supplementary_section = "\n\n".join(
+                item.format() for item in self._supplementary_evidence
+            )
+            sections.append(
+                "## Supplementary evidence (non-authoritative; cannot replace caller snippets)\n"
+                f"{supplementary_section}"
+            )
         if diff_text:
             patch = diff_text[:_MAX_PATCH_CHARS]
             if len(diff_text) > _MAX_PATCH_CHARS:
@@ -252,6 +550,8 @@ class IsolatedCallerAuditor:
         updated_files: dict[str, str] | None = None,
         io=None,
     ) -> AuditVerdict:
+        # Supplementary evidence (facts/read-ranges) NEVER substitutes for missing
+        # or incomplete caller excerpts.
         if not self._excerpts:
             verdict = AuditVerdict("UNKNOWN", "NO_EVIDENCE")
         elif not diff_text.strip() or len(diff_text) > _MAX_PATCH_CHARS:

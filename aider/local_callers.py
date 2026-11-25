@@ -1,10 +1,12 @@
 """Language-agnostic bounded local caller lookup and prompt context formatting.
 
 Architecture:
-- Boundary DTO & formatting policy (`CallerExcerpt`, `format_caller_context`) stay pure
+- Boundary DTOs & formatting policy (`CallerExcerpt`, `CallerEvidence`, `CallerScope`,
+  `CallerEvidenceResult`, `CallerEvidenceReport`, `format_caller_context`) stay pure
   and independent of parser implementations.
-- Parser adapters (`PythonAstCallerFinder`, `TreeSitterCallerFinder`) implement the
-  `CallerFinder` protocol and are orchestrated by `CompositeCallerFinder`.
+- Parser adapters (`PythonAstCallerFinder`, `TreeSitterCallerFinder`, or injected
+  external adapters such as Cymbal) implement the `CallerFinder` protocol and are
+  orchestrated by `CompositeCallerFinder`.
 - Safe file reading (`read_source`, `read_python`) enforces explicit path, symlink,
   size, and UTF-8 contracts before any parser inspects file contents.
 """
@@ -12,13 +14,14 @@ Architecture:
 from __future__ import annotations
 
 import ast
+import inspect
 import posixpath
 import re
 import warnings
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
-from typing import Iterable, Protocol, Sequence
+from typing import Iterable, Literal, Protocol, Sequence
 
 DEFAULT_CALLER_HINT = (
     "Check how the caller uses the return value before choosing the implementation."
@@ -138,6 +141,135 @@ _DECL_LINE_RE = re.compile(
 )
 
 
+EvidenceStatus = Literal["NO_EVIDENCE", "INCOMPLETE", "COMPLETE_WITHIN_SCOPE"]
+ScopePool = Literal["production", "tests", "production+tests", "none"]
+
+
+def _dedupe_str(items: Iterable[str]) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for item in items:
+        text = str(item).strip()
+        if text and text not in seen:
+            seen[text] = None
+    return tuple(seen)
+
+
+def _is_ambiguity_reason(reason: str) -> bool:
+    lowered = reason.lower()
+    return any(token in lowered for token in ("ambiguous", "duplicate", "alias", "stale"))
+
+
+def _is_truncation_reason(reason: str) -> bool:
+    lowered = reason.lower()
+    return any(token in lowered for token in ("truncated", "omitted", "capped", "budget"))
+
+
+def _supports_report_arg(finder: CallerFinder) -> bool:
+    """Return True if ``finder.find_callers`` accepts a ``report`` keyword argument."""
+    try:
+        sig = inspect.signature(finder.find_callers)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "report" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def _finder_source(finder: CallerFinder) -> str:
+    raw = getattr(finder, "source", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return type(finder).__name__
+
+
+@dataclass(frozen=True)
+class CallerScope:
+    """Immutable description of the candidate pool and bounds searched."""
+
+    pool: ScopePool = "none"
+    editable: tuple[str, ...] = ()
+    candidates_total: int = 0
+    candidates_searched: int = 0
+    production_candidates: int = 0
+    test_candidates: int = 0
+    omitted_test_candidates: int = 0
+    matched_files: int = 0
+    selected_files: int = 0
+    max_files: int = 3
+    max_chars: int = 700
+    context_lines: int = 3
+    sources: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "editable", tuple(self.editable))
+        object.__setattr__(self, "sources", _dedupe_str(self.sources))
+
+    def describe(self) -> str:
+        parts = [
+            f"pool={self.pool}",
+            f"searched={self.candidates_searched}/{self.candidates_total}",
+        ]
+        if self.omitted_test_candidates:
+            parts.append(f"omitted_tests={self.omitted_test_candidates}")
+        if self.matched_files or self.selected_files:
+            parts.append(f"files={self.selected_files}/{self.matched_files}")
+        parts.append(f"max_files={self.max_files}")
+        if self.sources:
+            parts.append(f"sources={','.join(self.sources)}")
+        return "; ".join(parts)
+
+
+@dataclass(frozen=True)
+class CallerEvidence:
+    """Immutable typed record describing a single scoped caller evidence item."""
+
+    path: str
+    line: int
+    symbol: str
+    kind: str = "call"
+    source: str = "builtin"
+    scope: str = ""
+    ambiguity: tuple[str, ...] = ()
+    truncation: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    start_line: int = 0
+    code: str = ""
+
+    def __post_init__(self) -> None:
+        resolved_start = self.start_line if self.start_line > 0 else self.line
+        object.__setattr__(self, "start_line", resolved_start)
+
+        raw_lims = _dedupe_str(self.limitations)
+        amb = _dedupe_str(
+            (*self.ambiguity, *(item for item in raw_lims if _is_ambiguity_reason(item)))
+        )
+        trunc = _dedupe_str(
+            (*self.truncation, *(item for item in raw_lims if _is_truncation_reason(item)))
+        )
+        merged_lims = _dedupe_str((*raw_lims, *amb, *trunc))
+
+        object.__setattr__(self, "ambiguity", amb)
+        object.__setattr__(self, "truncation", trunc)
+        object.__setattr__(self, "limitations", merged_lims)
+
+    @property
+    def incomplete(self) -> bool:
+        return bool(self.limitations or self.ambiguity or self.truncation)
+
+    def format(self) -> str:
+        """Render the caller evidence with its 1-based file:line header."""
+        marker = f" [INCOMPLETE: {', '.join(self.limitations)}]" if self.limitations else ""
+        if self.code:
+            return f"{self.path}:{self.start_line}{marker}\n{self.code}"
+        return f"{self.path}:{self.line}{marker}"
+
+
 @dataclass(frozen=True)
 class CallerExcerpt:
     """Immutable boundary DTO describing a single local caller snapshot."""
@@ -147,10 +279,49 @@ class CallerExcerpt:
     symbol: str
     code: str
     limitations: tuple[str, ...] = ()
+    line: int = 0
+    kind: str = "call"
+    source: str = "builtin"
+    scope: str = ""
+    ambiguity: tuple[str, ...] = ()
+    truncation: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        resolved_line = self.line if self.line > 0 else self.start_line
+        object.__setattr__(self, "line", resolved_line)
+
+        raw_lims = _dedupe_str(self.limitations)
+        amb = _dedupe_str(
+            (*self.ambiguity, *(item for item in raw_lims if _is_ambiguity_reason(item)))
+        )
+        trunc = _dedupe_str(
+            (*self.truncation, *(item for item in raw_lims if _is_truncation_reason(item)))
+        )
+        merged_lims = _dedupe_str((*raw_lims, *amb, *trunc))
+
+        object.__setattr__(self, "ambiguity", amb)
+        object.__setattr__(self, "truncation", trunc)
+        object.__setattr__(self, "limitations", merged_lims)
 
     @property
-    def incomplete(self):
-        return bool(self.limitations)
+    def incomplete(self) -> bool:
+        return bool(self.limitations or self.ambiguity or self.truncation)
+
+    def to_evidence(self, *, scope: str | None = None) -> CallerEvidence:
+        """Convert this excerpt into an immutable typed ``CallerEvidence`` record."""
+        return CallerEvidence(
+            path=self.path,
+            line=self.line,
+            symbol=self.symbol,
+            kind=self.kind,
+            source=self.source,
+            scope=self.scope or (scope or ""),
+            ambiguity=self.ambiguity,
+            truncation=self.truncation,
+            limitations=self.limitations,
+            start_line=self.start_line,
+            code=self.code,
+        )
 
     def format(self) -> str:
         """Render the caller excerpt with its 1-based file:line header."""
@@ -158,20 +329,213 @@ class CallerExcerpt:
         return f"{self.path}:{self.start_line}{marker}\n{self.code}"
 
 
+@dataclass(frozen=True)
+class CallerEvidenceResult:
+    """Immutable typed aggregate result of scoped caller discovery."""
+
+    status: EvidenceStatus
+    evidence: tuple[CallerEvidence, ...] = ()
+    excerpts: tuple[CallerExcerpt, ...] = ()
+    definitions: tuple[tuple[str, str], ...] = ()
+    scope: CallerScope = field(default_factory=CallerScope)
+    ambiguity: tuple[str, ...] = ()
+    truncation: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    sources: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status not in ("NO_EVIDENCE", "INCOMPLETE", "COMPLETE_WITHIN_SCOPE"):
+            raise ValueError(f"Unknown caller evidence status: {self.status!r}")
+        object.__setattr__(self, "evidence", tuple(self.evidence))
+        object.__setattr__(self, "excerpts", tuple(self.excerpts))
+        object.__setattr__(self, "definitions", tuple(sorted(set(self.definitions))))
+
+        raw_lims = _dedupe_str(self.limitations)
+        amb = _dedupe_str(
+            (*self.ambiguity, *(item for item in raw_lims if _is_ambiguity_reason(item)))
+        )
+        trunc = _dedupe_str(
+            (*self.truncation, *(item for item in raw_lims if _is_truncation_reason(item)))
+        )
+        merged_lims = _dedupe_str((*raw_lims, *amb, *trunc))
+
+        object.__setattr__(self, "ambiguity", amb)
+        object.__setattr__(self, "truncation", trunc)
+        object.__setattr__(self, "limitations", merged_lims)
+        object.__setattr__(self, "sources", _dedupe_str(self.sources))
+
+    @property
+    def incomplete(self) -> bool:
+        return self.status == "INCOMPLETE"
+
+    @property
+    def has_evidence(self) -> bool:
+        return bool(self.evidence)
+
+    def describe(self) -> str:
+        status_label = (
+            "COMPLETE_WITHIN_SCOPE (SELECTED)"
+            if self.status == "COMPLETE_WITHIN_SCOPE"
+            else self.status
+        )
+        targets = ", ".join(f"{path}:{symbol}" for path, symbol in self.definitions[:8]) or "none"
+        if len(self.definitions) > 8:
+            targets += ", [additional definitions omitted]"
+        if self.excerpts:
+            sources_text = ", ".join(e.format().splitlines()[0] for e in self.excerpts)
+        elif self.evidence:
+            sources_text = ", ".join(e.format().splitlines()[0] for e in self.evidence)
+        else:
+            sources_text = "none"
+        parts = [
+            f"{status_label} ({self.scope.describe()}).",
+            f"Definitions: {targets}.",
+            f"Sources: {sources_text}",
+        ]
+        if self.ambiguity:
+            parts.append(f"Ambiguity: {', '.join(self.ambiguity)}")
+        if self.truncation:
+            parts.append(f"Truncation: {', '.join(self.truncation)}")
+        extra_lims = tuple(
+            item
+            for item in self.limitations
+            if item not in self.ambiguity and item not in self.truncation
+        )
+        if extra_lims:
+            parts.append(f"Limitations: {', '.join(extra_lims)}")
+        return " ".join(parts)
+
+
 @dataclass
 class CallerEvidenceReport:
-    definitions: set[tuple[str, str]] = field(default_factory=set)
+    """Mutable collector passed through caller finders to build a typed evidence result."""
 
-    def describe(self, excerpts):
-        status = "SELECTED" if excerpts else "NO_EVIDENCE"
-        if any(e.incomplete for e in excerpts):
+    definitions: set[tuple[str, str]] = field(default_factory=set)
+    ambiguity: list[str] = field(default_factory=list)
+    truncation: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    scope: CallerScope = field(default_factory=CallerScope)
+    result: CallerEvidenceResult | None = None
+
+    def record_definition(self, path: str, symbol: str) -> None:
+        self.definitions.add((path, symbol))
+
+    def record_source(self, source: str) -> None:
+        text = str(source).strip()
+        if text and text not in self.sources:
+            self.sources.append(text)
+
+    def record_ambiguity(self, reason: str) -> None:
+        text = str(reason).strip()
+        if not text:
+            return
+        if text not in self.ambiguity:
+            self.ambiguity.append(text)
+        if text not in self.limitations:
+            self.limitations.append(text)
+
+    def record_truncation(self, reason: str) -> None:
+        text = str(reason).strip()
+        if not text:
+            return
+        if text not in self.truncation:
+            self.truncation.append(text)
+        if text not in self.limitations:
+            self.limitations.append(text)
+
+    def record_limitation(self, reason: str) -> None:
+        text = str(reason).strip()
+        if not text:
+            return
+        if text not in self.limitations:
+            self.limitations.append(text)
+        if _is_ambiguity_reason(text) and text not in self.ambiguity:
+            self.ambiguity.append(text)
+        if _is_truncation_reason(text) and text not in self.truncation:
+            self.truncation.append(text)
+
+    def to_result(self, excerpts: Sequence[CallerExcerpt] = ()) -> CallerEvidenceResult:
+        """Freeze collected report state and excerpts into an immutable typed result."""
+        excerpt_tuple = tuple(excerpts)
+        default_scope = self.scope.pool if self.scope.pool != "none" else ""
+        evidence_items: list[CallerEvidence] = []
+        for e in excerpt_tuple:
+            if isinstance(e, CallerExcerpt):
+                evidence_items.append(e.to_evidence(scope=default_scope))
+            else:
+                lims = tuple(getattr(e, "limitations", ()))
+                if not lims and getattr(e, "incomplete", False):
+                    lims = ("incomplete",)
+                evidence_items.append(
+                    CallerEvidence(
+                        path=getattr(e, "path", ""),
+                        line=getattr(e, "line", 0) or getattr(e, "start_line", 1),
+                        symbol=getattr(e, "symbol", ""),
+                        kind=getattr(e, "kind", "call"),
+                        source=getattr(e, "source", "builtin"),
+                        scope=getattr(e, "scope", "") or default_scope,
+                        ambiguity=tuple(getattr(e, "ambiguity", ())),
+                        truncation=tuple(getattr(e, "truncation", ())),
+                        limitations=lims,
+                        start_line=getattr(e, "start_line", 0),
+                        code=getattr(e, "code", ""),
+                    )
+                )
+        evidence_tuple = tuple(evidence_items)
+
+        ambiguity = _dedupe_str(
+            (*self.ambiguity, *(reason for e in evidence_tuple for reason in e.ambiguity))
+        )
+        truncation = _dedupe_str(
+            (*self.truncation, *(reason for e in evidence_tuple for reason in e.truncation))
+        )
+        limitations = _dedupe_str(
+            (
+                *self.limitations,
+                *(reason for e in evidence_tuple for reason in e.limitations),
+                *ambiguity,
+                *truncation,
+            )
+        )
+        sources = _dedupe_str(
+            (*self.sources, *(e.source for e in evidence_tuple if e.source), *self.scope.sources)
+        )
+        scope = (
+            replace(self.scope, sources=sources)
+            if sources != self.scope.sources
+            else self.scope
+        )
+
+        if not evidence_tuple:
+            status: EvidenceStatus = "NO_EVIDENCE"
+        elif ambiguity or truncation or limitations:
             status = "INCOMPLETE"
-        definitions = sorted(self.definitions)
-        targets = ", ".join(f"{path}:{symbol}" for path, symbol in definitions[:8]) or "none"
-        if len(definitions) > 8:
-            targets += ", [additional definitions omitted]"
-        sources = ", ".join(e.format().splitlines()[0] for e in excerpts) or "none"
-        return f"{status} (first direct calls only). Definitions: {targets}. Sources: {sources}"
+        else:
+            status = "COMPLETE_WITHIN_SCOPE"
+
+        return CallerEvidenceResult(
+            status=status,
+            evidence=evidence_tuple,
+            excerpts=excerpt_tuple,
+            definitions=tuple(sorted(self.definitions)),
+            scope=scope,
+            ambiguity=ambiguity,
+            truncation=truncation,
+            limitations=limitations,
+            sources=sources,
+        )
+
+    def describe(self, excerpts: Sequence[CallerExcerpt] | None = None) -> str:
+        if excerpts is None and self.result is not None:
+            return self.result.describe()
+        if (
+            excerpts is not None
+            and self.result is not None
+            and tuple(excerpts) == self.result.excerpts
+        ):
+            return self.result.describe()
+        return self.to_result(excerpts or ()).describe()
 
 
 class CallerFinder(Protocol):
@@ -191,6 +555,7 @@ class CallerFinder(Protocol):
         max_files: int = 3,
         max_chars: int = 700,
         context_lines: int = 3,
+        report: CallerEvidenceReport | None = None,
     ) -> tuple[CallerExcerpt, ...]:
         """Return bounded caller excerpts for editable symbols referenced in message."""
         ...
@@ -278,6 +643,8 @@ def _dotted_name(expr: ast.AST) -> str | None:
 class PythonAstCallerFinder:
     """AST-based caller finder for Python modules and methods."""
 
+    source: str = "python_ast"
+
     def supports(self, path: str) -> bool:
         return Path(path).suffix == ".py"
 
@@ -305,6 +672,7 @@ class PythonAstCallerFinder:
         # (module, class_name, method_name)
         target_methods: set[tuple[str, str, str]] = set()
         target_modules: set[str] = set()
+        symbol_def_count: dict[str, int] = {}
 
         for name in editable:
             if not self.supports(name):
@@ -321,9 +689,10 @@ class PythonAstCallerFinder:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if node.name in words:
                         if report is not None:
-                            report.definitions.add((name, node.name))
+                            report.record_definition(name, node.name)
                         target_funcs.add((module, node.name))
                         target_modules.add(module)
+                        symbol_def_count[node.name] = symbol_def_count.get(node.name, 0) + 1
                 elif isinstance(node, ast.ClassDef):
                     for item in node.body:
                         if (
@@ -331,12 +700,16 @@ class PythonAstCallerFinder:
                             and item.name in words
                         ):
                             if report is not None:
-                                report.definitions.add((name, item.name))
+                                report.record_definition(name, item.name)
                             target_methods.add((module, node.name, item.name))
                             target_modules.add(module)
+                            symbol_def_count[item.name] = symbol_def_count.get(item.name, 0) + 1
 
         if not target_funcs and not target_methods:
             return ()
+
+        if report is not None and any(count > 1 for count in symbol_def_count.values()):
+            report.record_ambiguity("duplicate symbol definition")
 
         target_symbols = {sym for _, sym in target_funcs} | {m for _, _, m in target_methods}
         excerpts: list[CallerExcerpt] = []
@@ -413,7 +786,7 @@ class PythonAstCallerFinder:
             if not func_aliases and not module_aliases and not allowed_method_names:
                 continue
 
-            matched_call = self._find_first_call(
+            matched_calls = self._find_calls(
                 tree,
                 func_aliases=func_aliases,
                 module_aliases=module_aliases,
@@ -421,27 +794,40 @@ class PythonAstCallerFinder:
                 allowed_method_names=allowed_method_names,
                 unrelated_module_aliases=unrelated_module_aliases,
             )
-            if matched_call is None:
+            if not matched_calls:
                 continue
 
-            call_node, symbol = matched_call
+            call_node, symbol, kind = matched_calls[0]
             lines = source.splitlines()
             start = max(0, call_node.lineno - ctx)
+            end_line = min(len(lines), call_node.lineno + ctx)
             snippet = "\n".join(lines[start : call_node.lineno + ctx])
-            limitations = []
+            ambiguity: list[str] = []
+            truncation: list[str] = []
             if len(snippet) > max_chars:
-                limitations.append("excerpt truncated")
+                truncation.append("excerpt truncated")
             if call_node.end_lineno and call_node.end_lineno > call_node.lineno + ctx:
-                limitations.append("multiline call truncated")
-            if symbol in allowed_method_names:
-                limitations.append("ambiguous method receiver")
+                truncation.append("multiline call truncated")
+            if any(
+                other.lineno > end_line or (other.end_lineno or other.lineno) > end_line
+                for other, _, _ in matched_calls[1:]
+            ):
+                truncation.append("additional calls in file omitted")
+            if kind == "method_call":
+                ambiguity.append("ambiguous method receiver")
+            if symbol_def_count.get(symbol, 0) > 1:
+                ambiguity.append("duplicate symbol definition")
             excerpts.append(
                 CallerExcerpt(
                     path=name,
                     start_line=start + 1,
                     symbol=symbol,
                     code=snippet[:max_chars],
-                    limitations=tuple(limitations),
+                    line=call_node.lineno,
+                    kind=kind,
+                    source=self.source,
+                    ambiguity=tuple(ambiguity),
+                    truncation=tuple(truncation),
                 )
             )
             if len(excerpts) >= max_files:
@@ -450,7 +836,38 @@ class PythonAstCallerFinder:
         return tuple(excerpts)
 
     @staticmethod
+    def _find_calls(
+        tree: ast.AST,
+        *,
+        func_aliases: dict[str, str],
+        module_aliases: dict[str, str],
+        target_funcs: set[tuple[str, str]],
+        allowed_method_names: set[str],
+        unrelated_module_aliases: set[str],
+    ) -> list[tuple[ast.Call, str, str]]:
+        matches: list[tuple[int, int, ast.Call, str, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in func_aliases:
+                matches.append(
+                    (node.lineno, node.col_offset, node, func_aliases[node.func.id], "direct_call")
+                )
+                continue
+            if isinstance(node.func, ast.Attribute):
+                owner = _dotted_name(node.func.value)
+                attr = node.func.attr
+                if owner in module_aliases and (module_aliases[owner], attr) in target_funcs:
+                    matches.append((node.lineno, node.col_offset, node, attr, "direct_call"))
+                    continue
+                if attr in allowed_method_names and owner not in unrelated_module_aliases:
+                    matches.append((node.lineno, node.col_offset, node, attr, "method_call"))
+        matches.sort(key=lambda item: (item[0], item[1]))
+        return [(call_node, symbol, kind) for _, _, call_node, symbol, kind in matches]
+
+    @classmethod
     def _find_first_call(
+        cls,
         tree: ast.AST,
         *,
         func_aliases: dict[str, str],
@@ -459,25 +876,17 @@ class PythonAstCallerFinder:
         allowed_method_names: set[str],
         unrelated_module_aliases: set[str],
     ) -> tuple[ast.Call, str] | None:
-        matches: list[tuple[int, int, ast.Call, str]] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if isinstance(node.func, ast.Name) and node.func.id in func_aliases:
-                matches.append((node.lineno, node.col_offset, node, func_aliases[node.func.id]))
-                continue
-            if isinstance(node.func, ast.Attribute):
-                owner = _dotted_name(node.func.value)
-                attr = node.func.attr
-                if owner in module_aliases and (module_aliases[owner], attr) in target_funcs:
-                    matches.append((node.lineno, node.col_offset, node, attr))
-                    continue
-                if attr in allowed_method_names and owner not in unrelated_module_aliases:
-                    matches.append((node.lineno, node.col_offset, node, attr))
+        matches = cls._find_calls(
+            tree,
+            func_aliases=func_aliases,
+            module_aliases=module_aliases,
+            target_funcs=target_funcs,
+            allowed_method_names=allowed_method_names,
+            unrelated_module_aliases=unrelated_module_aliases,
+        )
         if not matches:
             return None
-        matches.sort(key=lambda item: (item[0], item[1]))
-        _, _, call_node, symbol = matches[0]
+        call_node, symbol, _ = matches[0]
         return call_node, symbol
 
 
@@ -664,6 +1073,8 @@ def _extract_callee_name(call_node) -> tuple[str | None, str | None]:
 class TreeSitterCallerFinder:
     """Language-agnostic caller finder backed by tree-sitter queries with regex fallback."""
 
+    source: str = "tree_sitter"
+
     def supports(self, path: str) -> bool:
         return Path(path).suffix != ".py"
 
@@ -699,11 +1110,14 @@ class TreeSitterCallerFinder:
             for sym in defined:
                 if sym in words:
                     if report is not None:
-                        report.definitions.add((name, sym))
+                        report.record_definition(name, sym)
                     targets.setdefault(sym, set()).add(name)
 
         if not targets:
             return ()
+
+        if report is not None and any(len(paths) > 1 for paths in targets.values()):
+            report.record_ambiguity("duplicate symbol definition")
 
         excerpts: list[CallerExcerpt] = []
         for name in sorted(candidates):
@@ -723,17 +1137,21 @@ class TreeSitterCallerFinder:
             if not any(tok in source for tok in search_tokens):
                 continue
 
-            match = self._find_first_call_line(name, source, call_names, ns_aliases)
-            if match is None:
+            matches, kind = self._find_call_lines(name, source, call_names, ns_aliases)
+            if not matches:
                 continue
 
-            lineno, symbol = match
+            lineno, symbol = matches[0]
             lines = source.splitlines()
             start = max(0, lineno - ctx)
+            end_row = min(len(lines) - 1, lineno + ctx)
             snippet = "\n".join(lines[start : lineno + ctx + 1])
-            limitations = []
+            ambiguity: list[str] = []
+            truncation: list[str] = []
             if len(snippet) > max_chars:
-                limitations.append("excerpt truncated")
+                truncation.append("excerpt truncated")
+            if any(other_row > end_row for other_row, _ in matches[1:]):
+                truncation.append("additional calls in file omitted")
             is_js_ts = Path(name).suffix.lower() in _JS_TS_SUFFIXES
             if is_js_ts:
                 named, namespaces = _parse_js_imports(source)
@@ -745,16 +1163,24 @@ class TreeSitterCallerFinder:
                     for target in targets[symbol]
                 )
                 if len(targets[symbol]) != 1 or not resolved:
-                    limitations.append("ambiguous symbol binding")
+                    ambiguity.append("ambiguous symbol binding")
+                if len(targets[symbol]) > 1:
+                    ambiguity.append("duplicate symbol definition")
             elif len(targets[symbol]) != 1:
-                limitations.append("ambiguous symbol binding")
+                ambiguity.append("ambiguous symbol binding")
+                if len(targets[symbol]) > 1:
+                    ambiguity.append("duplicate symbol definition")
             excerpts.append(
                 CallerExcerpt(
                     path=name,
                     start_line=start + 1,
                     symbol=symbol,
                     code=snippet[:max_chars],
-                    limitations=tuple(limitations),
+                    line=lineno + 1,
+                    kind=kind,
+                    source=self.source,
+                    ambiguity=tuple(ambiguity),
+                    truncation=tuple(truncation),
                 )
             )
             if len(excerpts) >= max_files:
@@ -849,6 +1275,20 @@ class TreeSitterCallerFinder:
 
         return call_names, ns_aliases
 
+    def _find_call_lines(
+        self,
+        path: str,
+        source: str,
+        call_names: dict[str, str],
+        ns_aliases: dict[str, set[str]],
+    ) -> tuple[list[tuple[int, str]], str]:
+        lang = _resolve_lang(path)
+        if lang:
+            matches = self._find_ts_call_lines(lang, source, call_names, ns_aliases)
+            if matches:
+                return matches, "direct_call"
+        return self._find_regex_call_lines(source, call_names, ns_aliases), "regex_call"
+
     def _find_first_call_line(
         self,
         path: str,
@@ -856,20 +1296,16 @@ class TreeSitterCallerFinder:
         call_names: dict[str, str],
         ns_aliases: dict[str, set[str]],
     ) -> tuple[int, str] | None:
-        lang = _resolve_lang(path)
-        if lang:
-            match = self._find_ts_call_line(lang, source, call_names, ns_aliases)
-            if match is not None:
-                return match
-        return self._find_regex_call_line(source, call_names, ns_aliases)
+        matches, _ = self._find_call_lines(path, source, call_names, ns_aliases)
+        return matches[0] if matches else None
 
-    def _find_ts_call_line(
+    def _find_ts_call_lines(
         self,
         lang: str,
         source: str,
         call_names: dict[str, str],
         ns_aliases: dict[str, set[str]],
-    ) -> tuple[int, str] | None:
+    ) -> list[tuple[int, str]]:
         try:
             warnings.simplefilter("ignore", category=FutureWarning)
             from grep_ast.tsl import get_language, get_parser
@@ -879,7 +1315,7 @@ class TreeSitterCallerFinder:
             parser = get_parser(lang)
             tree = parser.parse(source.encode("utf-8"))
         except Exception:
-            return None
+            return []
 
         scm_path = _get_scm_path(lang)
         scm_text = ""
@@ -915,7 +1351,7 @@ class TreeSitterCallerFinder:
                         matches.append((row, col, called))
             if matches:
                 matches.sort(key=lambda item: (item[0], item[1]))
-                return matches[0][0], matches[0][2]
+                return [(row, sym) for row, _, sym in matches]
 
         # Path 2: Tree-sitter AST walk for call nodes (e.g. TypeScript, Java, C#).
         ast_matches: list[tuple[int, int, str]] = []
@@ -933,15 +1369,25 @@ class TreeSitterCallerFinder:
 
         if ast_matches:
             ast_matches.sort(key=lambda item: (item[0], item[1]))
-            return ast_matches[0][0], ast_matches[0][2]
-        return None
+            return [(row, sym) for row, _, sym in ast_matches]
+        return []
 
-    @staticmethod
-    def _find_regex_call_line(
+    def _find_ts_call_line(
+        self,
+        lang: str,
         source: str,
         call_names: dict[str, str],
         ns_aliases: dict[str, set[str]],
     ) -> tuple[int, str] | None:
+        matches = self._find_ts_call_lines(lang, source, call_names, ns_aliases)
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _find_regex_call_lines(
+        source: str,
+        call_names: dict[str, str],
+        ns_aliases: dict[str, set[str]],
+    ) -> list[tuple[int, str]]:
         patterns: list[tuple[re.Pattern[str], str]] = [
             (re.compile(rf"\b{re.escape(local)}\s*\("), sym)
             for local, sym in sorted(call_names.items())
@@ -953,15 +1399,27 @@ class TreeSitterCallerFinder:
                 )
 
         if not patterns:
-            return None
+            return []
 
+        matches: list[tuple[int, str]] = []
         for row, line in enumerate(source.splitlines()):
             if _DECL_LINE_RE.match(line):
                 continue
             for pattern, sym in patterns:
                 if pattern.search(line):
-                    return row, sym
-        return None
+                    matches.append((row, sym))
+                    break
+        return matches
+
+    @classmethod
+    def _find_regex_call_line(
+        cls,
+        source: str,
+        call_names: dict[str, str],
+        ns_aliases: dict[str, set[str]],
+    ) -> tuple[int, str] | None:
+        matches = cls._find_regex_call_lines(source, call_names, ns_aliases)
+        return matches[0] if matches else None
 
 
 _TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs"})
@@ -997,6 +1455,240 @@ class CompositeCallerFinder:
     def supports(self, path: str) -> bool:
         return any(finder.supports(path) for finder in self.finders)
 
+    def discover_callers(
+        self,
+        root: Path,
+        message: str,
+        editable: Sequence[str],
+        candidates: Sequence[str],
+        *,
+        max_files: int = 3,
+        max_chars: int = 700,
+        context_lines: int = 3,
+        report: CallerEvidenceReport | None = None,
+    ) -> CallerEvidenceResult:
+        active_report = report if report is not None else CallerEvidenceReport()
+        editable_tuple = tuple(editable)
+        editable_norm = {Path(p.replace("\\", "/")).as_posix() for p in editable_tuple if p}
+
+        seen_candidates: set[str] = set()
+        unique_candidates_list: list[str] = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            norm = Path(candidate.replace("\\", "/")).as_posix()
+            if norm not in editable_norm and norm not in seen_candidates:
+                seen_candidates.add(norm)
+                unique_candidates_list.append(norm)
+        unique_candidates = tuple(sorted(unique_candidates_list))
+        prod_candidates = tuple(c for c in unique_candidates if not _is_test_path(c))
+        test_candidates = tuple(c for c in unique_candidates if _is_test_path(c))
+
+        if max_files <= 0 or max_chars <= 0:
+            active_report.record_truncation("budget cap zero")
+            active_report.scope = CallerScope(
+                pool="none",
+                editable=editable_tuple,
+                candidates_total=len(unique_candidates),
+                candidates_searched=0,
+                production_candidates=len(prod_candidates),
+                test_candidates=len(test_candidates),
+                omitted_test_candidates=len(test_candidates),
+                matched_files=0,
+                selected_files=0,
+                max_files=max_files,
+                max_chars=max_chars,
+                context_lines=context_lines,
+                sources=tuple(active_report.sources),
+            )
+            result = active_report.to_result(())
+            active_report.result = result
+            return result
+
+        if not editable_tuple:
+            active_report.scope = CallerScope(
+                pool="none",
+                editable=(),
+                candidates_total=len(unique_candidates),
+                candidates_searched=0,
+                production_candidates=len(prod_candidates),
+                test_candidates=len(test_candidates),
+                omitted_test_candidates=0,
+                matched_files=0,
+                selected_files=0,
+                max_files=max_files,
+                max_chars=max_chars,
+                context_lines=context_lines,
+                sources=tuple(active_report.sources),
+            )
+            result = active_report.to_result(())
+            active_report.result = result
+            return result
+
+        resolved_root = Path(root).resolve()
+
+        # Prefer real production callers; only fall back to test/smoke files when no
+        # production caller matches (prevents weak smoke assertions from diluting contracts).
+        named_pools: list[tuple[ScopePool, tuple[str, ...]]] = []
+        if prod_candidates:
+            named_pools.append(("production", prod_candidates))
+        if test_candidates:
+            named_pools.append(("tests", test_candidates))
+        if not named_pools:
+            named_pools.append(("none", ()))
+
+        searched_count = 0
+        for pool_name, pool in named_pools:
+            searched_count += len(pool)
+            by_key: dict[tuple[str, int, str], CallerExcerpt] = {}
+            for finder in self.finders:
+                supported_editable = [p for p in editable_tuple if finder.supports(p)]
+                supported_candidates = [p for p in pool if finder.supports(p)]
+                if not supported_editable:
+                    continue
+                finder_source = _finder_source(finder)
+                active_report.record_source(finder_source)
+
+                before_amb = set(active_report.ambiguity)
+                before_trunc = set(active_report.truncation)
+                before_lim = set(active_report.limitations)
+
+                kwargs: dict[str, object] = {
+                    "max_files": max_files + 1,
+                    "max_chars": max_chars,
+                    "context_lines": context_lines,
+                }
+                if _supports_report_arg(finder):
+                    kwargs["report"] = active_report
+
+                found = finder.find_callers(
+                    resolved_root,
+                    message,
+                    supported_editable,
+                    supported_candidates,
+                    **kwargs,
+                )
+
+                added_amb = tuple(x for x in active_report.ambiguity if x not in before_amb)
+                added_trunc = tuple(x for x in active_report.truncation if x not in before_trunc)
+                added_lim = tuple(x for x in active_report.limitations if x not in before_lim)
+
+                for raw_excerpt in found:
+                    source_name = (
+                        raw_excerpt.source
+                        if raw_excerpt.source and raw_excerpt.source != "builtin"
+                        else finder_source
+                    )
+                    active_report.record_source(source_name)
+                    enriched = replace(
+                        raw_excerpt,
+                        source=source_name,
+                        scope=raw_excerpt.scope or pool_name,
+                        ambiguity=_dedupe_str((*raw_excerpt.ambiguity, *added_amb)),
+                        truncation=_dedupe_str((*raw_excerpt.truncation, *added_trunc)),
+                        limitations=_dedupe_str((*raw_excerpt.limitations, *added_lim)),
+                    )
+                    key = (enriched.path, enriched.line, enriched.symbol)
+                    existing = by_key.get(key)
+                    if existing is None:
+                        by_key[key] = enriched
+                    else:
+                        by_key[key] = replace(
+                            existing,
+                            ambiguity=_dedupe_str((*existing.ambiguity, *enriched.ambiguity)),
+                            truncation=_dedupe_str((*existing.truncation, *enriched.truncation)),
+                            limitations=_dedupe_str((*existing.limitations, *enriched.limitations)),
+                        )
+
+            if by_key:
+                ordered = sorted(
+                    by_key.values(), key=lambda item: (item.path, item.line, item.symbol)
+                )
+                distinct_paths = tuple(dict.fromkeys(item.path for item in ordered))
+                allowed_paths = set(distinct_paths[:max_files])
+                selected = [item for item in ordered if item.path in allowed_paths]
+
+                if len(distinct_paths) > max_files:
+                    active_report.record_truncation("additional files omitted")
+                    selected[-1] = replace(
+                        selected[-1],
+                        truncation=(*selected[-1].truncation, "additional files omitted"),
+                    )
+
+                missing = {name for _, name in active_report.definitions} - {
+                    e.symbol for e in selected
+                }
+                if missing:
+                    active_report.record_limitation("unmatched target symbols")
+                    selected[-1] = replace(
+                        selected[-1],
+                        limitations=(*selected[-1].limitations, "unmatched target symbols"),
+                    )
+
+                represented_amb = {item for e in selected for item in e.ambiguity}
+                represented_trunc = {item for e in selected for item in e.truncation}
+                represented_lim = {item for e in selected for item in e.limitations}
+                extra_amb = tuple(x for x in active_report.ambiguity if x not in represented_amb)
+                extra_trunc = tuple(
+                    x for x in active_report.truncation if x not in represented_trunc
+                )
+                extra_lim = tuple(x for x in active_report.limitations if x not in represented_lim)
+                if extra_amb or extra_trunc or extra_lim:
+                    selected[-1] = replace(
+                        selected[-1],
+                        ambiguity=(*selected[-1].ambiguity, *extra_amb),
+                        truncation=(*selected[-1].truncation, *extra_trunc),
+                        limitations=(*selected[-1].limitations, *extra_lim),
+                    )
+
+                omitted_tests = len(test_candidates) if pool_name == "production" else 0
+                active_report.scope = CallerScope(
+                    pool=pool_name,
+                    editable=editable_tuple,
+                    candidates_total=len(unique_candidates),
+                    candidates_searched=searched_count,
+                    production_candidates=len(prod_candidates),
+                    test_candidates=len(test_candidates),
+                    omitted_test_candidates=omitted_tests,
+                    matched_files=len(distinct_paths),
+                    selected_files=len(allowed_paths),
+                    max_files=max_files,
+                    max_chars=max_chars,
+                    context_lines=context_lines,
+                    sources=tuple(active_report.sources),
+                )
+                result = active_report.to_result(tuple(selected))
+                active_report.result = result
+                return result
+
+        if prod_candidates and test_candidates:
+            final_pool: ScopePool = "production+tests"
+        elif prod_candidates:
+            final_pool = "production"
+        elif test_candidates:
+            final_pool = "tests"
+        else:
+            final_pool = "none"
+
+        active_report.scope = CallerScope(
+            pool=final_pool,
+            editable=editable_tuple,
+            candidates_total=len(unique_candidates),
+            candidates_searched=searched_count,
+            production_candidates=len(prod_candidates),
+            test_candidates=len(test_candidates),
+            omitted_test_candidates=0,
+            matched_files=0,
+            selected_files=0,
+            max_files=max_files,
+            max_chars=max_chars,
+            context_lines=context_lines,
+            sources=tuple(active_report.sources),
+        )
+        result = active_report.to_result(())
+        active_report.result = result
+        return result
+
     def find_callers(
         self,
         root: Path,
@@ -1009,70 +1701,74 @@ class CompositeCallerFinder:
         context_lines: int = 3,
         report: CallerEvidenceReport | None = None,
     ) -> tuple[CallerExcerpt, ...]:
-        if max_files <= 0 or max_chars <= 0:
-            return ()
-        resolved_root = Path(root).resolve()
-        editable_tuple = tuple(editable)
-        editable_norm = {Path(p).as_posix() for p in editable_tuple}
-        unique_candidates = tuple(
-            c for c in sorted(set(candidates)) if Path(c).as_posix() not in editable_norm
-        )
-        if not editable_tuple or (not unique_candidates and report is None):
-            return ()
-
-        prod_candidates = tuple(c for c in unique_candidates if not _is_test_path(c))
-        test_candidates = tuple(c for c in unique_candidates if _is_test_path(c))
-
-        # Prefer real production callers; only fall back to test/smoke files when no
-        # production caller matches (prevents weak smoke assertions from diluting contracts).
-        pools = [pool for pool in (prod_candidates, test_candidates) if pool]
-        for pool in pools or [()]:
-            by_path: dict[str, CallerExcerpt] = {}
-            for finder in self.finders:
-                supported_editable = [p for p in editable_tuple if finder.supports(p)]
-                supported_candidates = [p for p in pool if finder.supports(p)]
-                if not supported_editable or (not supported_candidates and report is None):
-                    continue
-                found = finder.find_callers(
-                    resolved_root,
-                    message,
-                    supported_editable,
-                    supported_candidates,
-                    **(
-                        {"report": report}
-                        if report is not None
-                        and isinstance(finder, (PythonAstCallerFinder, TreeSitterCallerFinder))
-                        else {}
-                    ),
-                    max_files=max_files + 1,
-                    max_chars=max_chars,
-                    context_lines=context_lines,
-                )
-                for excerpt in found:
-                    by_path.setdefault(excerpt.path, excerpt)
-            if by_path:
-                ordered = sorted(by_path.values(), key=lambda item: item.path)
-                selected = ordered[:max_files]
-                if len(ordered) > max_files:
-                    selected[-1] = replace(
-                        selected[-1],
-                        limitations=(*selected[-1].limitations, "additional files omitted"),
-                    )
-                if report is not None:
-                    missing = {name for _, name in report.definitions} - {
-                        e.symbol for e in selected
-                    }
-                    if missing:
-                        selected[-1] = replace(
-                            selected[-1],
-                            limitations=(*selected[-1].limitations, "unmatched target symbols"),
-                        )
-                return tuple(selected)
-
-        return ()
+        return self.discover_callers(
+            root,
+            message,
+            editable,
+            candidates,
+            max_files=max_files,
+            max_chars=max_chars,
+            context_lines=context_lines,
+            report=report,
+        ).excerpts
 
 
 _DEFAULT_FINDER = CompositeCallerFinder()
+
+
+def discover_related_callers(
+    root: Path | str,
+    message: str,
+    editable: Iterable[str],
+    candidates: Iterable[str],
+    *,
+    max_files: int = 3,
+    max_chars: int = 700,
+    context_lines: int = 3,
+    report: CallerEvidenceReport | None = None,
+    finder: CallerFinder | None = None,
+) -> CallerEvidenceResult:
+    """Discover bounded local caller evidence and return an immutable scoped result."""
+    target_finder = _DEFAULT_FINDER if finder is None else finder
+    resolved_root = Path(root)
+    editable_tuple = tuple(editable)
+    candidates_tuple = tuple(candidates)
+
+    if isinstance(target_finder, CompositeCallerFinder):
+        return target_finder.discover_callers(
+            resolved_root,
+            message,
+            editable_tuple,
+            candidates_tuple,
+            max_files=max_files,
+            max_chars=max_chars,
+            context_lines=context_lines,
+            report=report,
+        )
+
+    discover_fn = getattr(target_finder, "discover_callers", None)
+    if callable(discover_fn):
+        return discover_fn(
+            resolved_root,
+            message,
+            editable_tuple,
+            candidates_tuple,
+            max_files=max_files,
+            max_chars=max_chars,
+            context_lines=context_lines,
+            report=report,
+        )
+
+    return CompositeCallerFinder((target_finder,)).discover_callers(
+        resolved_root,
+        message,
+        editable_tuple,
+        candidates_tuple,
+        max_files=max_files,
+        max_chars=max_chars,
+        context_lines=context_lines,
+        report=report,
+    )
 
 
 def find_related_callers(
@@ -1085,18 +1781,20 @@ def find_related_callers(
     max_chars: int = 700,
     context_lines: int = 3,
     report: CallerEvidenceReport | None = None,
+    finder: CallerFinder | None = None,
 ) -> tuple[CallerExcerpt, ...]:
     """Find bounded local caller excerpts across Python and non-Python source files."""
-    return _DEFAULT_FINDER.find_callers(
-        Path(root),
+    return discover_related_callers(
+        root,
         message,
-        tuple(editable),
-        tuple(candidates),
-        report=report,
+        editable,
+        candidates,
         max_files=max_files,
         max_chars=max_chars,
         context_lines=context_lines,
-    )
+        report=report,
+        finder=finder,
+    ).excerpts
 
 
 def related_callers(
@@ -1104,14 +1802,23 @@ def related_callers(
     message: str,
     editable: Iterable[str],
     candidates: Iterable[str],
+    *,
+    finder: CallerFinder | None = None,
 ) -> str:
     """Backwards-compatible wrapper returning formatted caller excerpts joined by blank lines."""
-    excerpts = find_related_callers(root, message, editable, candidates, context_lines=3)
+    excerpts = find_related_callers(
+        root,
+        message,
+        editable,
+        candidates,
+        context_lines=3,
+        finder=finder,
+    )
     return "\n\n".join(f"{e.path}:{e.start_line}\n{e.code}" for e in excerpts)
 
 
 def format_caller_context(
-    excerpts: Iterable[CallerExcerpt],
+    excerpts: Iterable[CallerExcerpt] | CallerEvidenceResult,
     *,
     hint: str | None = None,
     mode: str = "passive",
@@ -1127,7 +1834,7 @@ def format_caller_context(
     if mode not in ("passive", "contract"):
         raise ValueError(f"Unknown caller context mode: {mode!r}")
 
-    items = tuple(excerpts)
+    items = excerpts.excerpts if isinstance(excerpts, CallerEvidenceResult) else tuple(excerpts)
     if not items:
         return ""
 

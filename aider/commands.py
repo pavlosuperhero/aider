@@ -1,6 +1,7 @@
 import glob
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -417,6 +418,16 @@ class Commands:
 
     def _drop_all_files(self):
         self.coder.abs_fnames = set()
+        if hasattr(self.coder, "read_only_ranges"):
+            self.coder.read_only_ranges = []
+            if hasattr(self.coder, "_turn_supplementary_evidence"):
+                self.coder._turn_supplementary_evidence = tuple(
+                    ev
+                    for ev in (self.coder._turn_supplementary_evidence or ())
+                    if getattr(ev, "kind", "") != "read-range"
+                )
+            if hasattr(self.coder, "_sync_local_caller_supplementary_evidence"):
+                self.coder._sync_local_caller_supplementary_evidence()
 
         # When dropping all files, keep those that were originally provided via args.read
         if self.original_read_only_fnames:
@@ -700,6 +711,9 @@ class Commands:
             fname = f'"{fname}"'
         return fname
 
+    def completions_raw_read(self, document, complete_event):
+        return self.completions_raw_read_only(document, complete_event)
+
     def completions_raw_read_only(self, document, complete_event):
         # Get the text before the cursor
         text = document.text_before_cursor
@@ -906,7 +920,16 @@ class Commands:
     def completions_drop(self):
         files = self.coder.get_inchat_relative_files()
         read_only_files = [self.coder.get_rel_fname(fn) for fn in self.coder.abs_read_only_fnames]
-        all_files = files + read_only_files
+        range_paths = []
+        for item in getattr(self.coder, "read_only_ranges", ()) or ():
+            source = getattr(item, "source", "")
+            if source:
+                range_paths.append(source)
+                rel_path = re.sub(r"\s+\[[^\]]+\]$", "", source)
+                rel_path = re.sub(r":\d+(?:-\d+)?$", "", rel_path)
+                if rel_path and rel_path != source:
+                    range_paths.append(rel_path)
+        all_files = list(dict.fromkeys(files + read_only_files + range_paths))
         all_files = [self.quote_fname(fn) for fn in all_files]
         return all_files
 
@@ -946,6 +969,12 @@ class Commands:
             for matched_file in read_only_matched:
                 self.coder.abs_read_only_fnames.remove(matched_file)
                 self.io.tool_output(f"Removed read-only file {matched_file} from the chat")
+
+            if hasattr(self.coder, "drop_read_only_ranges"):
+                for removed_range in self.coder.drop_read_only_ranges(expanded_word):
+                    self.io.tool_output(
+                        f"Removed read-only range {removed_range.source} from the chat"
+                    )
 
             # For editable files, use glob if word contains glob chars, otherwise use substring
             if any(c in expanded_word for c in "*?[]"):
@@ -1340,6 +1369,10 @@ class Commands:
         except Exception as e:
             self.io.tool_error(f"Error processing clipboard content: {e}")
 
+    def cmd_read(self, args):
+        "Alias for /read-only: Add files to the chat that are for reference only"
+        return self.cmd_read_only(args)
+
     def cmd_read_only(self, args):
         "Add files to the chat that are for reference only, or turn added files to read-only"
         if not args.strip():
@@ -1693,6 +1726,193 @@ Just show me the edits I need to make.
             )
         except Exception as e:
             self.io.tool_error(f"An unexpected error occurred while copying to clipboard: {str(e)}")
+
+    def completions_read_range(self):
+        files = set(self.coder.get_all_relative_files())
+        return [self.quote_fname(fn) for fn in files]
+
+    def cmd_read_range(self, args=""):
+        (
+            "Display a bounded read-only line range from a file "
+            "(usage: /read-range <path> <start>-<end>)"
+        )
+        raw = (args or "").strip()
+        if not raw:
+            self.io.tool_output(
+                "Usage: /read-range <path> <start>-<end> | "
+                "/read-range <path> <start> <end> | "
+                "/read-range <path>:<start>-<end>"
+            )
+            return
+
+        parsed = _parse_read_range_args(raw)
+        if parsed is None:
+            self.io.tool_error(
+                "Invalid range specification. Use <path>:<start>-<end>, "
+                "<path> <start>-<end>, or <path> <start> <end>."
+            )
+            return
+
+        path, start_line, end_line = parsed
+        try:
+            result = self.coder.read_file_range(path, start_line, end_line)
+        except Exception as err:
+            self.io.tool_error(f"Unable to read range {path}:{start_line}-{end_line}: {err}")
+            return
+
+        evidence = self.coder.add_read_only_range(result)
+        if evidence is None:
+            self.io.tool_warning(f"No lines returned for {path}:{start_line}-{end_line}.")
+            return
+
+        self.io.tool_output(evidence.format())
+
+    def cmd_fact(self, args=""):
+        (
+            "Record or inspect project facts (/fact [-f path] [-t tag] <statement> | "
+            "/fact list | /fact search <query> | /fact show <id>)"
+        )
+        if not getattr(self.coder, "facts_enabled", False) and getattr(
+            self.coder, "facts_store", None
+        ) is None:
+            self.io.tool_error("Project facts are disabled. Start aider with --facts to enable.")
+            return
+
+        store = self.coder._get_facts_store()
+        if store is None or not store.active:
+            diag = getattr(store, "diagnostic", "") or "Project facts are unavailable."
+            self.io.tool_error(diag)
+            return
+
+        raw = (args or "").strip()
+        if not raw:
+            subcmd, rest = "list", ""
+        else:
+            parts = raw.split(None, 1)
+            subcmd = parts[0].lower()
+            rest = parts[1].strip() if len(parts) > 1 else ""
+
+        try:
+            if subcmd in ("list", "ls") and not rest:
+                items = self.coder.list_project_facts(limit=20)
+                if not items:
+                    self.io.tool_output("No project facts recorded for this worktree.")
+                    return
+                for item in items:
+                    self.io.tool_output(item.format())
+                return
+
+            if subcmd in ("search", "query", "find"):
+                if not rest:
+                    self.io.tool_error("Usage: /fact search <query>")
+                    return
+                items = self.coder.search_project_facts(rest, limit=10)
+                if not items:
+                    self.io.tool_output("No matching project facts found.")
+                    return
+                for item in items:
+                    self.io.tool_output(item.format())
+                return
+
+            if subcmd in ("show", "get"):
+                if not rest:
+                    self.io.tool_error("Usage: /fact show <id>")
+                    return
+                item = self.coder.get_project_fact(rest)
+                if item is None:
+                    self.io.tool_output("No matching project facts found.")
+                    return
+                self.io.tool_output(item.format())
+                return
+
+            if subcmd == "confirm":
+                if not rest:
+                    self.io.tool_error("Usage: /fact confirm <id>")
+                    return
+                confirmed = store.confirm_fact(rest)
+                if confirmed is None:
+                    self.io.tool_error(f"Project fact not found: {rest}")
+                else:
+                    self.io.tool_output(f"Confirmed project fact {confirmed.fact_id}.")
+                return
+
+            if subcmd == "invalidate":
+                if not rest:
+                    self.io.tool_error("Usage: /fact invalidate <id> [reason]")
+                    return
+                inv_parts = rest.split(None, 1)
+                fact_id = inv_parts[0]
+                reason = inv_parts[1].strip() if len(inv_parts) > 1 else "invalidated"
+                updated = store.invalidate_fact(fact_id, reason=reason)
+                if updated is None:
+                    self.io.tool_error(f"Project fact not found: {fact_id}")
+                else:
+                    self.io.tool_output(f"Invalidated project fact {updated.fact_id}.")
+                return
+
+            fact_args = rest if subcmd == "add" else raw
+            if not fact_args:
+                self.io.tool_error(
+                    "Usage: /fact [-f path] [-t tag] [--symbol name] "
+                    "[--line start[:end]] <statement>"
+                )
+                return
+            result = self.coder.record_project_fact(fact_args)
+        except Exception as err:
+            self.io.tool_error(f"Project facts error: {err}")
+            return
+
+        if result.ok:
+            self.io.tool_output(result.message)
+        else:
+            self.io.tool_error(result.message)
+
+
+_LINE_SPAN_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+def _parse_line_span(span_str):
+    match = _LINE_SPAN_RE.fullmatch(span_str.strip())
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) is not None else start
+    if start < 1 or end < start:
+        return None
+    return start, end
+
+
+def _parse_read_range_args(raw):
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return None
+    if not tokens or len(tokens) > 3:
+        return None
+    if len(tokens) == 1:
+        if ":" not in tokens[0]:
+            return None
+        path, span_str = tokens[0].rsplit(":", 1)
+        if not path:
+            return None
+        span = _parse_line_span(span_str)
+        if span is None:
+            return None
+        return path, span[0], span[1]
+    if len(tokens) == 2:
+        path, span_str = tokens
+        span = _parse_line_span(span_str)
+        if not path or span is None:
+            return None
+        return path, span[0], span[1]
+    path, start_str, end_str = tokens
+    if not path or not start_str.isdigit() or not end_str.isdigit():
+        return None
+    start = int(start_str)
+    end = int(end_str)
+    if start < 1 or end < start:
+        return None
+    return path, start, end
 
 
 def expand_subdir(file_path):

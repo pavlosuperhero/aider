@@ -2,6 +2,7 @@
 
 import base64
 import difflib
+import fnmatch
 import hashlib
 import json
 import locale
@@ -87,12 +88,20 @@ all_fences = [
 ]
 
 
+def _extract_range_rel_path(source):
+    text = (source or "").strip()
+    text = re.sub(r"\s+\[[^\]]+\]$", "", text)
+    text = re.sub(r":\d+(?:-\d+)?$", "", text)
+    return text
+
+
 class Coder:
     abs_fnames = None
     abs_read_only_fnames = None
     repo = None
     last_aider_commit_hash = None
     aider_edited_files = None
+    dry_run_edited = False
     last_asked_for_commit_time = 0
     repo_map = None
     functions = None
@@ -102,6 +111,7 @@ class Coder:
     num_reflections = 0
     max_reflections = 3
     edit_format = None
+    allows_edits = True
     yield_stream = False
     temperature = None
     auto_lint = True
@@ -122,6 +132,16 @@ class Coder:
     chat_language = None
     commit_language = None
     file_watcher = None
+    local_callers = False
+    local_callers_mode = "passive"
+    local_callers_hint = None
+    _local_caller_excerpts = ()
+    _local_caller_task = ""
+    _turn_supplementary_evidence = ()
+    _turn_facts_context = ""
+    _turn_auto_ranges = ()
+    _last_caller_result = None
+    _preserve_local_caller_state = False
 
     @classmethod
     def create(
@@ -182,6 +202,21 @@ class Coder:
                 total_tokens_sent=from_coder.total_tokens_sent,
                 total_tokens_received=from_coder.total_tokens_received,
                 file_watcher=from_coder.file_watcher,
+                local_callers=from_coder.local_callers,
+                local_callers_hint=from_coder.local_callers_hint,
+                local_callers_mode=from_coder.local_callers_mode,
+                local_callers_audit=from_coder.local_callers_audit,
+                local_callers_policy="advisory" if from_coder.caller_advisory else "strict",
+                local_callers_backend=from_coder.local_callers_backend,
+                local_callers_read_range=from_coder.local_callers_read_range,
+                local_caller_finder=from_coder.local_caller_finder,
+                read_range_reader=from_coder.read_range_reader,
+                facts=from_coder.facts_enabled,
+                facts_db=from_coder.facts_db,
+                facts_file=from_coder.facts_file,
+                chat_history_file=from_coder.chat_history_file,
+                facts_store=from_coder.facts_store,
+                read_only_ranges=list(from_coder.read_only_ranges),
             )
             use_kwargs.update(update)  # override to complete the switch
             use_kwargs.update(kwargs)  # override passed kwargs
@@ -359,11 +394,26 @@ class Coder:
         local_callers_mode="passive",
         local_callers_audit=False,
         local_callers_policy="strict",
+        local_callers_backend="builtin",
+        local_callers_read_range=False,
+        local_caller_finder=None,
+        read_range_reader=None,
+        facts=False,
+        facts_db=None,
+        facts_file=None,
+        chat_history_file=None,
+        facts_store=None,
+        read_only_ranges=None,
     ):
         if local_callers_mode not in ("passive", "contract"):
             raise ValueError(
                 f"Invalid local_callers_mode {local_callers_mode!r};"
                 " expected 'passive' or 'contract'."
+            )
+        if local_callers_backend not in ("auto", "builtin", "cymbal"):
+            raise ValueError(
+                f"Invalid local_callers_backend {local_callers_backend!r};"
+                " expected 'auto', 'builtin', or 'cymbal'."
             )
         from aider.caller_audit import CallerContractHook, IsolatedCallerAuditor
 
@@ -376,6 +426,27 @@ class Coder:
         if local_callers_policy not in ("strict", "advisory"):
             raise ValueError(f"Unknown caller policy: {local_callers_policy}")
         self.caller_advisory = local_callers_policy == "advisory"
+        self.local_callers_backend = local_callers_backend
+        self.local_callers_read_range = bool(local_callers_read_range)
+        self.local_caller_finder = local_caller_finder
+        self.read_range_reader = read_range_reader
+        self.facts_enabled = bool(facts)
+        self.facts_db = facts_db
+        self.facts_file = facts_file
+        self.chat_history_file = (
+            chat_history_file
+            if chat_history_file is not None
+            else getattr(io, "chat_history_file", None)
+        )
+        self.facts_store = facts_store
+        self.read_only_ranges = list(read_only_ranges or ())
+        self._local_caller_excerpts = ()
+        self._turn_supplementary_evidence = ()
+        self._turn_facts_context = ""
+        self._turn_auto_ranges = ()
+        self._preserve_local_caller_state = False
+        self._facts_diagnostic_shown = False
+        self._last_caller_result = None
         self._local_caller_task = ""
         self._audit_originals = {}
         self._unreviewed_paths = {}
@@ -389,13 +460,19 @@ class Coder:
             if hook is not None:
                 self.response_hooks += (hook,)
         self.local_caller_contract_hook = CallerContractHook(
-            enabled=bool(self.local_callers and self.local_callers_mode == "contract"),
+            enabled=bool(
+                self.local_callers
+                and self.local_callers_mode == "contract"
+                and self.allows_edits
+            ),
             advisory=self.caller_advisory,
         )
         if self.local_caller_contract_hook.enabled:
             self.response_hooks += (self.local_caller_contract_hook,)
         if self.local_callers and (
-            self.local_callers_audit or self.local_callers_mode == "contract"
+            self.local_callers_audit
+            or self.local_callers_mode == "contract"
+            or self.local_callers_read_range
         ):
             self.max_reflections = max(self.max_reflections, 4)
         self.local_caller_auditor = (
@@ -851,6 +928,23 @@ class Coder:
                 dict(role="assistant", content="Ok, I will use these images as references."),
             ]
 
+        if self.read_only_ranges:
+            range_blocks = "\n\n".join(item.format() for item in self.read_only_ranges)
+            readonly_messages += [
+                dict(
+                    role="user",
+                    content=(
+                        "Read-only file range excerpts (reference only; do not edit these "
+                        "files unless they are explicitly added to the chat):\n\n"
+                        + range_blocks
+                    ),
+                ),
+                dict(
+                    role="assistant",
+                    content="Ok, I will use these read-only file ranges as references.",
+                ),
+            ]
+
         return readonly_messages
 
     def get_chat_files_messages(self):
@@ -943,11 +1037,503 @@ class Coder:
             self.num_reflections += 1
             user_message = self.reflected_message
 
-    def _reset_local_caller_state(self, excerpts, task=""):
+    def _get_local_caller_finder(self):
+        if self.local_caller_finder is not None:
+            return self.local_caller_finder
+        if self.local_callers_backend == "builtin":
+            return None
+        from aider.main import create_local_caller_finder
+
+        self.local_caller_finder = create_local_caller_finder(self.local_callers_backend)
+        return self.local_caller_finder
+
+    def _get_cymbal_client(self):
+        finder = self.local_caller_finder
+        if finder is None:
+            return None
+        cymbal_finder = getattr(finder, "cymbal_finder", None)
+        if cymbal_finder is not None:
+            return getattr(cymbal_finder, "client", None)
+        return getattr(finder, "client", None)
+
+    def _find_local_callers(self, task):
+        from dataclasses import replace
+        from aider.local_callers import CallerEvidenceReport, find_related_callers
+
+        inchat = self.get_inchat_relative_files()
+        addable = self.get_addable_relative_files()
+        finder = self._get_local_caller_finder()
+        root_path = Path(self.root)
+
+        if finder is None:
+            report = CallerEvidenceReport()
+            excerpts = tuple(
+                find_related_callers(root_path, task, inchat, addable, report=report)
+            )
+            result = report.result if report.result is not None else report.to_result(excerpts)
+            description = report.describe(excerpts)
+            diagnostics = ()
+            used_cymbal = False
+        else:
+            from aider.cymbal_callers import (
+                BACKEND_CYMBAL,
+                CymbalCallerFinder,
+                CymbalEvidenceReport,
+                FallbackCallerFinder,
+            )
+
+            if isinstance(finder, FallbackCallerFinder):
+                report = CymbalEvidenceReport(backend_requested=finder.backend)
+                result = finder.lookup(root_path, task, inchat, addable, report=report)
+                excerpts = result.excerpts
+                description = report.describe(excerpts)
+                diagnostics = result.diagnostics
+                used_cymbal = result.source == BACKEND_CYMBAL and not result.fallback_used
+            elif isinstance(finder, CymbalCallerFinder):
+                report = CymbalEvidenceReport(
+                    backend_requested=self.local_callers_backend,
+                    backend_used=BACKEND_CYMBAL,
+                )
+                excerpts = tuple(
+                    finder.find_callers(root_path, task, inchat, addable, report=report)
+                )
+                result = report.to_result(excerpts)
+                description = report.describe(excerpts)
+                diagnostics = result.diagnostics
+                used_cymbal = True
+            else:
+                report = CallerEvidenceReport()
+                excerpts = tuple(
+                    finder.find_callers(root_path, task, inchat, addable, report=report)
+                )
+                result = report.result if report.result is not None else report.to_result(excerpts)
+                description = report.describe(excerpts)
+                diagnostics = ()
+                used_cymbal = False
+
+        if (
+            excerpts
+            and result.status == "INCOMPLETE"
+            and not any(getattr(e, "incomplete", False) for e in excerpts)
+        ):
+            reasons = tuple(
+                dict.fromkeys(
+                    (*getattr(result, "ambiguity", ()), *getattr(result, "truncation", ()))
+                )
+            ) or ("incomplete caller evidence",)
+            last = excerpts[-1]
+            if hasattr(last, "limitations"):
+                updated_last = replace(
+                    last,
+                    limitations=tuple(dict.fromkeys((*last.limitations, *reasons))),
+                )
+            elif hasattr(last, "incomplete"):
+                updated_last = replace(last, incomplete=True)
+            else:
+                updated_last = last
+            excerpts = (*excerpts[:-1], updated_last)
+
+        self._last_caller_result = result
+        return excerpts, description, diagnostics, used_cymbal
+
+    def _get_read_range_reader(self):
+        if self.read_range_reader is not None:
+            return self.read_range_reader
+        from aider.main import create_read_range_reader
+
+        self.read_range_reader = create_read_range_reader(
+            self.root,
+            backend=self.local_callers_backend,
+            cymbal_client=self._get_cymbal_client(),
+        )
+        return self.read_range_reader
+
+    def read_file_range(
+        self, path, start_line, end_line, *, max_lines=120, max_bytes=16384, symbol=""
+    ):
+        reader = self._get_read_range_reader()
+        return reader.read_range(
+            path,
+            start_line,
+            end_line,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            symbol=symbol,
+        )
+
+    def _range_excerpt_to_evidence(self, result):
+        from aider.caller_audit import ProvenanceEvidence, normalize_supplementary_evidence
+        from aider.read_range import LineRangeExcerpt
+
+        if isinstance(result, LineRangeExcerpt):
+            if result.is_empty:
+                return None
+            src = f"{result.path}:{result.start_line}-{result.end_line}"
+            if result.source and result.source != "native":
+                src = f"{src} [{result.source}]"
+            return ProvenanceEvidence(
+                kind="read-range",
+                source=src,
+                content=result.format(numbered=True),
+                truncated=result.truncated,
+            )
+        items = normalize_supplementary_evidence((result,), default_kind="read-range", max_items=1)
+        return items[0] if items else None
+
+    def add_read_only_range(self, result):
+        evidence = self._range_excerpt_to_evidence(result)
+        if evidence is None:
+            return None
+        self.read_only_ranges = [
+            existing for existing in self.read_only_ranges if existing.source != evidence.source
+        ]
+        self.read_only_ranges.append(evidence)
+        if len(self.read_only_ranges) > 8:
+            self.read_only_ranges = self.read_only_ranges[-8:]
+        self._sync_local_caller_supplementary_evidence()
+        return evidence
+
+    def drop_read_only_ranges(self, pattern):
+        if not pattern or not self.read_only_ranges:
+            return []
+
+        expanded = os.path.expanduser(pattern)
+        norm_pattern = expanded.replace("\\", "/")
+        has_glob = any(ch in expanded for ch in "*?[]")
+
+        kept = []
+        removed = []
+        for item in self.read_only_ranges:
+            source = getattr(item, "source", "") or ""
+            source_no_tag = re.sub(r"\s+\[[^\]]+\]$", "", source)
+            rel_path = _extract_range_rel_path(source)
+            norm_rel = rel_path.replace("\\", "/")
+            abs_path = self.abs_root_path(rel_path) if rel_path else ""
+            norm_abs = abs_path.replace("\\", "/") if abs_path else ""
+
+            matched = False
+            if (
+                expanded == source
+                or norm_pattern == source.replace("\\", "/")
+                or expanded == source_no_tag
+                or norm_pattern == source_no_tag.replace("\\", "/")
+            ):
+                matched = True
+            elif has_glob and (
+                fnmatch.fnmatch(norm_rel, norm_pattern)
+                or fnmatch.fnmatch(source.replace("\\", "/"), norm_pattern)
+            ):
+                matched = True
+            elif (
+                expanded in rel_path
+                or norm_pattern in norm_rel
+                or (abs_path and (expanded in abs_path or norm_pattern in norm_abs))
+            ):
+                matched = True
+            elif abs_path:
+                for candidate in (os.path.abspath(expanded), self.abs_root_path(expanded)):
+                    try:
+                        if os.path.samefile(candidate, abs_path):
+                            matched = True
+                            break
+                    except (FileNotFoundError, OSError):
+                        continue
+
+            if matched:
+                removed.append(item)
+            else:
+                kept.append(item)
+
+        if removed:
+            self.read_only_ranges = kept
+            removed_sources = {getattr(item, "source", "") for item in removed}
+            if self._turn_supplementary_evidence:
+                self._turn_supplementary_evidence = tuple(
+                    ev
+                    for ev in self._turn_supplementary_evidence
+                    if not (
+                        getattr(ev, "kind", "") == "read-range"
+                        and getattr(ev, "source", "") in removed_sources
+                    )
+                )
+            self._sync_local_caller_supplementary_evidence()
+        return removed
+
+    def _collect_auto_call_site_ranges(self, excerpts, *, used_cymbal=False):
+        if not self.local_callers_read_range or not excerpts:
+            return ()
+        from aider.caller_audit import normalize_supplementary_evidence
+
+        reader = self._get_read_range_reader()
+        collected = []
+        seen = set()
+        for excerpt in excerpts[:3]:
+            path = getattr(excerpt, "path", "")
+            line = getattr(excerpt, "line", 0) or getattr(excerpt, "start_line", 0)
+            symbol = getattr(excerpt, "symbol", "")
+            if not path or line < 1 or (path, line) in seen:
+                continue
+            seen.add((path, line))
+            try:
+                if hasattr(reader, "read_call_site"):
+                    rr = reader.read_call_site(
+                        path,
+                        line,
+                        context_lines=5,
+                        max_lines=20,
+                        max_bytes=4096,
+                        symbol=symbol,
+                        use_cymbal=used_cymbal,
+                    )
+                else:
+                    rr = reader.read_range(
+                        path,
+                        max(1, line - 5),
+                        line + 5,
+                        max_lines=20,
+                        max_bytes=4096,
+                    )
+            except Exception as err:
+                self.io.tool_warning(f"Read-range unavailable for {path}:{line}: {err}")
+                continue
+            ev = self._range_excerpt_to_evidence(rr)
+            if ev is not None:
+                collected.append(ev)
+        if not collected:
+            return ()
+        return normalize_supplementary_evidence(
+            collected,
+            default_kind="read-range",
+            max_items=3,
+            max_item_chars=900,
+            max_total_chars=1600,
+        )
+
+    def _get_facts_store(self):
+        if self.facts_store is not None:
+            return self.facts_store
+        if not self.facts_enabled:
+            return None
+        from aider.main import create_project_facts_store
+
+        chat_history_file = (
+            self.chat_history_file
+            if self.chat_history_file is not None
+            else getattr(self.io, "chat_history_file", None)
+        )
+        store = create_project_facts_store(
+            self.facts_db,
+            root=self.root,
+            enabled=True,
+            facts_file=self.facts_file,
+            chat_history_file=chat_history_file,
+            io=self.io,
+        )
+        if store.storage_path is not None:
+            if store.backend == "sqlite":
+                self.facts_db = str(store.storage_path)
+            elif store.backend == "jsonl":
+                self.facts_file = str(store.storage_path)
+        self.facts_store = store
+        if not store.active and store.diagnostic:
+            self._facts_diagnostic_shown = True
+        return self.facts_store
+
+    def _fact_to_evidence(self, fact):
+        from aider.caller_audit import ProvenanceEvidence, normalize_supplementary_evidence
+        from aider.project_facts import ProjectFact, format_facts_context
+
+        if isinstance(fact, ProjectFact):
+            formatted = format_facts_context((fact,), max_chars=600)
+            lines = formatted.splitlines()
+            body = lines[1][2:] if len(lines) > 1 and lines[1].startswith("- ") else fact.statement
+            return ProvenanceEvidence(
+                kind="project-fact",
+                source=fact.fact_id,
+                content=body,
+            )
+        items = normalize_supplementary_evidence((fact,), default_kind="project-fact", max_items=1)
+        return items[0] if items else None
+
+    def record_project_fact(self, raw_args):
+        from aider.project_facts import FactCommandResult
+
+        store = self._get_facts_store()
+        if store is None:
+            return FactCommandResult(
+                ok=False,
+                message="Project facts are disabled. Start aider with --facts to enable.",
+                fact=None,
+            )
+        root_path = Path(self.root).resolve()
+        default_paths = tuple(
+            rel for rel in self.get_inchat_relative_files() if (root_path / rel).is_file()
+        )
+        commit_sha = ""
+        if self.repo:
+            try:
+                commit_sha = self.repo.get_head_commit_sha() or ""
+            except Exception:
+                commit_sha = ""
+        return store.handle_fact_command(
+            raw_args,
+            default_source_paths=default_paths,
+            commit_sha=commit_sha,
+        )
+
+    def list_project_facts(self, *, limit=20, include_unverified=False, include_stale=False):
+        store = self._get_facts_store()
+        if store is None or not store.active or store.repository is None:
+            return ()
+        store.revalidate(persist=not store.read_only)
+        facts = store.repository.list_all(
+            worktree_id=store.worktree_id,
+            include_unverified=include_unverified,
+            include_stale=include_stale,
+        )[:limit]
+        return tuple(ev for f in facts if (ev := self._fact_to_evidence(f)) is not None)
+
+    def search_project_facts(self, query, *, limit=10):
+        store = self._get_facts_store()
+        if store is None or not store.active:
+            return ()
+        facts = store.search(query, top_k=limit)
+        return tuple(ev for f in facts if (ev := self._fact_to_evidence(f)) is not None)
+
+    def get_project_fact(self, fact_id):
+        store = self._get_facts_store()
+        if store is None or not store.active:
+            return None
+        fact = store.get(fact_id)
+        if fact is None:
+            return None
+        return self._fact_to_evidence(fact)
+
+    def _collect_project_facts_context(self, task):
+        if not self.facts_enabled:
+            return "", ()
+        store = self._get_facts_store()
+        if store is None:
+            return "", ()
+        if not store.active:
+            if store.diagnostic and not self._facts_diagnostic_shown:
+                self.io.tool_warning(store.diagnostic)
+                self._facts_diagnostic_shown = True
+            return "", ()
+        try:
+            context = store.format_prompt_context(
+                query=task,
+                paths=tuple(self.get_inchat_relative_files()),
+                top_k=5,
+                max_chars=1600,
+            )
+        except Exception as err:
+            self.io.tool_warning(f"Project facts unavailable: {err}")
+            return "", ()
+        if not context:
+            return "", ()
+        from aider.caller_audit import ProvenanceEvidence, normalize_supplementary_evidence
+
+        bullet_lines = [line[2:].strip() for line in context.splitlines() if line.startswith("- ")]
+        source_label = f"worktree:{store.worktree_id}"
+        raw_items = [
+            ProvenanceEvidence(kind="project-fact", source=source_label, content=entry)
+            for entry in (bullet_lines or [context])
+        ]
+        evidence = normalize_supplementary_evidence(
+            raw_items,
+            default_kind="project-fact",
+            max_items=5,
+            max_total_chars=1600,
+        )
+        return context, evidence
+
+    def _collect_read_range_evidence(self):
+        if not self.read_only_ranges:
+            return ()
+        from aider.caller_audit import normalize_supplementary_evidence
+
+        return normalize_supplementary_evidence(
+            self.read_only_ranges,
+            default_kind="read-range",
+            max_items=4,
+            max_total_chars=1600,
+        )
+
+    def _sync_local_caller_supplementary_evidence(self):
+        combined = tuple(self._turn_supplementary_evidence) + self._collect_read_range_evidence()
+        if getattr(self, "local_caller_contract_hook", None) is not None:
+            self.local_caller_contract_hook.set_supplementary_evidence(combined)
+        if getattr(self, "local_caller_auditor", None) is not None:
+            self.local_caller_auditor.set_supplementary_evidence(combined)
+
+    def _reset_local_caller_state(self, excerpts, task="", supplementary_evidence=()):
+        from aider.caller_audit import normalize_supplementary_evidence
+
+        self._local_caller_excerpts = tuple(excerpts or ())
         self._local_caller_task = task or ""
-        self.local_caller_contract_hook.begin_turn(excerpts)
+        self._turn_supplementary_evidence = normalize_supplementary_evidence(
+            supplementary_evidence
+        )
+        self.local_caller_contract_hook.begin_turn(
+            self._local_caller_excerpts,
+            supplementary_evidence=self._turn_supplementary_evidence,
+        )
         if self.local_caller_auditor is not None:
-            self.local_caller_auditor.begin_turn(excerpts)
+            self.local_caller_auditor.begin_turn(
+                self._local_caller_excerpts,
+                supplementary_evidence=self._turn_supplementary_evidence,
+            )
+
+    def handoff_local_caller_turn_state(self, target_coder) -> str:
+        if not isinstance(target_coder, Coder):
+            return ""
+
+        excerpts = tuple(self._local_caller_excerpts or ())
+        task = self._local_caller_task or ""
+        supplementary = tuple(self._turn_supplementary_evidence or ())
+        facts_context = self._turn_facts_context or ""
+        auto_ranges = tuple(self._turn_auto_ranges or ())
+
+        target_coder._last_caller_result = self._last_caller_result
+        target_coder._turn_facts_context = facts_context
+        target_coder._turn_auto_ranges = auto_ranges
+        target_coder._reset_local_caller_state(
+            excerpts,
+            task=task,
+            supplementary_evidence=supplementary,
+        )
+        target_coder._preserve_local_caller_state = True
+
+        appendix = ""
+        if facts_context:
+            appendix += (
+                "\n\n"
+                f"{facts_context}\n"
+                "(Supplementary read-only context; "
+                "does not replace source code or caller verification.)"
+            )
+        if target_coder.local_callers and excerpts:
+            from aider.local_callers import format_caller_context
+
+            caller_mode = (
+                target_coder.local_callers_mode if target_coder.allows_edits else "passive"
+            )
+            formatted = format_caller_context(
+                excerpts,
+                hint=target_coder.local_callers_hint,
+                mode=caller_mode,
+            )
+            if formatted:
+                appendix += f"\n\n{formatted}"
+        if auto_ranges:
+            range_blocks = "\n\n".join(item.format() for item in auto_ranges)
+            appendix += (
+                "\n\nRead-only call-site range excerpts "
+                "(supplementary context; do not edit unless added to chat):\n"
+                f"{range_blocks}"
+            )
+        return appendix
 
     def _complete_caller_audit(self, messages):
         litellm_ex = LiteLLMExceptions()
@@ -966,7 +1552,8 @@ class Coder:
                     if not ex_info.retry or attempt + 1 >= max_attempts:
                         raise
                     self.io.tool_warning(
-                        f"Local caller audit transient error ({err}); retrying in {retry_delay:.1f}s..."
+                        f"Local caller audit transient error ({err}); "
+                        f"retrying in {retry_delay:.1f}s..."
                     )
                     time.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, 20.0)
@@ -974,7 +1561,10 @@ class Coder:
             if os.getenv("AIDER_TRIAL_USAGE"):
                 usage = getattr(response, "usage", None)
                 total = getattr(usage, "total_tokens", None)
-                self.io.tool_output(f"Trial usage: audit {total}")
+                self.io.tool_output(
+                    f"Trial usage: audit prompt={getattr(usage, 'prompt_tokens', None)}"
+                    f" completion={getattr(usage, 'completion_tokens', None)} total={total}"
+                )
         if not response or not response.choices:
             return None
         raw = response.choices[0].message.content
@@ -1011,6 +1601,8 @@ class Coder:
         return "".join(chunks)
 
     def get_oracle_message(self, message):
+        self._turn_facts_context = ""
+        self._turn_auto_ranges = ()
         if not message:
             if self.local_callers:
                 self._reset_local_caller_state(())
@@ -1027,39 +1619,83 @@ class Coder:
                     self._reset_local_caller_state(())
                 self.partial_response_content = None
                 return None
-        if self.local_callers and self.repo:
-            from aider.local_callers import (
-                CallerEvidenceReport,
-                find_related_callers,
-                format_caller_context,
+        facts_context, fact_evidence = self._collect_project_facts_context(task)
+        self._turn_facts_context = facts_context
+        if facts_context:
+            message += (
+                "\n\n"
+                f"{facts_context}\n"
+                "(Supplementary read-only context; "
+                "does not replace source code or caller verification.)"
             )
+            self.io.tool_output(
+                f"Project facts: attached {len(fact_evidence)} read-only fact(s)"
+            )
+        manual_ranges = self._collect_read_range_evidence()
+        supplementary = fact_evidence + manual_ranges
 
-            report = CallerEvidenceReport()
-            excerpts = find_related_callers(
-                Path(self.root),
-                task,
-                self.get_inchat_relative_files(),
-                self.get_addable_relative_files(),
-                report=report,
+        if self.local_callers and self.repo:
+            from aider.local_callers import format_caller_context
+
+            excerpts = ()
+            used_cymbal = False
+            try:
+                excerpts, description, diagnostics, used_cymbal = self._find_local_callers(task)
+            except Exception as err:
+                from aider.cymbal_callers import CymbalError
+
+                if not isinstance(err, CymbalError):
+                    raise
+                self.io.tool_error(f"Local callers ({self.local_callers_backend}) failed: {err}")
+                description = f"NO_EVIDENCE (cymbal error: {err})"
+                diagnostics = ()
+
+            for diag in diagnostics:
+                self.io.tool_warning(f"Local callers diagnostic: {diag}")
+
+            auto_ranges = self._collect_auto_call_site_ranges(
+                excerpts, used_cymbal=used_cymbal
             )
-            self._reset_local_caller_state(excerpts, task=task)
-            self.io.tool_output("Local caller evidence: " + report.describe(excerpts))
+            self._turn_auto_ranges = tuple(auto_ranges)
+            supplementary = supplementary + auto_ranges
+            self._reset_local_caller_state(
+                excerpts,
+                task=task,
+                supplementary_evidence=supplementary,
+            )
+            self.io.tool_output("Local caller evidence: " + description)
             if excerpts:
+                caller_mode = self.local_callers_mode if self.allows_edits else "passive"
                 formatted = format_caller_context(
                     excerpts,
                     hint=self.local_callers_hint,
-                    mode=self.local_callers_mode,
+                    mode=caller_mode,
                 )
                 if formatted:
                     message += f"\n\n{formatted}"
+            if auto_ranges:
+                range_blocks = "\n\n".join(item.format() for item in auto_ranges)
+                message += (
+                    "\n\nRead-only call-site range excerpts "
+                    "(supplementary context; do not edit unless added to chat):\n"
+                    f"{range_blocks}"
+                )
+                self.io.tool_output(
+                    f"Read-range: attached {len(auto_ranges)} call-site range(s)"
+                )
         elif self.local_callers:
             self.io.tool_output("Local caller evidence: NO_EVIDENCE (no repository)")
-            self._reset_local_caller_state(())
+            self._reset_local_caller_state(
+                (),
+                task=task,
+                supplementary_evidence=supplementary,
+            )
         return message
 
     def init_before_message(self):
         self.response_hook_pending = False
         self.aider_edited_files = set()
+        self.dry_run_edited = False
         self._unreviewed_paths.update(self._audit_originals)
         self._audit_originals.clear()
         self.reflected_message = None
@@ -1068,7 +1704,9 @@ class Coder:
         self.test_outcome = None
         self.shell_commands = []
         self.message_cost = 0
-        if self.local_callers:
+        if self._preserve_local_caller_state:
+            self._preserve_local_caller_state = False
+        elif self.local_callers:
             self._reset_local_caller_state(())
 
         if self.repo:
@@ -1943,6 +2581,7 @@ class Coder:
 
     def _finish_local_caller_audit(self):
         try:
+            self._sync_local_caller_supplementary_evidence()
             patch = self._get_local_caller_audit_diff()
             verdict = self.local_caller_auditor.audit(
                 patch, task=self._local_caller_task, io=self.io
@@ -2108,20 +2747,45 @@ class Coder:
         return mentioned_rel_fnames
 
     def check_for_file_mentions(self, content):
-        if "<<<<<<< SEARCH" in content:
-            content = re.sub(
+        has_edit_block = "<<<<<<< SEARCH" in content or bool(
+            re.search(
+                r"^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
+                content,
+                re.M,
+            )
+        )
+        has_contract_marker = "CALLER_CONTRACT:" in content.upper()
+        scan_content = content
+        if "<<<<<<< SEARCH" in scan_content:
+            scan_content = re.sub(
                 r"<<<<<<< SEARCH.*?>>>>>>> REPLACE",
                 "",
-                content,
+                scan_content,
                 flags=re.DOTALL,
             )
-        mentioned_rel_fnames = self.get_file_mentions(content)
+        mentioned_rel_fnames = self.get_file_mentions(scan_content)
 
         new_mentions = mentioned_rel_fnames - self.ignore_mentions
-        if self.local_callers and (
-            "<<<<<<< SEARCH" in content or "CALLER_CONTRACT:" in content.upper()
-        ):
-            new_mentions -= self.local_caller_contract_hook.attached_paths
+        if has_edit_block or has_contract_marker:
+            attached_paths = set()
+            if getattr(self, "local_callers", False) is True:
+                hook = getattr(self, "local_caller_contract_hook", None)
+                for path in getattr(hook, "attached_paths", None) or ():
+                    if isinstance(path, str) and path:
+                        attached_paths.add(path.replace("\\", "/"))
+            for ranges_attr in ("read_only_ranges", "_turn_auto_ranges"):
+                for item in getattr(self, ranges_attr, None) or ():
+                    source = getattr(item, "source", None)
+                    if isinstance(source, str) and source:
+                        rel_path = _extract_range_rel_path(source).replace("\\", "/")
+                        if rel_path:
+                            attached_paths.add(rel_path)
+            if attached_paths:
+                new_mentions = {
+                    path
+                    for path in new_mentions
+                    if path.replace("\\", "/") not in attached_paths
+                }
 
         if not new_mentions:
             return
@@ -2469,7 +3133,10 @@ class Coder:
         self.io.tool_output(self.usage_report)
         if os.getenv("AIDER_TRIAL_USAGE"):
             total = self.message_tokens_sent + self.message_tokens_received
-            self.io.tool_output(f"Trial usage: editor {total}")
+            self.io.tool_output(
+                f"Trial usage: editor prompt={self.message_tokens_sent}"
+                f" completion={self.message_tokens_received} total={total}"
+            )
 
         prompt_tokens = self.message_tokens_sent
         completion_tokens = self.message_tokens_received
@@ -2671,6 +3338,7 @@ class Coder:
                 return edited
             contract = self.local_caller_contract_hook
             if edits and contract.enabled and not contract.format_present and not contract.advisory:
+                contract.blocked = True
                 self.io.tool_warning(
                     "Local caller contract check: UNKNOWN (unverified edit format)"
                 )
@@ -2722,6 +3390,9 @@ class Coder:
 
             self.reflected_message = str(err)
             return edited
+
+        if self.dry_run and edited:
+            self.dry_run_edited = True
 
         for path in edited:
             if self.dry_run:
