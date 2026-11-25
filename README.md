@@ -43,6 +43,11 @@ This fork supports opt-in [Oracle documentation context](docs/oracle.md) through
 `--oracle` or `.aider.conf.yml`. Oracle runs as a separate service; Aider retains
 ownership of code edits and Git operations.
 
+It also provides opt-in [local context primitives](docs/local-context.md) for
+caller discovery (`--local-callers`, optional Cymbal `v0.18.0` backend), bounded
+line-range reads (`--local-callers-read-range`, `/read-range`), and worktree-scoped
+project facts (`--facts`, `/fact`). All flags default to off.
+
 ### [Cloud and local LLMs](https://aider.chat/docs/llms.html)
 
 <a href="https://aider.chat/docs/llms.html"><img src="https://aider.chat/assets/icons/brain.svg" width="32" height="32" align="left" valign="middle" style="margin-right:10px"></a>

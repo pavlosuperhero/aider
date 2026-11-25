@@ -1,0 +1,43 @@
+name: Cymbal v0.18.0 smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cymbal-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cymbal-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - name: Install pinned Cymbal v0.18.0
+        env:
+          CGO_ENABLED: "1"
+          CGO_CFLAGS: "-DSQLITE_ENABLE_FTS5"
+        run: |
+          go install -ldflags "-X github.com/1broseidon/cymbal/cmd.version=v0.18.0" github.com/1broseidon/cymbal@v0.18.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Verify Cymbal version
+        run: |
+          cymbal --version
+          cymbal --version | grep -Fq "0.18.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Aider and pytest
+        run: python -m pip install -e . pytest
+      - name: Run pinned Cymbal v0.18.0 smoke test
+        env:
+          AIDER_ANALYTICS: "false"
+        run: >-
+          python -m pytest -q tests/basic/test_cymbal_callers.py -k test_pinned_v0_18_0_cymbal_smoke
