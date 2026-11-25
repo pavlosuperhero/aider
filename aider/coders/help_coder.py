@@ -8,6 +8,7 @@ class HelpCoder(Coder):
 
     edit_format = "help"
     gpt_prompts = HelpPrompts()
+    allows_edits = False
 
     def get_edits(self, mode="update"):
         return []

@@ -420,6 +420,14 @@ class Commands:
         self.coder.abs_fnames = set()
         if hasattr(self.coder, "read_only_ranges"):
             self.coder.read_only_ranges = []
+            if hasattr(self.coder, "_turn_supplementary_evidence"):
+                self.coder._turn_supplementary_evidence = tuple(
+                    ev
+                    for ev in (self.coder._turn_supplementary_evidence or ())
+                    if getattr(ev, "kind", "") != "read-range"
+                )
+            if hasattr(self.coder, "_sync_local_caller_supplementary_evidence"):
+                self.coder._sync_local_caller_supplementary_evidence()
 
         # When dropping all files, keep those that were originally provided via args.read
         if self.original_read_only_fnames:
@@ -703,6 +711,9 @@ class Commands:
             fname = f'"{fname}"'
         return fname
 
+    def completions_raw_read(self, document, complete_event):
+        return self.completions_raw_read_only(document, complete_event)
+
     def completions_raw_read_only(self, document, complete_event):
         # Get the text before the cursor
         text = document.text_before_cursor
@@ -909,7 +920,16 @@ class Commands:
     def completions_drop(self):
         files = self.coder.get_inchat_relative_files()
         read_only_files = [self.coder.get_rel_fname(fn) for fn in self.coder.abs_read_only_fnames]
-        all_files = files + read_only_files
+        range_paths = []
+        for item in getattr(self.coder, "read_only_ranges", ()) or ():
+            source = getattr(item, "source", "")
+            if source:
+                range_paths.append(source)
+                rel_path = re.sub(r"\s+\[[^\]]+\]$", "", source)
+                rel_path = re.sub(r":\d+(?:-\d+)?$", "", rel_path)
+                if rel_path and rel_path != source:
+                    range_paths.append(rel_path)
+        all_files = list(dict.fromkeys(files + read_only_files + range_paths))
         all_files = [self.quote_fname(fn) for fn in all_files]
         return all_files
 
@@ -949,6 +969,12 @@ class Commands:
             for matched_file in read_only_matched:
                 self.coder.abs_read_only_fnames.remove(matched_file)
                 self.io.tool_output(f"Removed read-only file {matched_file} from the chat")
+
+            if hasattr(self.coder, "drop_read_only_ranges"):
+                for removed_range in self.coder.drop_read_only_ranges(expanded_word):
+                    self.io.tool_output(
+                        f"Removed read-only range {removed_range.source} from the chat"
+                    )
 
             # For editable files, use glob if word contains glob chars, otherwise use substring
             if any(c in expanded_word for c in "*?[]"):
@@ -1342,6 +1368,10 @@ class Commands:
 
         except Exception as e:
             self.io.tool_error(f"Error processing clipboard content: {e}")
+
+    def cmd_read(self, args):
+        "Alias for /read-only: Add files to the chat that are for reference only"
+        return self.cmd_read_only(args)
 
     def cmd_read_only(self, args):
         "Add files to the chat that are for reference only, or turn added files to read-only"

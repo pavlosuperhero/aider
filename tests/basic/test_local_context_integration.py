@@ -160,8 +160,8 @@ def project(tmp_path, monkeypatch):
 
 def make_coder(**kwargs):
     kwargs.setdefault("auto_commits", True)
+    kwargs.setdefault("main_model", Model("gpt-3.5-turbo"))
     return Coder.create(
-        main_model=Model("gpt-3.5-turbo"),
         edit_format="diff",
         fnames=["pricing.py"],
         io=InputOutput(yes=True, pretty=False, fancy_input=False),
@@ -1017,3 +1017,297 @@ def test_facts_never_override_incomplete_caller_evidence(project):
     hook = CallerContractHook(enabled=True)
     hook.begin_turn((), facts=[fact])
     assert hook(EDIT_BLOCK) == ResponseHookResult()
+
+
+# --- Regression tests: /arch handoff, /ask contract mode, /drop ranges, /read alias ---
+
+
+def _script_coder_sends(monkeypatch, replies):
+    calls = []
+    remaining = list(replies)
+
+    def send(self, messages, model=None, functions=None):
+        user_text = "\n".join(
+            m["content"]
+            for m in messages
+            if m["role"] == "user" and isinstance(m["content"], str)
+        )
+        calls.append((self.edit_format, user_text))
+        reply = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        self.partial_response_content = reply
+        self.partial_response_function_call = None
+        return iter(())
+
+    monkeypatch.setattr(Coder, "send", send)
+    return calls
+
+
+def test_architect_handoff_contract_mode_edits_and_records_outcome(project, monkeypatch):
+    from aider.project_facts import FakeFactRepository, open_project_fact_store
+
+    store = open_project_fact_store(project, enabled=True, repository=FakeFactRepository())
+    store.record_fact("format_price returns plain decimal strings", source_paths=("pricing.py",))
+
+    coder = make_coder(
+        main_model=Model("gpt-3.5-turbo", editor_edit_format="editor-diff"),
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_policy="strict",
+        facts=True,
+        facts_store=store,
+        auto_accept_architect=True,
+    )
+    arch_reply = (
+        "Update `format_price` in `pricing.py` to prepend `$`.\n"
+        "```python\n"
+        "return f'${cents / 100:.2f}'\n"
+        "```\n"
+    )
+    editor_reply = (
+        "CALLER_CONTRACT: pkg/consumer.py calls `raw = format_price(1050)`.\n"
+        "TRACE: format_price(1050) -> '$10.50'; format_price(0) -> '$0.00'.\n"
+        + EDIT_BLOCK
+    )
+    calls = _script_coder_sends(monkeypatch, [arch_reply, editor_reply])
+    repo = git.Repo(project)
+    head = repo.head.commit
+
+    with pytest.raises(SwitchCoder) as exc_info:
+        coder.commands.run("/arch update format_price")
+
+    arch_coder = exc_info.value.kwargs["from_coder"]
+    assert [fmt for fmt, _ in calls] == ["architect", "editor-diff"]
+    assert "pkg/consumer.py" in calls[0][1]
+    assert "Before outputting any edit block" not in calls[0][1]
+    assert "format_price returns plain decimal strings" in calls[1][1]
+    assert "Before outputting any edit block" in calls[1][1]
+    assert "pkg/consumer.py" in calls[1][1]
+    assert "raw = format_price(1050)" in calls[1][1]
+    assert "${cents / 100:.2f}" in (project / "pricing.py").read_text(encoding="utf-8")
+    assert repo.head.commit != head
+    assert not repo.is_dirty()
+    assert arch_coder.aider_edited_files == {"pricing.py"}
+    assert any(
+        m["content"] == "I made those changes to the files." for m in arch_coder.done_messages
+    )
+
+
+def test_architect_handoff_strict_contract_rejection_records_no_changes(project, monkeypatch):
+    coder = make_coder(
+        main_model=Model("gpt-3.5-turbo", editor_edit_format="editor-diff"),
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_policy="strict",
+        auto_accept_architect=True,
+    )
+    arch_coder = Coder.create(from_coder=coder, edit_format="architect")
+    calls = _script_coder_sends(
+        monkeypatch,
+        ["Update format_price in pricing.py to prepend '$'.", EDIT_BLOCK],
+    )
+    repo = git.Repo(project)
+    head = repo.head.commit
+    orig_text = (project / "pricing.py").read_text(encoding="utf-8")
+
+    arch_coder.run("update format_price")
+
+    assert calls[0][0] == "architect"
+    assert any(fmt == "editor-diff" for fmt, _ in calls)
+    assert (project / "pricing.py").read_text(encoding="utf-8") == orig_text
+    assert repo.head.commit == head
+    assert not repo.is_dirty()
+    assert arch_coder.aider_edited_files == set()
+    expected = (
+        "No changes were made to the files because "
+        "caller contract verification did not pass."
+    )
+    assert any(m["content"] == expected for m in arch_coder.done_messages)
+    assert not any(
+        m["content"] == "I made those changes to the files." for m in arch_coder.done_messages
+    )
+
+
+def test_architect_handoff_strict_audit_failure_reports_uncommitted(project, monkeypatch):
+    coder = make_coder(
+        main_model=Model("gpt-3.5-turbo", editor_edit_format="editor-diff"),
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_audit=True,
+        local_callers_policy="strict",
+        auto_accept_architect=True,
+    )
+    arch_coder = Coder.create(from_coder=coder, edit_format="architect")
+    audit_prompts = []
+
+    def fake_audit(self, messages):
+        audit_prompts.append(messages[1]["content"])
+        return "VERDICT: FAIL: consumer asserts raw == '10.50' without '$'"
+
+    monkeypatch.setattr(Coder, "_complete_caller_audit", fake_audit)
+    editor_reply = (
+        "CALLER_CONTRACT: pkg/consumer.py calls `raw = format_price(1050)`.\n"
+        "TRACE: format_price(1050) -> '$10.50'; format_price(0) -> '$0.00'.\n"
+        + EDIT_BLOCK
+    )
+    _script_coder_sends(
+        monkeypatch,
+        [
+            "Update format_price in pricing.py to prepend '$'.",
+            editor_reply,
+            "Cannot satisfy the consumer assertion without modifying the caller.",
+        ],
+    )
+    repo = git.Repo(project)
+    head = repo.head.commit
+
+    arch_coder.run("update format_price")
+
+    assert len(audit_prompts) == 1
+    assert "update format_price" in audit_prompts[0]
+    assert "pkg/consumer.py" in audit_prompts[0]
+    assert "${cents / 100:.2f}" in (project / "pricing.py").read_text(encoding="utf-8")
+    assert repo.head.commit == head
+    assert repo.is_dirty()
+    assert "pricing.py" in arch_coder._unreviewed_paths
+    expected = (
+        "I edited the files, but strict caller verification "
+        "left the changes uncommitted."
+    )
+    assert any(m["content"] == expected for m in arch_coder.done_messages)
+
+
+def test_ask_mode_contract_retains_context_and_allows_fenced_code(project):
+    from aider.coders import ArchitectCoder, AskCoder, ContextCoder, HelpCoder
+    from aider.project_facts import FakeFactRepository, open_project_fact_store
+
+    assert Coder.allows_edits is True
+    assert AskCoder.allows_edits is False
+    assert ArchitectCoder.allows_edits is False
+    assert HelpCoder.allows_edits is False
+    assert ContextCoder.allows_edits is False
+
+    store = open_project_fact_store(project, enabled=True, repository=FakeFactRepository())
+    store.record_fact("format_price omits currency symbols", source_paths=("pricing.py",))
+
+    code_coder = make_coder(
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_policy="strict",
+        facts=True,
+        facts_store=store,
+    )
+    assert code_coder.local_caller_contract_hook.enabled is True
+
+    ask_coder = Coder.create(from_coder=code_coder, edit_format="ask")
+    assert ask_coder.allows_edits is False
+    assert ask_coder.local_caller_contract_hook.enabled is False
+    assert ask_coder.local_caller_contract_hook not in ask_coder.response_hooks
+
+    fenced_reply = (
+        "Example usage:\n"
+        "```python\n"
+        "raw = format_price(1050)\n"
+        "```\n"
+    )
+    sends = fake_send(ask_coder, [fenced_reply])
+    ask_coder.run("explain format_price")
+
+    assert len(sends) == 1
+    assert "pkg/consumer.py" in sends[0]
+    assert "raw = format_price(1050)" in sends[0]
+    assert "format_price omits currency symbols" in sends[0]
+    assert "Before outputting any edit block" not in sends[0]
+    assert ask_coder.partial_response_content == fenced_reply.strip()
+
+    with pytest.raises(SwitchCoder) as exc_info:
+        ask_coder.commands.cmd_chat_mode("code")
+    restored = Coder.create(from_coder=ask_coder, **exc_info.value.kwargs)
+    assert restored.allows_edits is True
+    assert restored.local_callers is True
+    assert restored.local_callers_mode == "contract"
+    assert restored.local_caller_contract_hook.enabled is True
+    assert restored.local_caller_contract_hook in restored.response_hooks
+
+
+def test_drop_removes_read_only_ranges_from_prompt_and_evidence(project):
+    repo = git.Repo(project)
+    (project / "pkg" / "other.py").write_text("alpha = 1\nbeta = 2\n", encoding="utf-8")
+    repo.index.add(["pkg/other.py"])
+    repo.index.commit("Add other module")
+
+    coder = make_coder(
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_audit=True,
+        local_callers_read_range=False,
+        read_range_reader=create_read_range_reader(project),
+    )
+    outputs = []
+    coder.io.tool_output = lambda *a, **kw: outputs.append(" ".join(str(x) for x in a))
+
+    coder.commands.run("/read-range pkg/consumer.py:1-3")
+    assert [r.source for r in coder.read_only_ranges] == ["pkg/consumer.py:1-3"]
+    drop_completions = coder.commands.completions_drop()
+    assert "pkg/consumer.py" in drop_completions
+    assert "pkg/consumer.py:1-3" in drop_completions
+
+    sends = fake_send(coder, ["Checked callers.", "Second turn."])
+    coder.run("inspect format_price")
+    assert "provenance=read-range" in sends[0]
+    assert "pkg/consumer.py:1-3" in sends[0]
+    assert len(coder.local_caller_contract_hook.supplementary_evidence) == 1
+    assert len(coder.local_caller_auditor.supplementary_evidence) == 1
+
+    outputs.clear()
+    coder.commands.run("/drop pkg/consumer.py")
+    assert "Removed read-only range pkg/consumer.py:1-3 from the chat" in outputs
+    assert coder.read_only_ranges == []
+    assert coder.local_caller_contract_hook.supplementary_evidence == ()
+    assert coder.local_caller_auditor.supplementary_evidence == ()
+
+    coder.run("inspect unrelated topic")
+    assert "provenance=read-range" not in sends[1]
+    assert "pkg/consumer.py:1-3" not in sends[1]
+
+    # Exact source drop removes only the targeted range.
+    coder.commands.run("/read-range pkg/consumer.py:1-2")
+    coder.commands.run("/read-range pkg/consumer.py:2-3")
+    assert [r.source for r in coder.read_only_ranges] == [
+        "pkg/consumer.py:1-2",
+        "pkg/consumer.py:2-3",
+    ]
+    coder.commands.run("/drop pkg/consumer.py:1-2")
+    assert [r.source for r in coder.read_only_ranges] == ["pkg/consumer.py:2-3"]
+
+    # Glob drop removes all matching ranges and clears supplementary evidence.
+    coder.commands.run("/read-range pkg/other.py:1-2")
+    assert len(coder.read_only_ranges) == 2
+    coder.commands.run("/drop pkg/*.py")
+    assert coder.read_only_ranges == []
+    assert coder.local_caller_contract_hook.supplementary_evidence == ()
+    assert coder.local_caller_auditor.supplementary_evidence == ()
+
+
+def test_read_command_alias_works_without_ambiguity(project):
+    coder = make_coder(read_range_reader=create_read_range_reader(project))
+    errors = []
+    coder.io.tool_error = lambda *a, **kw: errors.append(" ".join(str(x) for x in a))
+
+    assert "/read" in coder.commands.get_commands()
+    assert coder.commands.get_raw_completions("/read") is not None
+
+    coder.commands.run("/read pkg/consumer.py")
+    assert not errors
+    consumer_abs = coder.abs_root_path("pkg/consumer.py")
+    assert consumer_abs in coder.abs_read_only_fnames
+
+    coder.commands.run("/drop pkg/consumer.py")
+    assert consumer_abs not in coder.abs_read_only_fnames
+
+    coder.commands.run("/read-only pkg/consumer.py")
+    assert not errors
+    assert consumer_abs in coder.abs_read_only_fnames
+
+    coder.commands.run("/read-range pkg/consumer.py:1-2")
+    assert not errors
+    assert [r.source for r in coder.read_only_ranges] == ["pkg/consumer.py:1-2"]

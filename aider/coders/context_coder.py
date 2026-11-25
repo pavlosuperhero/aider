@@ -7,6 +7,7 @@ class ContextCoder(Coder):
 
     edit_format = "context"
     gpt_prompts = ContextPrompts()
+    allows_edits = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

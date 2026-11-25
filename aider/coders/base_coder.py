@@ -2,6 +2,7 @@
 
 import base64
 import difflib
+import fnmatch
 import hashlib
 import json
 import locale
@@ -87,6 +88,13 @@ all_fences = [
 ]
 
 
+def _extract_range_rel_path(source):
+    text = (source or "").strip()
+    text = re.sub(r"\s+\[[^\]]+\]$", "", text)
+    text = re.sub(r":\d+(?:-\d+)?$", "", text)
+    return text
+
+
 class Coder:
     abs_fnames = None
     abs_read_only_fnames = None
@@ -102,6 +110,7 @@ class Coder:
     num_reflections = 0
     max_reflections = 3
     edit_format = None
+    allows_edits = True
     yield_stream = False
     temperature = None
     auto_lint = True
@@ -122,6 +131,16 @@ class Coder:
     chat_language = None
     commit_language = None
     file_watcher = None
+    local_callers = False
+    local_callers_mode = "passive"
+    local_callers_hint = None
+    _local_caller_excerpts = ()
+    _local_caller_task = ""
+    _turn_supplementary_evidence = ()
+    _turn_facts_context = ""
+    _turn_auto_ranges = ()
+    _last_caller_result = None
+    _preserve_local_caller_state = False
 
     @classmethod
     def create(
@@ -420,7 +439,11 @@ class Coder:
         )
         self.facts_store = facts_store
         self.read_only_ranges = list(read_only_ranges or ())
+        self._local_caller_excerpts = ()
         self._turn_supplementary_evidence = ()
+        self._turn_facts_context = ""
+        self._turn_auto_ranges = ()
+        self._preserve_local_caller_state = False
         self._facts_diagnostic_shown = False
         self._last_caller_result = None
         self._local_caller_task = ""
@@ -436,7 +459,11 @@ class Coder:
             if hook is not None:
                 self.response_hooks += (hook,)
         self.local_caller_contract_hook = CallerContractHook(
-            enabled=bool(self.local_callers and self.local_callers_mode == "contract"),
+            enabled=bool(
+                self.local_callers
+                and self.local_callers_mode == "contract"
+                and self.allows_edits
+            ),
             advisory=self.caller_advisory,
         )
         if self.local_caller_contract_hook.enabled:
@@ -1162,7 +1189,74 @@ class Coder:
         self.read_only_ranges.append(evidence)
         if len(self.read_only_ranges) > 8:
             self.read_only_ranges = self.read_only_ranges[-8:]
+        self._sync_local_caller_supplementary_evidence()
         return evidence
+
+    def drop_read_only_ranges(self, pattern):
+        if not pattern or not self.read_only_ranges:
+            return []
+
+        expanded = os.path.expanduser(pattern)
+        norm_pattern = expanded.replace("\\", "/")
+        has_glob = any(ch in expanded for ch in "*?[]")
+
+        kept = []
+        removed = []
+        for item in self.read_only_ranges:
+            source = getattr(item, "source", "") or ""
+            source_no_tag = re.sub(r"\s+\[[^\]]+\]$", "", source)
+            rel_path = _extract_range_rel_path(source)
+            norm_rel = rel_path.replace("\\", "/")
+            abs_path = self.abs_root_path(rel_path) if rel_path else ""
+            norm_abs = abs_path.replace("\\", "/") if abs_path else ""
+
+            matched = False
+            if (
+                expanded == source
+                or norm_pattern == source.replace("\\", "/")
+                or expanded == source_no_tag
+                or norm_pattern == source_no_tag.replace("\\", "/")
+            ):
+                matched = True
+            elif has_glob and (
+                fnmatch.fnmatch(norm_rel, norm_pattern)
+                or fnmatch.fnmatch(source.replace("\\", "/"), norm_pattern)
+            ):
+                matched = True
+            elif (
+                expanded in rel_path
+                or norm_pattern in norm_rel
+                or (abs_path and (expanded in abs_path or norm_pattern in norm_abs))
+            ):
+                matched = True
+            elif abs_path:
+                for candidate in (os.path.abspath(expanded), self.abs_root_path(expanded)):
+                    try:
+                        if os.path.samefile(candidate, abs_path):
+                            matched = True
+                            break
+                    except (FileNotFoundError, OSError):
+                        continue
+
+            if matched:
+                removed.append(item)
+            else:
+                kept.append(item)
+
+        if removed:
+            self.read_only_ranges = kept
+            removed_sources = {getattr(item, "source", "") for item in removed}
+            if self._turn_supplementary_evidence:
+                self._turn_supplementary_evidence = tuple(
+                    ev
+                    for ev in self._turn_supplementary_evidence
+                    if not (
+                        getattr(ev, "kind", "") == "read-range"
+                        and getattr(ev, "source", "") in removed_sources
+                    )
+                )
+            self._sync_local_caller_supplementary_evidence()
+        return removed
 
     def _collect_auto_call_site_ranges(self, excerpts, *, used_cymbal=False):
         if not self.local_callers_read_range or not excerpts:
@@ -1366,28 +1460,78 @@ class Coder:
 
     def _sync_local_caller_supplementary_evidence(self):
         combined = tuple(self._turn_supplementary_evidence) + self._collect_read_range_evidence()
-        if not combined:
-            return
-        self.local_caller_contract_hook.set_supplementary_evidence(combined)
-        if self.local_caller_auditor is not None:
+        if getattr(self, "local_caller_contract_hook", None) is not None:
+            self.local_caller_contract_hook.set_supplementary_evidence(combined)
+        if getattr(self, "local_caller_auditor", None) is not None:
             self.local_caller_auditor.set_supplementary_evidence(combined)
 
     def _reset_local_caller_state(self, excerpts, task="", supplementary_evidence=()):
         from aider.caller_audit import normalize_supplementary_evidence
 
+        self._local_caller_excerpts = tuple(excerpts or ())
         self._local_caller_task = task or ""
         self._turn_supplementary_evidence = normalize_supplementary_evidence(
             supplementary_evidence
         )
         self.local_caller_contract_hook.begin_turn(
-            excerpts,
+            self._local_caller_excerpts,
             supplementary_evidence=self._turn_supplementary_evidence,
         )
         if self.local_caller_auditor is not None:
             self.local_caller_auditor.begin_turn(
-                excerpts,
+                self._local_caller_excerpts,
                 supplementary_evidence=self._turn_supplementary_evidence,
             )
+
+    def handoff_local_caller_turn_state(self, target_coder) -> str:
+        if not isinstance(target_coder, Coder):
+            return ""
+
+        excerpts = tuple(self._local_caller_excerpts or ())
+        task = self._local_caller_task or ""
+        supplementary = tuple(self._turn_supplementary_evidence or ())
+        facts_context = self._turn_facts_context or ""
+        auto_ranges = tuple(self._turn_auto_ranges or ())
+
+        target_coder._last_caller_result = self._last_caller_result
+        target_coder._turn_facts_context = facts_context
+        target_coder._turn_auto_ranges = auto_ranges
+        target_coder._reset_local_caller_state(
+            excerpts,
+            task=task,
+            supplementary_evidence=supplementary,
+        )
+        target_coder._preserve_local_caller_state = True
+
+        appendix = ""
+        if facts_context:
+            appendix += (
+                "\n\n"
+                f"{facts_context}\n"
+                "(Supplementary read-only context; "
+                "does not replace source code or caller verification.)"
+            )
+        if target_coder.local_callers and excerpts:
+            from aider.local_callers import format_caller_context
+
+            caller_mode = (
+                target_coder.local_callers_mode if target_coder.allows_edits else "passive"
+            )
+            formatted = format_caller_context(
+                excerpts,
+                hint=target_coder.local_callers_hint,
+                mode=caller_mode,
+            )
+            if formatted:
+                appendix += f"\n\n{formatted}"
+        if auto_ranges:
+            range_blocks = "\n\n".join(item.format() for item in auto_ranges)
+            appendix += (
+                "\n\nRead-only call-site range excerpts "
+                "(supplementary context; do not edit unless added to chat):\n"
+                f"{range_blocks}"
+            )
+        return appendix
 
     def _complete_caller_audit(self, messages):
         litellm_ex = LiteLLMExceptions()
@@ -1452,6 +1596,8 @@ class Coder:
         return "".join(chunks)
 
     def get_oracle_message(self, message):
+        self._turn_facts_context = ""
+        self._turn_auto_ranges = ()
         if not message:
             if self.local_callers:
                 self._reset_local_caller_state(())
@@ -1469,6 +1615,7 @@ class Coder:
                 self.partial_response_content = None
                 return None
         facts_context, fact_evidence = self._collect_project_facts_context(task)
+        self._turn_facts_context = facts_context
         if facts_context:
             message += (
                 "\n\n"
@@ -1504,6 +1651,7 @@ class Coder:
             auto_ranges = self._collect_auto_call_site_ranges(
                 excerpts, used_cymbal=used_cymbal
             )
+            self._turn_auto_ranges = tuple(auto_ranges)
             supplementary = supplementary + auto_ranges
             self._reset_local_caller_state(
                 excerpts,
@@ -1512,10 +1660,11 @@ class Coder:
             )
             self.io.tool_output("Local caller evidence: " + description)
             if excerpts:
+                caller_mode = self.local_callers_mode if self.allows_edits else "passive"
                 formatted = format_caller_context(
                     excerpts,
                     hint=self.local_callers_hint,
-                    mode=self.local_callers_mode,
+                    mode=caller_mode,
                 )
                 if formatted:
                     message += f"\n\n{formatted}"
@@ -1549,7 +1698,9 @@ class Coder:
         self.test_outcome = None
         self.shell_commands = []
         self.message_cost = 0
-        if self.local_callers:
+        if self._preserve_local_caller_state:
+            self._preserve_local_caller_state = False
+        elif self.local_callers:
             self._reset_local_caller_state(())
 
         if self.repo:
