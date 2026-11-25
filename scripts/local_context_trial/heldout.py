@@ -885,6 +885,8 @@ def build_summary(rows: list[dict]) -> dict:
     token_pairs: dict[tuple[str, str, str, str, object], dict[str, float | None]] = defaultdict(
         dict
     )
+    first_prompt_pairs = defaultdict(dict)
+    prompt_pairs = defaultdict(dict)
     seconds_pairs: dict[tuple[str, str, str, str, object], dict[str, float | None]] = defaultdict(
         dict
     )
@@ -988,6 +990,10 @@ def build_summary(rows: list[dict]) -> dict:
             commit_pairs[pair_key][arm] = outcomes["commit_passed"]
         if outcomes["tokens"] is not None:
             token_pairs[pair_key][arm] = float(outcomes["tokens"])
+        if r.get("first_editor_prompt_tokens") is not None:
+            first_prompt_pairs[pair_key][arm] = r["first_editor_prompt_tokens"]
+        if outcomes["prompt_tokens"] is not None:
+            prompt_pairs[pair_key][arm] = outcomes["prompt_tokens"]
         if r.get("seconds") is not None:
             seconds_pairs[pair_key][arm] = float(r["seconds"])
 
@@ -1110,6 +1116,10 @@ def build_summary(rows: list[dict]) -> dict:
                 "passed": overall_passed,
                 "hidden": _paired_binary_stats(hidden_pairs, lambda _k: True, treatment, ref),
                 "commit": _paired_binary_stats(commit_pairs, lambda _k: True, treatment, ref),
+                "first_prompt": _paired_numeric_stats(
+                    first_prompt_pairs, lambda _k: True, treatment, ref
+                ),
+                "prompt": _paired_numeric_stats(prompt_pairs, lambda _k: True, treatment, ref),
                 "tokens": tokens_stat,
                 "seconds": seconds_stat,
                 "delta_tokens_pct": tokens_stat["delta_pct"] if tokens_stat is not None else None,
@@ -1165,6 +1175,9 @@ def build_summary(rows: list[dict]) -> dict:
             "p50_tokens": _percentile(stat["token_values"], 50),
             "p95_tokens": _percentile(stat["token_values"], 95),
             "tokens_per_solved": tokens_per_solved,
+            "prompt_tokens_per_solved": (
+                stat["prompt_tokens"] / passed_n if passed_n and prompt_n == n else None
+            ),
             "editor_tokens_total": int(stat["editor_tokens"]),
             "editor_tokens_measured_n": int(stat["editor_tokens_measured_n"]),
             "audit_tokens_total": int(stat["audit_tokens"]),
@@ -1330,6 +1343,18 @@ def summarize(rows: list[dict]) -> dict:
                     f"commit={c_stat['delta']:+.3f}"
                     f" {_format_ci(c_stat['ci_low'], c_stat['ci_high'])}"
                 )
+            for metric in ("first_prompt", "prompt"):
+                stat = entry[metric]
+                if stat is None:
+                    parts.append(f"{metric}=n/a (n=0)")
+                    continue
+                pct = stat["delta_pct"]
+                percent = f" ({pct:+.1f}%)" if pct is not None else ""
+                parts.append(
+                    f"{metric}={stat['mean_diff']:+.1f}{percent}"
+                    f" {_format_ci(stat['ci_low'], stat['ci_high'], precision=1)}"
+                    f" (n={stat['n_pairs']})"
+                )
             if entry["tokens"] is not None:
                 t_stat = entry["tokens"]
                 t_pct = (
@@ -1360,7 +1385,7 @@ def summarize(rows: list[dict]) -> dict:
     econ_header = (
         f"  {'arm':{arm_w}} {'pass':>6} {'tok_avg':>8} {'tok_p50':>8} {'tok_p95':>8}"
         f" {'tok/sol':>8} {'s_avg':>6} {'s_p50':>6} {'s_p95':>6}"
-        f" {'prompt':>8} {'compl':>7} {'calls':>5} {'d_tok':>7} {'d_sec':>7}"
+        f" {'prompt':>8} {'in/sol':>8} {'compl':>7} {'calls':>5} {'d_tok':>7} {'d_sec':>7}"
     )
     print(econ_header)
     print("  " + "-" * (len(econ_header) - 2))
@@ -1380,6 +1405,7 @@ def summarize(rows: list[dict]) -> dict:
             f" {_format_opt_num(stat['p50_seconds']):>6}"
             f" {_format_opt_num(stat['p95_seconds']):>6}"
             f" {_format_opt_num(stat['mean_prompt_tokens']):>8}"
+            f" {_format_opt_num(stat['prompt_tokens_per_solved']):>8}"
             f" {_format_opt_num(stat['mean_completion_tokens']):>7}"
             f" {_format_opt_num(stat['mean_editor_calls'], precision=2):>5}"
             f" {_format_opt_pct(stat['delta_tokens_pct'], is_ref=is_ref):>7}"

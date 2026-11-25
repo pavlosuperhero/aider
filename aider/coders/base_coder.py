@@ -1560,7 +1560,10 @@ class Coder:
             if os.getenv("AIDER_TRIAL_USAGE"):
                 usage = getattr(response, "usage", None)
                 total = getattr(usage, "total_tokens", None)
-                self.io.tool_output(f"Trial usage: audit {total}")
+                self.io.tool_output(
+                    f"Trial usage: audit prompt={getattr(usage, 'prompt_tokens', None)}"
+                    f" completion={getattr(usage, 'completion_tokens', None)} total={total}"
+                )
         if not response or not response.choices:
             return None
         raw = response.choices[0].message.content
@@ -3104,7 +3107,10 @@ class Coder:
         self.io.tool_output(self.usage_report)
         if os.getenv("AIDER_TRIAL_USAGE"):
             total = self.message_tokens_sent + self.message_tokens_received
-            self.io.tool_output(f"Trial usage: editor {total}")
+            self.io.tool_output(
+                f"Trial usage: editor prompt={self.message_tokens_sent}"
+                f" completion={self.message_tokens_received} total={total}"
+            )
 
         prompt_tokens = self.message_tokens_sent
         completion_tokens = self.message_tokens_received

@@ -354,6 +354,9 @@ def parse_trial_usage(log_text: str) -> dict:
         "tokens": total_tokens,
         "editor_tokens": editor_tokens,
         "audit_tokens": audit_tokens,
+        "first_editor_prompt_tokens": next(
+            (call["prompt"] for call in calls if call["role"] == "editor"), None
+        ),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "editor_calls": editor_calls,
@@ -862,6 +865,8 @@ def run_spec(
         exit=code,
         oracle=oracle,
         evidence=evidence,
+        read_range_attached=bool(re.search(r"^Read-range: attached ", log_text, re.M)),
+        facts_attached=bool(re.search(r"^Project facts: attached ", log_text, re.M)),
         contract_rejected=contract_rejected,
         audit_ran=bool(verdicts),
         audit_verdicts=verdicts,
@@ -886,6 +891,7 @@ def run_spec(
         tokens_measured=usage_info["measured"],
         editor_tokens=usage_info["editor_tokens"],
         audit_tokens=usage_info["audit_tokens"],
+        first_editor_prompt_tokens=usage_info["first_editor_prompt_tokens"],
         prompt_tokens=usage_info["prompt_tokens"],
         completion_tokens=usage_info["completion_tokens"],
         calls_by_role=usage_info["calls_by_role"],

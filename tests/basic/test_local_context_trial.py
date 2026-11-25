@@ -173,6 +173,21 @@ class TestLocalContextTrialControls(unittest.TestCase):
 
 
 class TestTrialUsageAndOutcomes(unittest.TestCase):
+    def test_editor_usage_round_trip_includes_resends(self):
+        from aider.coders.base_coder import Coder
+
+        coder = mock.Mock(total_tokens_sent=0, total_tokens_received=0, usage_report="Usage")
+        with mock.patch.dict(os.environ, AIDER_TRIAL_USAGE="1"):
+            for sent, received in [(640, 45), (810, 28)]:
+                coder.message_tokens_sent = sent
+                coder.message_tokens_received = received
+                Coder.show_usage_report(coder)
+        log = "\n".join(call.args[0] for call in coder.io.tool_output.call_args_list)
+        usage = run.parse_trial_usage(log)
+        self.assertEqual(usage["first_editor_prompt_tokens"], 640)
+        self.assertEqual(usage["prompt_tokens"], 1450)
+        self.assertEqual(usage["completion_tokens"], 73)
+
     def test_parse_trial_usage_measured_and_unmeasured(self):
         classic = "\n".join(
             [
@@ -199,6 +214,8 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         parsed_detailed = run.parse_trial_usage(detailed)
         self.assertTrue(parsed_detailed["measured"])
         self.assertEqual(parsed_detailed["tokens"], 1300)
+        self.assertIsNone(parsed["first_editor_prompt_tokens"])
+        self.assertEqual(parsed_detailed["first_editor_prompt_tokens"], 900)
         self.assertEqual(parsed_detailed["prompt_tokens"], 1100)
         self.assertEqual(parsed_detailed["completion_tokens"], 200)
 
@@ -1159,6 +1176,7 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
                     "tokens_measured": True,
                     "editor_tokens": off_tokens[idx],
                     "audit_tokens": 0,
+                    "first_editor_prompt_tokens": 450 if idx else None,
                     "prompt_tokens": off_tokens[idx] - 200,
                     "completion_tokens": 200,
                     "editor_calls": 2,
@@ -1187,6 +1205,7 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
                     "tokens_measured": True,
                     "editor_tokens": on_tokens[idx],
                     "audit_tokens": 0,
+                    "first_editor_prompt_tokens": 500,
                     "prompt_tokens": on_tokens[idx] - 150,
                     "completion_tokens": 150,
                     "editor_calls": 1,
@@ -1227,6 +1246,11 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
 
         # Paired % deltas: tokens (4500 - 6000) / 6000 = -25.0%, seconds (20 - 25) / 25 = -20.0%
         overall = summary["paired_overall"][0]
+        self.assertEqual(overall["first_prompt"]["n_pairs"], 3)
+        self.assertEqual(overall["first_prompt"]["mean_diff"], 50)
+        self.assertEqual(overall["prompt"]["mean_diff"], -325)
+        self.assertAlmostEqual(overall["prompt"]["delta_pct"], -25)
+        self.assertAlmostEqual(on_stat["prompt_tokens_per_solved"], 1300)
         self.assertAlmostEqual(overall["delta_tokens_pct"], -25.0)
         self.assertAlmostEqual(overall["delta_seconds_pct"], -20.0)
         self.assertAlmostEqual(on_stat["delta_tokens_pct"], -25.0)

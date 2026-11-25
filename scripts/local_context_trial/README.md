@@ -65,6 +65,47 @@ python scripts/local_context_trial/heldout.py \
   --check-fixtures
 ~~~
 
+### Small-model input-token trial
+
+Run one model at a time with LM Studio and Oracle available. Set `MODEL` to the
+Aider model identifier served locally, for example `lm_studio/<served-id>`.
+Use a fresh output directory for each model. Record its weights revision, quantization,
+context window, inference server version and sampling settings alongside the results.
+Keep those settings fixed across arms.
+
+~~~sh
+bash scripts/local_context_trial/issue5_input_trial.sh "$MODEL" issue5-small-model-run
+~~~
+
+The launcher runs three rounds with vague prompts, the builtin caller finder and a
+1,024-token repository-map budget. The reference is passive caller excerpts with facts
+and extra ranges off. The five Issue 5 fixtures cross facts off/on with ranges off/on
+(60 attempts). Compare each single-feature arm with the reference; use the combined
+arm to inspect interaction. Two multi-file tasks from Requests 2.34.2 then compare
+ranges off/on with facts off (12 attempts). They exercise copy independence and
+exception pickling. Both suites check hidden behavior after Aider exits.
+
+Read these measures together:
+
+- **First input** (`first_prompt`) gives the paired change in tokens sent on the first
+  editor request. **Cumulative input** (`prompt`) includes repeated context on later
+  calls. The report gives the mean difference in tokens per attempt, percentage change
+  relative to matched reference inputs, and the number of measured pairs. Aider uses
+  its tokenizer estimate when the editor provider omits usage. Older total-only logs
+  have no input breakdown.
+- **Correct edits** must pass smoke and hidden checks and satisfy the runner's file-scope
+  check. Inspect paired wins and losses on the same case and round, especially regressions
+  on the stale-fact control. **Input tokens per solved task** (`in/sol`) charges the
+  arm for every attempt, including failures. Missing input usage or zero solves yields
+  an unavailable value.
+- Inspect `facts_attached` and `read_range_attached` in each row. The range option
+  needs a discovered caller. Include runs without attachments in the primary result;
+  this measures the behavior users would actually get.
+- Report each case separately as well as aggregate results. Three repeats help reveal
+  model variability; the pilot has seven distinct tasks. Use a separately frozen
+  real-repository replay set before generalizing or choosing defaults. Oracle reference:
+  *Introduction to Information Retrieval*, p. 320, passage `069dc983a616649ad3adc765`.
+
 ### 2. Fast economy & efficiency workflow (`--preset issue5-economy`)
 
 Use `--preset issue5-economy` to measure Aider token economy and wall-clock efficiency on the
