@@ -1648,3 +1648,137 @@ def test_manual_read_range_excluded_for_edit_reply_but_prose_only_still_adds(pro
     )
     assert sorted(coder.get_inchat_relative_files()) == ["pkg/consumer.py", "pricing.py"]
     assert len(prose_sends) == 2
+
+
+def test_read_call_site_rejects_mismatched_cymbal_path_and_span_and_normalizes_path(tmp_path):
+    from aider.cymbal_callers import CymbalShowResult, CymbalShowSlice
+
+    one_lines = [
+        "def one_entry():",
+        "    step_one = 1",
+        "    step_two = 2",
+        "    step_three = 3",
+        "    return step_one + step_two + step_three",
+    ] + [f"# distant line {lineno}" for lineno in range(6, 71)]
+    (tmp_path / "one.py").write_text("\n".join(one_lines) + "\n", encoding="utf-8")
+    (tmp_path / "two.py").write_text(
+        "def two_entry():\n    return 'from_two'\n",
+        encoding="utf-8",
+    )
+
+    class _FakeCymbalShowClient:
+        def __init__(self, result):
+            self._result = result
+            self.calls = []
+
+        def show(self, root, target, *, max_lines=40, max_bytes=4096, verify_disk=False):
+            self.calls.append((root, target, max_lines, max_bytes, verify_disk))
+            return self._result
+
+    # 1. Wrong file returned by Cymbal (two.py:1 when requesting one.py:1) -> fall back to disk.
+    wrong_file_client = _FakeCymbalShowClient(
+        CymbalShowResult(
+            target="one.py:1",
+            slices=(
+                CymbalShowSlice(
+                    path="two.py",
+                    start_line=1,
+                    end_line=2,
+                    symbol="two_entry",
+                    kind="function",
+                    code="def two_entry():\n    return 'from_two'",
+                ),
+            ),
+        )
+    )
+    wrong_file_reader = LocalReadRangeReader(
+        tmp_path,
+        backend="cymbal",
+        cymbal_client=wrong_file_client,
+    )
+    excerpt_wrong_file = wrong_file_reader.read_call_site(
+        "one.py",
+        1,
+        context_lines=2,
+        use_cymbal=True,
+    )
+    assert len(wrong_file_client.calls) == 1
+    assert excerpt_wrong_file.path == "one.py"
+    assert excerpt_wrong_file.source == "native"
+    assert excerpt_wrong_file.start_line == 1
+    assert excerpt_wrong_file.end_line == 3
+    assert "def one_entry():" in excerpt_wrong_file.code
+    assert "two_entry" not in excerpt_wrong_file.code
+
+    # 2. Wrong line span returned by Cymbal (one.py:50-60 when requesting one.py:1) -> disk.
+    distant_code = "\n".join(one_lines[49:60])
+    wrong_span_client = _FakeCymbalShowClient(
+        CymbalShowResult(
+            target="one.py:1",
+            slices=(
+                CymbalShowSlice(
+                    path="one.py",
+                    start_line=50,
+                    end_line=60,
+                    symbol="distant_symbol",
+                    kind="function",
+                    code=distant_code,
+                ),
+            ),
+        )
+    )
+    wrong_span_reader = LocalReadRangeReader(
+        tmp_path,
+        backend="cymbal",
+        cymbal_client=wrong_span_client,
+    )
+    excerpt_wrong_span = wrong_span_reader.read_call_site(
+        "one.py",
+        1,
+        context_lines=2,
+        use_cymbal=True,
+    )
+    assert len(wrong_span_client.calls) == 1
+    assert excerpt_wrong_span.path == "one.py"
+    assert excerpt_wrong_span.source == "native"
+    assert excerpt_wrong_span.start_line == 1
+    assert excerpt_wrong_span.end_line == 3
+    assert "def one_entry():" in excerpt_wrong_span.code
+    assert "# distant line 50" not in excerpt_wrong_span.code
+
+    # 3. Normalized path match (./one.py:1 vs Cymbal one.py:1-5) -> returns validated Cymbal slice.
+    matching_code = "\n".join(one_lines[0:5])
+    matching_client = _FakeCymbalShowClient(
+        CymbalShowResult(
+            target="one.py:1",
+            slices=(
+                CymbalShowSlice(
+                    path="one.py",
+                    start_line=1,
+                    end_line=5,
+                    symbol="one_entry",
+                    kind="function",
+                    code=matching_code,
+                ),
+            ),
+        )
+    )
+    matching_reader = LocalReadRangeReader(
+        tmp_path,
+        backend="cymbal",
+        cymbal_client=matching_client,
+    )
+    excerpt_matched = matching_reader.read_call_site(
+        "./one.py",
+        "1",
+        context_lines=2,
+        use_cymbal=True,
+    )
+    assert len(matching_client.calls) == 1
+    assert matching_client.calls[0][1] == "one.py:1"
+    assert excerpt_matched.path == "one.py"
+    assert excerpt_matched.source == "cymbal"
+    assert excerpt_matched.start_line == 1
+    assert excerpt_matched.end_line == 5
+    assert "def one_entry():" in excerpt_matched.code
+    assert "return step_one + step_two + step_three" in excerpt_matched.code

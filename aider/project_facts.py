@@ -5,7 +5,7 @@ Architecture (Repository Pattern / Clean Architecture):
   validation/formatting helpers have zero dependency on SQLite, Coder, or git CLI.
 - `FactRepository` defines the persistence port (`add`, `search`, `list_for_paths`,
   `get`, `list_all`, `update_status`) with three interchangeable implementations:
-  `FakeFactRepository` (in-memory), `JsonlFactRepository` (zero-dependency UTF-8
+  `FakeFactRepository` (in-memory), `JsonlFactRepository` (UTF-8
   JSONL with chat hash ID and atomic rewrites), and `SqliteFtsFactRepository`
   (embedded Python `sqlite3` + FTS5 with atomic transactions and initial DB creation).
 - `ProjectFactStore` / `open_project_fact_store` orchestrates worktree isolation,
@@ -33,6 +33,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import unquote
+
+from filelock import FileLock
 
 try:
     import sqlite3  # type: ignore[assignment]
@@ -1179,7 +1181,7 @@ class FakeFactRepository(FactRepository):
 
 
 class JsonlFactRepository(FactRepository):
-    """Zero-dependency UTF-8 JSONL Repository Pattern implementation with atomic rewrites."""
+    """UTF-8 JSONL Repository Pattern implementation with atomic rewrites."""
 
     def __init__(
         self,
@@ -1189,6 +1191,7 @@ class JsonlFactRepository(FactRepository):
         read_only: bool = False,
     ) -> None:
         self._file_path = Path(file_path).expanduser().resolve()
+        self._write_lock = FileLock(str(self._file_path) + ".lock")
         self._max_top_k = max(1, min(int(max_top_k), MAX_TOP_K))
         self._read_only = bool(read_only)
 
@@ -1313,10 +1316,12 @@ class JsonlFactRepository(FactRepository):
         self._ensure_writable()
         if not isinstance(fact, ProjectFact):
             raise FactValidationError("Expected a ProjectFact instance.")
-        facts = self._load_facts()
-        facts[(fact.worktree_id, fact.fact_id)] = fact
-        self._write_facts(facts)
-        return fact
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._write_lock:
+            facts = self._load_facts()
+            facts[(fact.worktree_id, fact.fact_id)] = fact
+            self._write_facts(facts)
+            return fact
 
     def get(self, fact_id: str, *, worktree_id: str) -> ProjectFact | None:
         return self._load_facts().get((worktree_id, fact_id))
@@ -1383,20 +1388,22 @@ class JsonlFactRepository(FactRepository):
         updated_at: str | None = None,
     ) -> ProjectFact | None:
         self._ensure_writable()
-        facts = self._load_facts()
-        existing = facts.get((worktree_id, fact_id))
-        if existing is None:
-            return None
-        new_status = status if isinstance(status, FactStatus) else FactStatus(str(status))
-        updated = replace(
-            existing,
-            status=new_status,
-            stale_reason=stale_reason.strip(),
-            updated_at=updated_at or _utc_now_iso(),
-        )
-        facts[(worktree_id, fact_id)] = updated
-        self._write_facts(facts)
-        return updated
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._write_lock:
+            facts = self._load_facts()
+            existing = facts.get((worktree_id, fact_id))
+            if existing is None:
+                return None
+            new_status = status if isinstance(status, FactStatus) else FactStatus(str(status))
+            updated = replace(
+                existing,
+                status=new_status,
+                stale_reason=stale_reason.strip(),
+                updated_at=updated_at or _utc_now_iso(),
+            )
+            facts[(worktree_id, fact_id)] = updated
+            self._write_facts(facts)
+            return updated
 
 
 class SqliteFtsFactRepository(FactRepository):
@@ -2630,7 +2637,7 @@ def open_project_fact_store(
     """Open or degrade a worktree-scoped ProjectFactStore.
 
     - When ``enabled`` is False, skips probing, opening, or creating any store.
-    - When ``facts_db`` is omitted/blank, opens the zero-dependency JSONL store at
+    - When ``facts_db`` is omitted/blank, opens the JSONL store at
       ``resolve_facts_jsonl_path(root, facts_file)`` with deterministic ``chat_id``.
     - When ``facts_db`` is provided, parses it via ``parse_facts_db_url`` and opens
       the embedded SQLite FTS5 store. On invalid URL/scheme or missing ``sqlite3`` /

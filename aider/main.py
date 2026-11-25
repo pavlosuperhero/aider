@@ -501,6 +501,13 @@ class LocalReadRangeReader:
             symbol=symbol,
         )
 
+    @staticmethod
+    def _normalize_rel_path(path):
+        normalized = str(path).strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
+
     def read_call_site(
         self,
         rel_path,
@@ -516,13 +523,16 @@ class LocalReadRangeReader:
 
         from aider.read_range import read_range, validate_cymbal_show
 
+        target_line = int(line)
+        normalized_rel_path = self._normalize_rel_path(rel_path)
+
         if use_cymbal and self.cymbal_client is not None:
             from aider.cymbal_callers import CymbalError
 
             try:
                 show_res = self.cymbal_client.show(
                     self.root,
-                    f"{rel_path}:{line}",
+                    f"{normalized_rel_path}:{target_line}",
                     max_lines=max_lines,
                     max_bytes=max_bytes,
                     verify_disk=False,
@@ -532,11 +542,18 @@ class LocalReadRangeReader:
                     raise
                 show_res = None
 
+            chosen = None
             if show_res is not None and show_res.slices:
-                chosen = next(
-                    (sl for sl in show_res.slices if sl.path == rel_path),
-                    show_res.slices[0],
-                )
+                for sl in show_res.slices:
+                    if self._normalize_rel_path(sl.path) != normalized_rel_path:
+                        continue
+                    try:
+                        if int(sl.start_line) <= target_line <= int(sl.end_line):
+                            chosen = sl
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            if chosen is not None:
                 payload = {
                     "path": chosen.path,
                     "start_line": chosen.start_line,
@@ -565,8 +582,8 @@ class LocalReadRangeReader:
                     )
                 return excerpt
 
-        start_line = max(1, int(line) - max(0, int(context_lines)))
-        end_line = int(line) + max(0, int(context_lines))
+        start_line = max(1, target_line - max(0, int(context_lines)))
+        end_line = target_line + max(0, int(context_lines))
         return read_range(
             self.root,
             rel_path,

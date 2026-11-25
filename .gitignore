@@ -19,6 +19,7 @@ tmp.benchmarks/
 .docker_bash_history
 .cymbal/
 .aider.facts.jsonl
+.aider.facts.jsonl.lock
 .aider.facts.sqlite3
 .aider.facts.sqlite3-journal
 .aider.facts.sqlite3-wal

@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import sqlite3 as real_sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -962,3 +963,352 @@ def test_shared_custom_store_isolates_revalidation_between_worktrees(backend, tm
         assert [f.fact_id for f in store_b.search("schema v1")] == [fact_b.fact_id]
         stale_a = store_a.get(fact_a.fact_id)
         assert stale_a is not None and stale_a.is_stale
+
+
+def test_jsonl_readonly_operations_do_not_create_lock_file(tmp_path):
+    (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
+    jsonl_path = tmp_path / DEFAULT_FACTS_JSONL_FILENAME
+    lock_path = Path(str(jsonl_path) + ".lock")
+    wt_id = worktree_scope_id(tmp_path)
+    snaps = capture_source_snapshots(tmp_path, ["app.py"])
+
+    seed_fact = ProjectFact.confirmed(
+        worktree_id=wt_id,
+        statement="Read-only operations must not create lock files.",
+        sources=snaps,
+    )
+    jsonl_path.write_text(
+        json.dumps(seed_fact.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    assert not lock_path.exists()
+
+    for read_only in (True, False):
+        repo = JsonlFactRepository(jsonl_path, read_only=read_only)
+        assert repo.get(seed_fact.fact_id, worktree_id=wt_id) == seed_fact
+        assert [f.fact_id for f in repo.search("lock files", worktree_id=wt_id)] == [
+            seed_fact.fact_id
+        ]
+        assert [f.fact_id for f in repo.list_for_paths(["app.py"], worktree_id=wt_id)] == [
+            seed_fact.fact_id
+        ]
+        assert [f.fact_id for f in repo.list_all(worktree_id=wt_id)] == [seed_fact.fact_id]
+        assert not lock_path.exists()
+
+
+def test_jsonl_add_and_update_status_create_missing_parent_directory(tmp_path):
+    (tmp_path / "app.py").write_text("X = 1\n", encoding="utf-8")
+    wt_id = worktree_scope_id(tmp_path)
+    snaps = capture_source_snapshots(tmp_path, ["app.py"])
+
+    nested_jsonl = tmp_path / "new_subdir" / "nested" / DEFAULT_FACTS_JSONL_FILENAME
+    lock_path = Path(str(nested_jsonl) + ".lock")
+    assert not nested_jsonl.parent.exists()
+
+    repo = JsonlFactRepository(nested_jsonl)
+    fact_a = ProjectFact.confirmed(
+        worktree_id=wt_id,
+        statement="Nested JSONL store creates parent directory cleanly.",
+        sources=snaps,
+    )
+    repo.add(fact_a)
+    assert nested_jsonl.parent.is_dir()
+    assert nested_jsonl.is_file()
+    assert lock_path.is_file()
+    assert JsonlFactRepository(nested_jsonl).get(fact_a.fact_id, worktree_id=wt_id) == fact_a
+
+    # Even if the parent directory is removed before add(), add() recreates it before locking.
+    shutil.rmtree(tmp_path / "new_subdir")
+    assert not nested_jsonl.parent.exists()
+    fact_b = ProjectFact.confirmed(
+        worktree_id=wt_id,
+        statement="Recreated directory before acquiring write lock.",
+        sources=snaps,
+    )
+    repo.add(fact_b)
+    assert nested_jsonl.parent.is_dir()
+    assert nested_jsonl.is_file()
+    assert lock_path.is_file()
+    assert JsonlFactRepository(nested_jsonl).get(fact_b.fact_id, worktree_id=wt_id) == fact_b
+
+    # Same guarantee for update_status() when parent directory does not yet exist.
+    shutil.rmtree(tmp_path / "new_subdir")
+    assert not nested_jsonl.parent.exists()
+    result = repo.update_status(
+        "nonexistent_fact",
+        worktree_id=wt_id,
+        status=FactStatus.STALE,
+        stale_reason="missing dir check",
+    )
+    assert result is None
+    assert nested_jsonl.parent.is_dir()
+    assert lock_path.is_file()
+
+
+def test_jsonl_concurrent_repository_and_store_writes_prevent_lost_update(tmp_path):
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    wt_id = worktree_scope_id(tmp_path)
+    snaps = capture_source_snapshots(tmp_path, ["app.py"])
+
+    # 1. Two separate JsonlFactRepository instances writing concurrently to the same file.
+    jsonl_path = tmp_path / DEFAULT_FACTS_JSONL_FILENAME
+    repo_a = JsonlFactRepository(jsonl_path)
+    repo_b = JsonlFactRepository(jsonl_path)
+
+    fact_a = ProjectFact.confirmed(
+        fact_id="fact_concurrent_a",
+        worktree_id=wt_id,
+        statement="Alpha writer confirmed invariant.",
+        sources=snaps,
+    )
+    fact_b = ProjectFact.confirmed(
+        fact_id="fact_concurrent_b",
+        worktree_id=wt_id,
+        statement="Beta writer confirmed invariant.",
+        sources=snaps,
+    )
+
+    start_barrier = threading.Barrier(2)
+    a_in_load = threading.Event()
+    b_in_load = threading.Event()
+    events = []
+    events_lock = threading.Lock()
+    overlap_detected = False
+
+    orig_load_a = repo_a._load_facts
+    orig_write_a = repo_a._write_facts
+    orig_load_b = repo_b._load_facts
+    orig_write_b = repo_b._write_facts
+
+    def wrapped_load_a():
+        nonlocal overlap_detected
+        loaded = orig_load_a()
+        with events_lock:
+            events.append("a_load")
+        a_in_load.set()
+        # Without FileLock serialization, repo_b would enter _load_facts immediately here
+        # and read the same empty snapshot, causing a lost update.
+        if b_in_load.wait(timeout=0.15):
+            overlap_detected = True
+        return loaded
+
+    def wrapped_write_a(facts):
+        orig_write_a(facts)
+        with events_lock:
+            events.append("a_write")
+
+    def wrapped_load_b():
+        loaded = orig_load_b()
+        with events_lock:
+            events.append("b_load")
+        b_in_load.set()
+        return loaded
+
+    def wrapped_write_b(facts):
+        orig_write_b(facts)
+        with events_lock:
+            events.append("b_write")
+
+    repo_a._load_facts = wrapped_load_a
+    repo_a._write_facts = wrapped_write_a
+    repo_b._load_facts = wrapped_load_b
+    repo_b._write_facts = wrapped_write_b
+
+    errors = []
+
+    def run_a():
+        try:
+            start_barrier.wait(timeout=5.0)
+            repo_a.add(fact_a)
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def run_b():
+        try:
+            start_barrier.wait(timeout=5.0)
+            assert a_in_load.wait(timeout=5.0)
+            repo_b.add(fact_b)
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    t_a = threading.Thread(target=run_a)
+    t_b = threading.Thread(target=run_b)
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=10.0)
+    t_b.join(timeout=10.0)
+
+    assert not t_a.is_alive() and not t_b.is_alive()
+    assert errors == []
+    assert overlap_detected is False
+    assert events == ["a_load", "a_write", "b_load", "b_write"]
+
+    reopened_repo = JsonlFactRepository(jsonl_path)
+    assert reopened_repo.get(fact_a.fact_id, worktree_id=wt_id) == fact_a
+    assert reopened_repo.get(fact_b.fact_id, worktree_id=wt_id) == fact_b
+
+    # 2. Two separate ProjectFactStore instances writing distinct confirmed facts concurrently.
+    store_root = tmp_path / "concurrent_stores"
+    store_root.mkdir()
+    (store_root / "svc.py").write_text("MODE = 'prod'\n", encoding="utf-8")
+
+    with (
+        open_project_fact_store(store_root, enabled=True) as store_a,
+        open_project_fact_store(store_root, enabled=True) as store_b,
+    ):
+        s_barrier = threading.Barrier(2)
+        s_a_in_load = threading.Event()
+        s_b_in_load = threading.Event()
+        s_overlap = False
+
+        s_orig_load_a = store_a.repository._load_facts
+        s_orig_load_b = store_b.repository._load_facts
+
+        def s_wrapped_load_a():
+            nonlocal s_overlap
+            loaded = s_orig_load_a()
+            s_a_in_load.set()
+            if s_b_in_load.wait(timeout=0.15):
+                s_overlap = True
+            return loaded
+
+        def s_wrapped_load_b():
+            loaded = s_orig_load_b()
+            s_b_in_load.set()
+            return loaded
+
+        store_a.repository._load_facts = s_wrapped_load_a
+        store_b.repository._load_facts = s_wrapped_load_b
+
+        store_errors = []
+        recorded_ids = {}
+
+        def write_store_a():
+            try:
+                s_barrier.wait(timeout=5.0)
+                fact = store_a.record_fact(
+                    "Store A confirmed fact for concurrent durability.",
+                    source_paths=["svc.py"],
+                )
+                recorded_ids["a"] = fact.fact_id
+            except Exception as exc:  # pragma: no cover
+                store_errors.append(exc)
+
+        def write_store_b():
+            try:
+                s_barrier.wait(timeout=5.0)
+                assert s_a_in_load.wait(timeout=5.0)
+                fact = store_b.record_fact(
+                    "Store B confirmed fact for concurrent durability.",
+                    source_paths=["svc.py"],
+                )
+                recorded_ids["b"] = fact.fact_id
+            except Exception as exc:  # pragma: no cover
+                store_errors.append(exc)
+
+        st_a = threading.Thread(target=write_store_a)
+        st_b = threading.Thread(target=write_store_b)
+        st_a.start()
+        st_b.start()
+        st_a.join(timeout=10.0)
+        st_b.join(timeout=10.0)
+
+        assert not st_a.is_alive() and not st_b.is_alive()
+        assert store_errors == []
+        assert s_overlap is False
+
+    with open_project_fact_store(store_root, enabled=True) as reopened_store:
+        found = reopened_store.search("concurrent durability")
+        assert {f.fact_id for f in found} == {recorded_ids["a"], recorded_ids["b"]}
+        assert reopened_store.get(recorded_ids["a"]).is_confirmed
+        assert reopened_store.get(recorded_ids["b"]).is_confirmed
+
+
+def test_jsonl_concurrent_add_and_update_status_preserves_both(tmp_path):
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    jsonl_path = tmp_path / DEFAULT_FACTS_JSONL_FILENAME
+    wt_id = worktree_scope_id(tmp_path)
+    snaps = capture_source_snapshots(tmp_path, ["app.py"])
+
+    fact_existing = ProjectFact.confirmed(
+        fact_id="fact_existing",
+        worktree_id=wt_id,
+        statement="Existing fact whose status will transition.",
+        sources=snaps,
+    )
+    fact_new = ProjectFact.confirmed(
+        fact_id="fact_added_concurrently",
+        worktree_id=wt_id,
+        statement="Newly added fact during concurrent status update.",
+        sources=snaps,
+    )
+    JsonlFactRepository(jsonl_path).add(fact_existing)
+
+    repo_status = JsonlFactRepository(jsonl_path)
+    repo_add = JsonlFactRepository(jsonl_path)
+
+    barrier = threading.Barrier(2)
+    status_in_load = threading.Event()
+    add_in_load = threading.Event()
+    overlap = False
+
+    orig_status_load = repo_status._load_facts
+    orig_add_load = repo_add._load_facts
+
+    def wrapped_status_load():
+        nonlocal overlap
+        loaded = orig_status_load()
+        status_in_load.set()
+        if add_in_load.wait(timeout=0.15):
+            overlap = True
+        return loaded
+
+    def wrapped_add_load():
+        loaded = orig_add_load()
+        add_in_load.set()
+        return loaded
+
+    repo_status._load_facts = wrapped_status_load
+    repo_add._load_facts = wrapped_add_load
+
+    errors = []
+
+    def run_status():
+        try:
+            barrier.wait(timeout=5.0)
+            updated = repo_status.update_status(
+                fact_existing.fact_id,
+                worktree_id=wt_id,
+                status=FactStatus.STALE,
+                stale_reason="source hash changed",
+            )
+            assert updated is not None and updated.status == FactStatus.STALE
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def run_add():
+        try:
+            barrier.wait(timeout=5.0)
+            assert status_in_load.wait(timeout=5.0)
+            repo_add.add(fact_new)
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    t_status = threading.Thread(target=run_status)
+    t_add = threading.Thread(target=run_add)
+    t_status.start()
+    t_add.start()
+    t_status.join(timeout=10.0)
+    t_add.join(timeout=10.0)
+
+    assert not t_status.is_alive() and not t_add.is_alive()
+    assert errors == []
+    assert overlap is False
+
+    reopened = JsonlFactRepository(jsonl_path)
+    recovered_existing = reopened.get(fact_existing.fact_id, worktree_id=wt_id)
+    recovered_new = reopened.get(fact_new.fact_id, worktree_id=wt_id)
+    assert recovered_existing is not None
+    assert recovered_existing.status == FactStatus.STALE
+    assert recovered_existing.stale_reason == "source hash changed"
+    assert recovered_new == fact_new

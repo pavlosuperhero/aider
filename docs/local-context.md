@@ -233,7 +233,7 @@ attached as read-only context on relevant turns.
 | `--facts-file PATH` | `.aider.facts.jsonl` in project root | Sets the JSONL storage path when `--facts` is enabled without `--facts-db`. |
 | `--facts-db PATH_OR_URL` | `None` | Selects embedded SQLite + FTS5 storage via a local file path or `sqlite://` URL (for example `.aider.facts.sqlite3`, `sqlite:///abs/path/facts.sqlite3`, or `sqlite://rel/path/facts.sqlite3`). Overrides the JSONL default when `--facts` is enabled. |
 
-- **Default zero-dependency JSONL:** When `--facts` is enabled without
+- **Default JSONL:** When `--facts` is enabled without
   `--facts-db`, Aider writes UTF-8 JSONL records to `.aider.facts.jsonl` using
   atomic rewrites. Each record carries a deterministic `worktree_id`
   (`wt:<24-char sha256>` of the resolved worktree root) and `chat_id`
