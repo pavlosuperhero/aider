@@ -1,7 +1,9 @@
 """Integration tests for local callers backends, read-range, and project facts wiring."""
 
+import importlib
 import json
 from pathlib import Path
+import runpy
 import sys
 from unittest.mock import Mock
 
@@ -1445,3 +1447,204 @@ def test_read_command_alias_works_without_ambiguity(project):
     coder.commands.run("/read-range pkg/consumer.py:1-2")
     assert not errors
     assert [r.source for r in coder.read_only_ranges] == ["pkg/consumer.py:1-2"]
+
+
+# --- Regression tests: file-mention exclusion for read-only references ---
+
+
+class FixedCallerFinder:
+    """Deterministic CallerFinder returning fixed caller excerpts."""
+
+    def __init__(self, excerpts):
+        self._excerpts = tuple(excerpts)
+
+    def supports(self, path: str) -> bool:
+        return True
+
+    def find_callers(
+        self,
+        root,
+        message,
+        editable,
+        candidates,
+        *,
+        max_files=3,
+        max_chars=700,
+        context_lines=3,
+        report=None,
+    ):
+        return self._excerpts
+
+
+def test_passive_local_callers_edit_reply_does_not_auto_add_large_consumer(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("webbrowser.open", Mock())
+    monkeypatch.setattr("aider.repo.GitRepo.get_commit_message", lambda *a, **kw: "test commit")
+
+    repo = git.Repo.init(tmp_path)
+    with repo.config_writer() as config:
+        config.set_value("user", "name", "Integration test")
+        config.set_value("user", "email", "integration-test@example.invalid")
+
+    (tmp_path / "api.py").write_text(
+        "def normalize_code(raw):\n"
+        "    cleaned = raw.strip().upper()\n"
+        "    return cleaned\n",
+        encoding="utf-8",
+    )
+    padding = "".join(
+        f'PADDING_{i:04d} = "xxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n' for i in range(1, 3651)
+    )
+    consumer_text = (
+        "from api import normalize_code\n"
+        + padding
+        + "\n"
+        + "def route_code(raw):\n"
+        + "    code = normalize_code(raw)\n"
+        + '    if code == "MISSING_CODE":\n'
+        + '        return "fallback"\n'
+        + '    return f"route:{code}"\n'
+    )
+    consumer_path = tmp_path / "consumer.py"
+    consumer_path.write_text(consumer_text, encoding="utf-8")
+    assert consumer_path.stat().st_size > 140 * 1024
+
+    call_line = next(
+        idx
+        for idx, line in enumerate(consumer_text.splitlines(), 1)
+        if "code = normalize_code(raw)" in line
+    )
+    assert call_line > 3600
+
+    (tmp_path / "smoke.py").write_text(
+        "from consumer import route_code\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        '    assert route_code(" ab-1 ") == "route:AB-1"\n'
+        '    assert route_code("   ") == "fallback"\n'
+        '    assert route_code("") == "fallback"\n'
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+        encoding="utf-8",
+    )
+    repo.index.add(["api.py", "consumer.py", "smoke.py"])
+    repo.index.commit("Initial commit")
+
+    excerpt = CallerExcerpt(
+        path="consumer.py",
+        start_line=call_line - 1,
+        line=call_line,
+        symbol="normalize_code",
+        code=(
+            "def route_code(raw):\n"
+            "    code = normalize_code(raw)\n"
+            '    if code == "MISSING_CODE":\n'
+            '        return "fallback"\n'
+            '    return f"route:{code}"'
+        ),
+    )
+    coder = Coder.create(
+        edit_format="diff",
+        fnames=["api.py"],
+        io=InputOutput(yes=True, pretty=False, fancy_input=False),
+        main_model=Model("gpt-3.5-turbo"),
+        auto_commits=True,
+        auto_lint=False,
+        stream=False,
+        map_tokens=0,
+        detect_urls=False,
+        local_callers=True,
+        local_callers_mode="passive",
+        local_callers_read_range=True,
+        local_caller_finder=FixedCallerFinder([excerpt]),
+        read_range_reader=create_read_range_reader(tmp_path),
+    )
+    reply = (
+        "In consumer.py, route_code checks normalize_code for MISSING_CODE on blank inputs.\n\n"
+        "api.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "def normalize_code(raw):\n"
+        "    cleaned = raw.strip().upper()\n"
+        "    return cleaned\n"
+        "=======\n"
+        "def normalize_code(raw):\n"
+        "    cleaned = raw.strip().upper()\n"
+        '    return cleaned or "MISSING_CODE"\n'
+        ">>>>>>> REPLACE\n"
+        "```\n"
+    )
+    sends = fake_send(coder, [reply])
+    coder.run("Update normalize_code to return MISSING_CODE for blank input")
+
+    assert coder.get_inchat_relative_files() == ["api.py"]
+    assert len(sends) == 1
+    assert f"{call_line}:     code = normalize_code(raw)" in sends[0]
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for mod_name in ("api", "consumer", "smoke"):
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    try:
+        runpy.run_path(str(tmp_path / "smoke.py"), run_name="__main__")
+        consumer = importlib.import_module("consumer")
+        assert consumer.route_code(" ab-1 ") == "route:AB-1"
+        assert consumer.route_code("   ") == "fallback"
+        assert consumer.route_code("") == "fallback"
+    finally:
+        for mod_name in ("api", "consumer", "smoke"):
+            sys.modules.pop(mod_name, None)
+
+
+def test_manual_read_range_excluded_for_edit_reply_but_prose_only_still_adds(project):
+    coder = make_coder(
+        local_callers=False,
+        read_range_reader=create_read_range_reader(project),
+    )
+    coder.commands.run("/read-range pkg/consumer.py:1-3")
+    assert [r.source for r in coder.read_only_ranges] == ["pkg/consumer.py:1-3"]
+
+    prompted_subjects = []
+    orig_confirm = coder.io.confirm_ask
+
+    def spy_confirm(question, *args, **kwargs):
+        prompted_subjects.append((question, kwargs.get("subject")))
+        return orig_confirm(question, *args, **kwargs)
+
+    coder.io.confirm_ask = spy_confirm
+
+    edit_reply = (
+        "Checked pkg/consumer.py before updating format_price in pricing.py.\n\n"
+        + EDIT_BLOCK
+    )
+    edit_sends = fake_send(coder, [edit_reply])
+    coder.run("update format_price")
+
+    assert coder.get_inchat_relative_files() == ["pricing.py"]
+    assert len(edit_sends) == 1
+    assert not any(subj == "pkg/consumer.py" for _, subj in prompted_subjects)
+
+    patch_reply = (
+        "Checked pkg/consumer.py before updating pricing.py.\n"
+        "*** Begin Patch\n"
+        "*** Update File: pricing.py\n"
+        "*** End Patch\n"
+    )
+    assert coder.check_for_file_mentions(patch_reply) is None
+    assert coder.get_inchat_relative_files() == ["pricing.py"]
+
+    # A prose-only reply without an edit block or CALLER_CONTRACT marker still prompts and adds.
+    prose_reply = "Please add pkg/consumer.py so we can update the caller assertion."
+    prose_sends = fake_send(coder, [prose_reply, "Updated plan after adding consumer."])
+    coder.run("check whether callers need updates")
+
+    assert any(
+        q == "Add file to the chat?" and subj == "pkg/consumer.py"
+        for q, subj in prompted_subjects
+    )
+    assert sorted(coder.get_inchat_relative_files()) == ["pkg/consumer.py", "pricing.py"]
+    assert len(prose_sends) == 2

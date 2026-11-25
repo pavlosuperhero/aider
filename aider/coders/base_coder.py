@@ -1279,8 +1279,8 @@ class Coder:
                     rr = reader.read_call_site(
                         path,
                         line,
-                        context_lines=15,
-                        max_lines=40,
+                        context_lines=5,
+                        max_lines=20,
                         max_bytes=4096,
                         symbol=symbol,
                         use_cymbal=used_cymbal,
@@ -1288,9 +1288,9 @@ class Coder:
                 else:
                     rr = reader.read_range(
                         path,
-                        max(1, line - 15),
-                        line + 15,
-                        max_lines=40,
+                        max(1, line - 5),
+                        line + 5,
+                        max_lines=20,
                         max_bytes=4096,
                     )
             except Exception as err:
@@ -1305,6 +1305,7 @@ class Coder:
             collected,
             default_kind="read-range",
             max_items=3,
+            max_item_chars=900,
             max_total_chars=1600,
         )
 
@@ -2746,20 +2747,45 @@ class Coder:
         return mentioned_rel_fnames
 
     def check_for_file_mentions(self, content):
-        if "<<<<<<< SEARCH" in content:
-            content = re.sub(
+        has_edit_block = "<<<<<<< SEARCH" in content or bool(
+            re.search(
+                r"^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
+                content,
+                re.M,
+            )
+        )
+        has_contract_marker = "CALLER_CONTRACT:" in content.upper()
+        scan_content = content
+        if "<<<<<<< SEARCH" in scan_content:
+            scan_content = re.sub(
                 r"<<<<<<< SEARCH.*?>>>>>>> REPLACE",
                 "",
-                content,
+                scan_content,
                 flags=re.DOTALL,
             )
-        mentioned_rel_fnames = self.get_file_mentions(content)
+        mentioned_rel_fnames = self.get_file_mentions(scan_content)
 
         new_mentions = mentioned_rel_fnames - self.ignore_mentions
-        if self.local_callers and (
-            "<<<<<<< SEARCH" in content or "CALLER_CONTRACT:" in content.upper()
-        ):
-            new_mentions -= self.local_caller_contract_hook.attached_paths
+        if has_edit_block or has_contract_marker:
+            attached_paths = set()
+            if getattr(self, "local_callers", False) is True:
+                hook = getattr(self, "local_caller_contract_hook", None)
+                for path in getattr(hook, "attached_paths", None) or ():
+                    if isinstance(path, str) and path:
+                        attached_paths.add(path.replace("\\", "/"))
+            for ranges_attr in ("read_only_ranges", "_turn_auto_ranges"):
+                for item in getattr(self, ranges_attr, None) or ():
+                    source = getattr(item, "source", None)
+                    if isinstance(source, str) and source:
+                        rel_path = _extract_range_rel_path(source).replace("\\", "/")
+                        if rel_path:
+                            attached_paths.add(rel_path)
+            if attached_paths:
+                new_mentions = {
+                    path
+                    for path in new_mentions
+                    if path.replace("\\", "/") not in attached_paths
+                }
 
         if not new_mentions:
             return
