@@ -36,7 +36,7 @@ import run  # noqa: E402
 
 ARM_ORDER = run.VALID_ARMS
 LANGUAGE_ORDER = ("python", "js")
-KIND_ORDER = ("caller", "noisy", "control")
+KIND_ORDER = ("caller", "noisy", "facts", "read_range", "control")
 SPEC_ORDER = ("vague", "explicit")
 FIXTURE_SETUP_ERRORS = (
     "SyntaxError",
@@ -503,6 +503,22 @@ def paired_mean_diff_ci(
     return mean, mean - half, mean + half
 
 
+def _percentile(values: list[float], p: float) -> float | None:
+    """Return the p-th percentile (0 <= p <= 100) using linear interpolation."""
+    if not values:
+        return None
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (p / 100.0) * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    frac = pos - lo
+    return ordered[lo] + frac * (ordered[hi] - ordered[lo])
+
+
 def load_results(path: Path) -> list[dict]:
     """Load trial rows from a JSONL file, ignoring blank lines and metadata records."""
     rows: list[dict] = []
@@ -525,6 +541,16 @@ def check_fixtures(cases: list[run.CaseSpec]) -> int:
             repo = root / case.name
             repo.mkdir()
             run.write_fixture_files(repo, case.files)
+            if case.seed_facts:
+                try:
+                    run.seed_repo_facts(repo, case.seed_facts)
+                except Exception as exc:
+                    failures += 1
+                    print(
+                        f"[FAIL] {case.name:10} lang={case.language:6} kind={case.kind:7}"
+                        f" seed_error={exc}"
+                    )
+                    continue
             smoke_proc = subprocess.run(
                 shlex.split(case.test_cmd),
                 cwd=repo,
@@ -610,6 +636,8 @@ def _paired_numeric_stats(
     reference: str,
 ) -> dict | None:
     diffs: list[float] = []
+    t_total = 0.0
+    r_total = 0.0
     for key, values in pairs.items():
         if not group_filter(key):
             continue
@@ -617,15 +645,21 @@ def _paired_numeric_stats(
             t_val = values[treatment]
             r_val = values[reference]
             if t_val is not None and r_val is not None:
-                diffs.append(float(t_val) - float(r_val))
+                tf = float(t_val)
+                rf = float(r_val)
+                diffs.append(tf - rf)
+                t_total += tf
+                r_total += rf
     if not diffs:
         return None
     mean, ci_low, ci_high = paired_mean_diff_ci(diffs)
+    delta_pct = ((t_total - r_total) / r_total) * 100.0 if r_total else None
     return {
         "n_pairs": len(diffs),
         "mean_diff": mean,
         "ci_low": ci_low,
         "ci_high": ci_high,
+        "delta_pct": delta_pct,
     }
 
 
@@ -673,47 +707,65 @@ def _extract_row_outcomes(row: dict) -> dict:
         "tokens_measured": tokens_measured,
         "editor_tokens": row.get("editor_tokens"),
         "audit_tokens": row.get("audit_tokens"),
+        "prompt_tokens": row.get("prompt_tokens"),
+        "completion_tokens": row.get("completion_tokens"),
+        "editor_calls": row.get("editor_calls"),
     }
 
 
-def _row_control_tuple(row: dict) -> tuple[str | None, bool | None, bool]:
+def _row_control_tuple(
+    row: dict,
+) -> tuple[str | None, bool | None, bool | None, str | None, bool]:
     base_arm = normalize_arm(row["arm"])
     backend = row.get("local_callers_backend")
     read_range = row.get("local_callers_read_range")
-    if "local_callers_facts" in row and row["local_callers_facts"] is not None:
-        facts = bool(row["local_callers_facts"])
+    project_facts = None if row.get("project_facts") is None else bool(row["project_facts"])
+    raw_fb = row.get("facts_backend")
+    active_fb = (
+        str(raw_fb)
+        if raw_fb is not None and str(raw_fb) != "off" and project_facts is not False
+        else None
+    )
+    if "local_callers_enabled" in row and row["local_callers_enabled"] is not None:
+        local_callers = bool(row["local_callers_enabled"])
+    elif "local_callers_facts" in row and row["local_callers_facts"] is not None:
+        local_callers = bool(row["local_callers_facts"])
     else:
-        facts = base_arm != "baseline"
-    return (backend, read_range, facts)
+        local_callers = base_arm != "baseline"
+    return (backend, read_range, project_facts, active_fb, local_callers)
 
 
 def _build_arm_labels(rows: list[dict]) -> tuple[list[str], dict[str, str]]:
     """Assign arm display labels, qualifying only arms that vary across controls."""
-    controls_by_arm: dict[str, set[tuple[str | None, bool | None, bool]]] = defaultdict(set)
-    row_base_and_ctrl: list[tuple[str, tuple[str | None, bool | None, bool]]] = []
+    ctrl_type = tuple[str | None, bool | None, bool | None, str | None, bool]
+    controls_by_arm: dict[str, set[ctrl_type]] = defaultdict(set)
+    row_base_and_ctrl: list[tuple[str, ctrl_type]] = []
     for row in rows:
         base_arm = normalize_arm(row["arm"])
         ctrl = _row_control_tuple(row)
         controls_by_arm[base_arm].add(ctrl)
         row_base_and_ctrl.append((base_arm, ctrl))
 
-    varying_dims: dict[str, tuple[bool, bool, bool]] = {}
+    varying_dims: dict[str, tuple[bool, bool, bool, bool, bool]] = {}
     for base_arm, ctrls in controls_by_arm.items():
         if len(ctrls) > 1:
+            active_fbs = {c[3] for c in ctrls if c[3] is not None}
             varying_dims[base_arm] = (
                 len({c[0] for c in ctrls}) > 1,
                 len({c[1] for c in ctrls}) > 1,
                 len({c[2] for c in ctrls}) > 1,
+                len(active_fbs) > 1,
+                len({c[4] for c in ctrls}) > 1,
             )
 
     labels: list[str] = []
     label_to_base: dict[str, str] = {}
-    for base_arm, (backend, read_range, facts) in row_base_and_ctrl:
+    for base_arm, (backend, read_range, proj_facts, active_fb, local_callers) in row_base_and_ctrl:
         dims = varying_dims.get(base_arm)
         if not dims:
             label = base_arm
         else:
-            vary_backend, vary_range, vary_facts = dims
+            vary_backend, vary_range, vary_facts, vary_fb, vary_lc = dims
             parts: list[str] = []
             if vary_backend:
                 parts.append(f"backend={backend if backend is not None else 'default'}")
@@ -721,8 +773,17 @@ def _build_arm_labels(rows: list[dict]) -> tuple[list[str], dict[str, str]]:
                 range_str = "default" if read_range is None else ("on" if read_range else "off")
                 parts.append(f"range={range_str}")
             if vary_facts:
-                parts.append("facts=on" if facts else "facts=off")
-            label = f"{base_arm}[{','.join(parts)}]"
+                if proj_facts is None:
+                    parts.append("facts=default")
+                elif proj_facts:
+                    parts.append(f"facts=on({active_fb})" if active_fb else "facts=on")
+                else:
+                    parts.append("facts=off")
+            elif vary_fb:
+                parts.append(f"facts_backend={active_fb if active_fb is not None else 'off'}")
+            if vary_lc:
+                parts.append("lc=on" if local_callers else "lc=off")
+            label = f"{base_arm}[{','.join(parts)}]" if parts else base_arm
         labels.append(label)
         label_to_base[label] = base_arm
     return labels, label_to_base
@@ -850,12 +911,20 @@ def build_summary(rows: list[dict]) -> dict:
             "false_approval": 0,
             "extra_calls": 0,
             "seconds": 0.0,
+            "second_values": [],
             "tokens": 0,
+            "token_values": [],
             "tokens_measured_n": 0,
             "editor_tokens": 0,
             "editor_tokens_measured_n": 0,
             "audit_tokens": 0,
             "audit_tokens_measured_n": 0,
+            "prompt_tokens": 0,
+            "prompt_tokens_measured_n": 0,
+            "completion_tokens": 0,
+            "completion_tokens_measured_n": 0,
+            "editor_calls": 0,
+            "editor_calls_recorded_n": 0,
             "instrumented": 0,
         }
     )
@@ -872,6 +941,8 @@ def build_summary(rows: list[dict]) -> dict:
     seeds: set[int] = set()
     backends: set[str] = set()
     read_ranges: set[bool] = set()
+    project_facts_set: set[bool] = set()
+    facts_backends_set: set[str] = set()
 
     for r, arm in zip(rows, labels):
         lang = r.get("language") or "python"
@@ -899,6 +970,11 @@ def build_summary(rows: list[dict]) -> dict:
             backends.add(str(r["local_callers_backend"]))
         if r.get("local_callers_read_range") is not None:
             read_ranges.add(bool(r["local_callers_read_range"]))
+        if r.get("project_facts") is not None:
+            project_facts_set.add(bool(r["project_facts"]))
+        fb = r.get("facts_backend")
+        if fb is not None and (r.get("project_facts") is not None or fb != "off"):
+            facts_backends_set.add(str(fb))
 
         cell = cells[(lang, kind, spec, arm)]
         cell[0] += int(passed)
@@ -947,13 +1023,26 @@ def build_summary(rows: list[dict]) -> dict:
             stat["instrumented"] += 1
             stat["tokens_measured_n"] += 1
             stat["tokens"] += int(outcomes["tokens"])
+            stat["token_values"].append(float(outcomes["tokens"]))
         if outcomes["editor_tokens"] is not None:
             stat["editor_tokens_measured_n"] += 1
             stat["editor_tokens"] += int(outcomes["editor_tokens"])
         if outcomes["audit_tokens"] is not None:
             stat["audit_tokens_measured_n"] += 1
             stat["audit_tokens"] += int(outcomes["audit_tokens"])
-        stat["seconds"] += float(r.get("seconds", 0.0))
+        if outcomes["prompt_tokens"] is not None:
+            stat["prompt_tokens_measured_n"] += 1
+            stat["prompt_tokens"] += int(outcomes["prompt_tokens"])
+        if outcomes["completion_tokens"] is not None:
+            stat["completion_tokens_measured_n"] += 1
+            stat["completion_tokens"] += int(outcomes["completion_tokens"])
+        if outcomes["editor_calls"] is not None:
+            stat["editor_calls_recorded_n"] += 1
+            stat["editor_calls"] += int(outcomes["editor_calls"])
+        if r.get("seconds") is not None:
+            sec = float(r["seconds"])
+            stat["seconds"] += sec
+            stat["second_values"].append(sec)
 
     arms = _order_arm_labels(present_arms, label_to_base)
     langs = ordered_values(present_langs, LANGUAGE_ORDER)
@@ -1011,6 +1100,8 @@ def build_summary(rows: list[dict]) -> dict:
         overall_passed = _paired_binary_stats(passed_pairs, lambda _k: True, treatment, ref)
         if overall_passed is None:
             continue
+        tokens_stat = _paired_numeric_stats(token_pairs, lambda _k: True, treatment, ref)
+        seconds_stat = _paired_numeric_stats(seconds_pairs, lambda _k: True, treatment, ref)
         paired_overall.append(
             {
                 "scope": "ALL",
@@ -1019,19 +1110,34 @@ def build_summary(rows: list[dict]) -> dict:
                 "passed": overall_passed,
                 "hidden": _paired_binary_stats(hidden_pairs, lambda _k: True, treatment, ref),
                 "commit": _paired_binary_stats(commit_pairs, lambda _k: True, treatment, ref),
-                "tokens": _paired_numeric_stats(token_pairs, lambda _k: True, treatment, ref),
-                "seconds": _paired_numeric_stats(seconds_pairs, lambda _k: True, treatment, ref),
+                "tokens": tokens_stat,
+                "seconds": seconds_stat,
+                "delta_tokens_pct": tokens_stat["delta_pct"] if tokens_stat is not None else None,
+                "delta_seconds_pct": (
+                    seconds_stat["delta_pct"] if seconds_stat is not None else None
+                ),
             }
         )
+
+    primary_ref_by_arm: dict[str, dict] = {}
+    for entry in paired_overall:
+        primary_ref_by_arm.setdefault(entry["treatment"], entry)
 
     arm_outcomes: dict[str, dict] = {}
     for arm in arms:
         stat = arm_stats[arm]
         n = int(stat["n"])
+        passed_n = int(stat["passed"])
         measured_n = int(stat["tokens_measured_n"])
+        tokens_total = int(stat["tokens"])
+        prompt_n = int(stat["prompt_tokens_measured_n"])
+        completion_n = int(stat["completion_tokens_measured_n"])
+        editor_calls_n = int(stat["editor_calls_recorded_n"])
+        tokens_per_solved = (tokens_total / passed_n) if passed_n and measured_n == n else None
+        ref_entry = primary_ref_by_arm.get(arm)
         arm_outcomes[arm] = {
             "n": n,
-            "passed": int(stat["passed"]),
+            "passed": passed_n,
             "hidden_passed": int(stat["hidden_passed"]),
             "hidden_recorded": int(stat["hidden_recorded"]),
             "smoke_passed": int(stat["smoke_passed"]),
@@ -1051,13 +1157,35 @@ def build_summary(rows: list[dict]) -> dict:
             "extra_calls": int(stat["extra_calls"]),
             "seconds_total": stat["seconds"],
             "mean_seconds": (stat["seconds"] / n) if n else 0.0,
-            "tokens_total": int(stat["tokens"]),
+            "p50_seconds": _percentile(stat["second_values"], 50),
+            "p95_seconds": _percentile(stat["second_values"], 95),
+            "tokens_total": tokens_total,
             "tokens_measured_n": measured_n,
-            "mean_tokens": (stat["tokens"] / measured_n) if measured_n else None,
+            "mean_tokens": (tokens_total / measured_n) if measured_n else None,
+            "p50_tokens": _percentile(stat["token_values"], 50),
+            "p95_tokens": _percentile(stat["token_values"], 95),
+            "tokens_per_solved": tokens_per_solved,
             "editor_tokens_total": int(stat["editor_tokens"]),
             "editor_tokens_measured_n": int(stat["editor_tokens_measured_n"]),
             "audit_tokens_total": int(stat["audit_tokens"]),
             "audit_tokens_measured_n": int(stat["audit_tokens_measured_n"]),
+            "prompt_tokens_total": int(stat["prompt_tokens"]),
+            "prompt_tokens_measured_n": prompt_n,
+            "mean_prompt_tokens": (stat["prompt_tokens"] / prompt_n) if prompt_n else None,
+            "completion_tokens_total": int(stat["completion_tokens"]),
+            "completion_tokens_measured_n": completion_n,
+            "mean_completion_tokens": (
+                (stat["completion_tokens"] / completion_n) if completion_n else None
+            ),
+            "editor_calls_total": int(stat["editor_calls"]),
+            "editor_calls_recorded_n": editor_calls_n,
+            "mean_editor_calls": (
+                (stat["editor_calls"] / editor_calls_n) if editor_calls_n else None
+            ),
+            "delta_tokens_pct": ref_entry["delta_tokens_pct"] if ref_entry is not None else None,
+            "delta_seconds_pct": (
+                ref_entry["delta_seconds_pct"] if ref_entry is not None else None
+            ),
             "instrumented": int(stat["instrumented"]),
         }
 
@@ -1070,6 +1198,8 @@ def build_summary(rows: list[dict]) -> dict:
             "seeds": sorted(seeds),
             "backends": sorted(backends),
             "read_ranges": sorted(read_ranges),
+            "facts": sorted(project_facts_set),
+            "facts_backends": sorted(facts_backends_set),
         },
         "arms": arms,
         "languages": langs,
@@ -1087,6 +1217,18 @@ def _format_ci(lo: float | None, hi: float | None, precision: int = 3) -> str:
     if lo is None or hi is None:
         return "n/a"
     return f"[{lo:+.{precision}f}, {hi:+.{precision}f}]"
+
+
+def _format_opt_num(val: float | None, precision: int = 1) -> str:
+    if val is None:
+        return "n/a"
+    return f"{val:.{precision}f}"
+
+
+def _format_opt_pct(val: float | None, *, is_ref: bool = False) -> str:
+    if val is None:
+        return "ref" if is_ref else "n/a"
+    return f"{val:+.1f}%"
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -1111,6 +1253,11 @@ def summarize(rows: list[dict]) -> dict:
     if meta["read_ranges"]:
         rr_str = ",".join("on" if v else "off" for v in meta["read_ranges"])
         meta_parts.append(f"read_range={rr_str}")
+    if meta.get("facts"):
+        facts_str = ",".join("on" if v else "off" for v in meta["facts"])
+        meta_parts.append(f"facts={facts_str}")
+    if meta.get("facts_backends"):
+        meta_parts.append(f"facts_backend={','.join(meta['facts_backends'])}")
     print("\nRun metadata: " + " ".join(meta_parts))
 
     arms = summary["arms"]
@@ -1185,12 +1332,59 @@ def summarize(rows: list[dict]) -> dict:
                 )
             if entry["tokens"] is not None:
                 t_stat = entry["tokens"]
+                t_pct = (
+                    f" ({entry['delta_tokens_pct']:+.1f}%)"
+                    if entry.get("delta_tokens_pct") is not None
+                    else ""
+                )
                 parts.append(
-                    f"tokens={t_stat['mean_diff']:+.1f}"
+                    f"tokens={t_stat['mean_diff']:+.1f}{t_pct}"
                     f" {_format_ci(t_stat['ci_low'], t_stat['ci_high'], precision=1)}"
                     f" (n={t_stat['n_pairs']})"
                 )
+            if entry["seconds"] is not None:
+                s_stat = entry["seconds"]
+                s_pct = (
+                    f" ({entry['delta_seconds_pct']:+.1f}%)"
+                    if entry.get("delta_seconds_pct") is not None
+                    else ""
+                )
+                parts.append(
+                    f"seconds={s_stat['mean_diff']:+.1f}{s_pct}"
+                    f" {_format_ci(s_stat['ci_low'], s_stat['ci_high'], precision=1)}"
+                )
             print(f"  {entry['treatment']} vs {entry['reference']}: " + " | ".join(parts))
+
+    print("\nEconomy & efficiency:")
+    arm_w = max(16, *(len(a) for a in arms))
+    econ_header = (
+        f"  {'arm':{arm_w}} {'pass':>6} {'tok_avg':>8} {'tok_p50':>8} {'tok_p95':>8}"
+        f" {'tok/sol':>8} {'s_avg':>6} {'s_p50':>6} {'s_p95':>6}"
+        f" {'prompt':>8} {'compl':>7} {'calls':>5} {'d_tok':>7} {'d_sec':>7}"
+    )
+    print(econ_header)
+    print("  " + "-" * (len(econ_header) - 2))
+    ref_arms = {entry["reference"] for entry in summary["paired_overall"]}
+    treat_arms = {entry["treatment"] for entry in summary["paired_overall"]}
+    for arm in arms:
+        stat = summary["arm_outcomes"][arm]
+        is_ref = arm in ref_arms and arm not in treat_arms
+        pass_str = f"{stat['passed']}/{stat['n']}"
+        print(
+            f"  {arm:{arm_w}} {pass_str:>6}"
+            f" {_format_opt_num(stat['mean_tokens']):>8}"
+            f" {_format_opt_num(stat['p50_tokens']):>8}"
+            f" {_format_opt_num(stat['p95_tokens']):>8}"
+            f" {_format_opt_num(stat['tokens_per_solved']):>8}"
+            f" {_format_opt_num(stat['mean_seconds']):>6}"
+            f" {_format_opt_num(stat['p50_seconds']):>6}"
+            f" {_format_opt_num(stat['p95_seconds']):>6}"
+            f" {_format_opt_num(stat['mean_prompt_tokens']):>8}"
+            f" {_format_opt_num(stat['mean_completion_tokens']):>7}"
+            f" {_format_opt_num(stat['mean_editor_calls'], precision=2):>5}"
+            f" {_format_opt_pct(stat['delta_tokens_pct'], is_ref=is_ref):>7}"
+            f" {_format_opt_pct(stat['delta_seconds_pct'], is_ref=is_ref):>7}"
+        )
 
     print("\nArm telemetry:")
     for arm in arms:
@@ -1288,6 +1482,51 @@ def parse_bool_modes(raw: str, parser: argparse.ArgumentParser, flag: str) -> li
     return out
 
 
+_UNSET = object()
+
+BASE_DEFAULTS: dict[str, object] = {
+    "rounds": 3,
+    "arms": "baseline,passive",
+    "specs": "vague",
+    "suite": "synthetic",
+    "read_range_modes": None,
+    "facts_modes": None,
+}
+
+PRESET_DEFAULTS: dict[str, dict[str, object]] = {
+    "issue5-economy": {
+        "suite": "issue5",
+        "arms": "passive",
+        "specs": "vague",
+        "rounds": 1,
+        "read_range_modes": "off,on",
+        "facts_modes": "off,on",
+    },
+}
+
+
+def apply_preset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply preset defaults for CLI options that were not explicitly provided."""
+    preset_vals = PRESET_DEFAULTS.get(getattr(args, "preset", None) or "", {})
+    for key, base_val in BASE_DEFAULTS.items():
+        if getattr(args, key, _UNSET) is _UNSET:
+            rr_explicit = getattr(args, "local_callers_read_range", None) is not None
+            if key == "read_range_modes" and rr_explicit:
+                setattr(args, key, None)
+            elif key == "facts_modes" and getattr(args, "facts", None) is not None:
+                setattr(args, key, None)
+            else:
+                setattr(args, key, preset_vals.get(key, base_val))
+    return args
+
+
+class _PresetArgumentParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        ns, extras = super().parse_known_args(args, namespace)
+        apply_preset_defaults(ns)
+        return ns, extras
+
+
 def resolve_control_grid(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -1309,11 +1548,11 @@ def resolve_control_grid(
         read_ranges = [args.local_callers_read_range]
 
     if args.facts_modes is not None:
-        if args.local_callers_facts is not None:
-            parser.error("Use either --local-callers-facts/--facts or --facts-modes, not both")
+        if args.facts is not None:
+            parser.error("Use either --facts/--no-facts or --facts-modes, not both")
         facts_list = parse_bool_modes(args.facts_modes, parser, "--facts-modes")
     else:
-        facts_list = [args.local_callers_facts]
+        facts_list = [args.facts]
 
     return [
         (backend, read_range, facts)
@@ -1324,8 +1563,14 @@ def resolve_control_grid(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser = _PresetArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESET_DEFAULTS.keys()),
+        default=None,
+        help="optional trial preset (e.g. issue5-economy for fast economy & efficiency runs)",
+    )
+    parser.add_argument("--rounds", type=int, default=_UNSET)
     parser.add_argument("--map-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20261123)
     parser.add_argument("--model", default=run.MODEL)
@@ -1338,12 +1583,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--arms",
-        default="baseline,passive",
+        default=_UNSET,
         help=f"comma-separated arms from {', '.join(ARM_ORDER)}",
     )
     parser.add_argument(
         "--specs",
-        default="vague",
+        default=_UNSET,
         help=f"comma-separated specs from {', '.join(SPEC_ORDER)}",
     )
     parser.add_argument(
@@ -1358,8 +1603,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suite",
-        choices=["synthetic", "requests", "replay"],
-        default="synthetic",
+        choices=["synthetic", "requests", "issue5", "replay"],
+        default=_UNSET,
     )
     parser.add_argument(
         "--replay-manifest",
@@ -1380,24 +1625,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--read-range-modes",
-        default=None,
+        default=_UNSET,
         help="optional comma-separated factorial modes from default,off,on for read-range",
     )
     parser.add_argument(
-        "--local-callers-facts",
         "--facts",
         action=argparse.BooleanOptionalAction,
         default=None,
-        dest="local_callers_facts",
-        help=(
-            "optional independent override for caller facts"
-            " (--local-callers / --no-local-callers)"
-        ),
+        dest="facts",
+        help="optional override for Issue 5 project facts (--facts / --no-facts)",
     )
     parser.add_argument(
         "--facts-modes",
+        default=_UNSET,
+        help="optional comma-separated factorial modes from default,off,on for project facts",
+    )
+    parser.add_argument(
+        "--facts-db",
         default=None,
-        help="optional comma-separated factorial modes from default,off,on for caller facts",
+        help="optional SQLite path or sqlite:// URL passed via --facts-db",
+    )
+    parser.add_argument(
+        "--facts-file",
+        default=None,
+        help="optional JSONL file path passed via --facts-file",
+    )
+    parser.add_argument(
+        "--local-callers-override",
+        "--local-callers-facts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="local_callers_override",
+        help="optional override for --local-callers / --no-local-callers",
     )
     return parser
 
@@ -1416,6 +1675,18 @@ def resolve_suite_cases(
         import requests_cases
 
         return requests_cases.cases()
+
+    if args.suite == "issue5":
+        if args.languages:
+            parser.error("Use --suite issue5 without --languages filter")
+        import issue5_cases
+
+        suite_cases = issue5_cases.cases()
+        if args.cases:
+            allowed_names = tuple(case.name for case in suite_cases)
+            names = set(parse_csv_arg(args.cases, allowed_names, parser, "--cases"))
+            suite_cases = [case for case in suite_cases if case.name in names]
+        return suite_cases
 
     if args.suite == "replay":
         if args.cases or args.languages:
@@ -1474,6 +1745,10 @@ def main(argv: list[str] | None = None):
             "backends": [b for b in dict.fromkeys(b for b, _, _ in control_grid)],
             "read_ranges": [rr for rr in dict.fromkeys(rr for _, rr, _ in control_grid)],
             "facts": [f for f in dict.fromkeys(f for _, _, f in control_grid)],
+            "facts_db": args.facts_db,
+            "facts_file": args.facts_file,
+            "local_callers": args.local_callers_override,
+            "preset": args.preset,
         },
     )
     run.write_run_metadata(out.with_suffix(".meta.json"), run_meta)
@@ -1503,6 +1778,9 @@ def main(argv: list[str] | None = None):
             backend=backend,
             read_range=read_range,
             facts=facts,
+            facts_db=args.facts_db,
+            facts_file=args.facts_file,
+            local_callers=args.local_callers_override,
             metadata=row_meta,
         )
         rows.append(result)

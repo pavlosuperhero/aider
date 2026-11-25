@@ -58,33 +58,70 @@ class TestLocalContextTrialControls(unittest.TestCase):
             ],
         )
 
-        # Independently disable facts on passive while keeping read-range off and backend set
+        # Independently disable project facts while keeping passive --local-callers active
         flags_no_facts = run.resolve_arm_flags(
             "passive",
             backend="ast",
             read_range=False,
             facts=False,
+            facts_file=".aider.custom.jsonl",
         )
         self.assertEqual(
             flags_no_facts,
             [
-                "--no-local-callers",
+                "--local-callers",
                 "--local-callers-mode",
                 "passive",
                 "--no-local-callers-audit",
                 "--no-local-callers-read-range",
                 "--local-callers-backend",
                 "ast",
+                "--no-facts",
+                "--facts-file",
+                ".aider.custom.jsonl",
             ],
         )
-        self.assertNotIn("--local-callers", flags_no_facts)
 
-        # Independently enable facts on baseline
-        flags_with_facts = run.resolve_arm_flags("baseline", facts=True)
-        self.assertEqual(flags_with_facts, ["--local-callers"])
+        # Independently enable project facts with SQLite DB and override --local-callers
+        flags_with_facts = run.resolve_arm_flags(
+            "baseline",
+            facts=True,
+            facts_db=".aider.facts.sqlite3",
+            local_callers=True,
+        )
+        self.assertEqual(
+            flags_with_facts,
+            [
+                "--local-callers",
+                "--facts",
+                "--facts-db",
+                ".aider.facts.sqlite3",
+            ],
+        )
+
+        flags_lc_off = run.resolve_arm_flags("passive", local_callers=False)
+        self.assertEqual(flags_lc_off[0], "--no-local-callers")
+        self.assertNotIn("--local-callers", flags_lc_off)
+
+        tag = run.control_tag(
+            backend="builtin",
+            read_range=True,
+            facts=True,
+            facts_db=".aider.facts.sqlite3",
+            facts_file="custom.jsonl",
+            local_callers=False,
+        )
+        self.assertEqual(
+            tag,
+            "be-builtin-rr-on-facts-on-fdb-.aider.facts.sqlite3-ffile-custom.jsonl-lc-off",
+        )
 
         with self.assertRaises(ValueError):
             run.resolve_arm_flags("passive", backend="   ")
+        with self.assertRaises(ValueError):
+            run.resolve_arm_flags("passive", facts_db="  ")
+        with self.assertRaises(ValueError):
+            run.resolve_arm_flags("passive", facts_file="  ")
         with self.assertRaises(ValueError):
             run.resolve_arm_flags("unknown-arm")
 
@@ -113,13 +150,26 @@ class TestLocalContextTrialControls(unittest.TestCase):
                 "--local-callers-backend",
                 "graft",
                 "--local-callers-read-range",
-                "--no-local-callers-facts",
+                "--no-facts",
+                "--facts-db",
+                ".aider.facts.sqlite3",
+                "--facts-file",
+                "custom.jsonl",
+                "--no-local-callers-override",
             ]
         )
         self.assertEqual(
             heldout.resolve_control_grid(single_args, parser),
             [("graft", True, False)],
         )
+        self.assertEqual(single_args.facts_db, ".aider.facts.sqlite3")
+        self.assertEqual(single_args.facts_file, "custom.jsonl")
+        self.assertIs(single_args.local_callers_override, False)
+
+        # Backwards-compatible alias --no-local-callers-facts maps to local_callers_override
+        legacy_lc_args = parser.parse_args(["--facts", "--no-local-callers-facts"])
+        self.assertEqual(heldout.resolve_control_grid(legacy_lc_args, parser), [(None, None, True)])
+        self.assertIs(legacy_lc_args.local_callers_override, False)
 
 
 class TestTrialUsageAndOutcomes(unittest.TestCase):
@@ -170,12 +220,17 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         backend: str | None = None,
         read_range: bool | None = None,
         facts: bool | None = None,
+        facts_db: str | None = None,
+        facts_file: str | None = None,
+        local_callers: bool | None = None,
     ) -> tuple[dict, list[str]]:
         captured_cmd: list[str] = []
         real_run = subprocess.run
 
         def fake_run(cmd, *args, **kwargs):
-            if isinstance(cmd, list) and any("runpy.run_module('aider'" in str(part) for part in cmd):
+            if isinstance(cmd, list) and any(
+                "runpy.run_module('aider'" in str(part) for part in cmd
+            ):
                 captured_cmd.extend(cmd)
                 stdout = kwargs.get("stdout")
                 if stdout is not None:
@@ -198,6 +253,9 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
                     backend=backend,
                     read_range=read_range,
                     facts=facts,
+                    facts_db=facts_db,
+                    facts_file=facts_file,
+                    local_callers=local_callers,
                     metadata={"schema_version": 2, "run_id": "testrun", "git_commit": "abc1234567"},
                 )
         return result, captured_cmd
@@ -246,7 +304,10 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertEqual(ok_res["audit_tokens"], 250)
         self.assertEqual(ok_res["local_callers_backend"], "graft")
         self.assertIs(ok_res["local_callers_read_range"], True)
+        self.assertIs(ok_res["local_callers_enabled"], True)
         self.assertIs(ok_res["local_callers_facts"], True)
+        self.assertIsNone(ok_res["project_facts"])
+        self.assertEqual(ok_res["facts_backend"], "off")
         self.assertEqual(ok_res["metadata"]["git_commit"], "abc1234567")
 
         # 2. Audit PASS, clean edit applied, smoke PASS, hidden FAIL -> false_approval
@@ -320,6 +381,61 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(oos_res["commit_passed"], False)
         self.assertIs(oos_res["hidden_passed"], True)
         self.assertIs(oos_res["passed"], False)
+
+    def test_run_spec_complete_within_scope_and_project_facts_fields(self):
+        import issue5_cases
+
+        stale_case = next(c for c in issue5_cases.cases() if c.name == "facts_stale_control")
+
+        def fix_tax(repo: Path):
+            self.assertIn("TAX_POLICY_VERSION = 2", (repo / "policy.py").read_text())
+            self.assertTrue((repo / ".aider.facts.sqlite3").exists())
+            (repo / "api.py").write_text(
+                "def compute_tax(amount_cents, rate_percent=10):\n"
+                "    if amount_cents <= 0 or rate_percent <= 0:\n"
+                "        return 0\n"
+                "    return (amount_cents * rate_percent + 50) // 100\n"
+            )
+
+        res, cmd = self._run_spec_with_fake_aider(
+            case_spec=stale_case,
+            arm="passive",
+            log_content=(
+                "required foundations loaded\n"
+                "Local caller evidence: COMPLETE_WITHIN_SCOPE\n"
+                "Trial usage: editor prompt=800 completion=120 total=920\n"
+            ),
+            edit_fn=fix_tax,
+            facts=True,
+            facts_db=".aider.facts.sqlite3",
+        )
+        self.assertIn("--facts", cmd)
+        self.assertIn("--facts-db", cmd)
+        self.assertIn(".aider.facts.sqlite3", cmd)
+        self.assertIs(res["evidence"], True)
+        self.assertIs(res["project_facts"], True)
+        self.assertEqual(res["facts_backend"], "sqlite")
+        self.assertEqual(res["facts_db"], ".aider.facts.sqlite3")
+        self.assertIsNone(res["facts_file"])
+        self.assertIs(res["local_callers_enabled"], True)
+        self.assertIs(res["only_target_modified"], True)
+        self.assertIs(res["passed"], True)
+
+        jsonl_res, jsonl_cmd = self._run_spec_with_fake_aider(
+            case_spec=heldout.CASE_BY_NAME["duration"],
+            arm="passive",
+            log_content=(
+                "required foundations loaded\n"
+                "Local caller evidence: SELECTED\n"
+                "Trial usage: editor 500\n"
+            ),
+            facts=True,
+            facts_file=".aider.custom.jsonl",
+        )
+        self.assertIn("--facts", jsonl_cmd)
+        self.assertIn("--facts-file", jsonl_cmd)
+        self.assertEqual(jsonl_res["facts_backend"], "jsonl")
+        self.assertEqual(jsonl_res["facts_file"], ".aider.custom.jsonl")
 
 
 class TestReportingAndPairedIntervals(unittest.TestCase):
@@ -851,6 +967,320 @@ class TestReplaySuiteCliWiring(unittest.TestCase):
         finally:
             if saved_replay is not None:
                 sys.modules["replay_corpus"] = saved_replay
+
+
+class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
+    def test_issue5_suite_loading_filtering_and_fixture_check(self):
+        parser = heldout.build_arg_parser()
+        all_cases = heldout.resolve_suite_cases(parser.parse_args(["--suite", "issue5"]), parser)
+        names = [c.name for c in all_cases]
+        self.assertEqual(
+            names,
+            [
+                "facts_currency",
+                "facts_sentinel",
+                "facts_stale_control",
+                "read_range_large_file",
+                "caller_multi_scope",
+            ],
+        )
+
+        filtered = heldout.resolve_suite_cases(
+            parser.parse_args(
+                ["--suite", "issue5", "--cases", "facts_currency,caller_multi_scope"]
+            ),
+            parser,
+        )
+        self.assertEqual([c.name for c in filtered], ["facts_currency", "caller_multi_scope"])
+
+        for bad_argv in (
+            ["--suite", "issue5", "--languages", "python"],
+            ["--suite", "issue5", "--replay-manifest", "/tmp/frozen.json"],
+        ):
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                with self.assertRaises(SystemExit) as ctx:
+                    heldout.resolve_suite_cases(parser.parse_args(bad_argv), parser)
+            self.assertEqual(ctx.exception.code, 2)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = heldout.check_fixtures(all_cases)
+        self.assertEqual(rc, 0)
+        self.assertIn("5/5 passed", buf.getvalue())
+
+    def test_seed_repo_facts_jsonl_sqlite_and_mutate_after_seed_staleness(self):
+        import issue5_cases
+        from aider.project_facts import open_project_fact_store
+
+        by_name = {c.name: c for c in issue5_cases.cases()}
+
+        # 1. Default JSONL store records confirmed fact with deterministic chat_id
+        with tempfile.TemporaryDirectory(prefix="aider-seed-jsonl-") as tmp:
+            repo = Path(tmp)
+            case = by_name["facts_currency"]
+            run.write_fixture_files(repo, case.files)
+            mutated = run.seed_repo_facts(repo, case.seed_facts)
+            self.assertEqual(mutated, [])
+            jsonl_path = repo / ".aider.facts.jsonl"
+            self.assertTrue(jsonl_path.exists())
+            raw_lines = [line for line in jsonl_path.read_text().splitlines() if line.strip()]
+            self.assertEqual(len(raw_lines), 1)
+            rec = json.loads(raw_lines[0])
+            self.assertEqual(rec["verification"], "confirmed")
+            self.assertTrue(rec["chat_id"].startswith("chat:"))
+
+            with open_project_fact_store(repo, enabled=True) as store:
+                self.assertEqual(store.backend, "jsonl")
+                found = store.list_for_paths(["api.py"])
+                self.assertEqual(len(found), 1)
+                self.assertIn("FREE", found[0].statement)
+                self.assertTrue(found[0].chat_id.startswith("chat:"))
+
+        # 2. SQLite FTS5 store via facts_db
+        with tempfile.TemporaryDirectory(prefix="aider-seed-sqlite-") as tmp:
+            repo = Path(tmp)
+            case = by_name["facts_sentinel"]
+            run.write_fixture_files(repo, case.files)
+            run.seed_repo_facts(repo, case.seed_facts, facts_db=".aider.facts.sqlite3")
+            self.assertTrue((repo / ".aider.facts.sqlite3").exists())
+            with open_project_fact_store(
+                repo, enabled=True, facts_db=".aider.facts.sqlite3"
+            ) as store:
+                self.assertEqual(store.backend, "sqlite")
+                found = store.search("sentinel")
+                self.assertEqual(len(found), 1)
+                self.assertIn("-99", found[0].statement)
+                self.assertTrue(found[0].chat_id.startswith("chat:"))
+
+        # 3. mutate_after_seed invalidates source-hash stale fact in both JSONL and SQLite
+        for kwargs in ({}, {"facts_db": ".aider.facts.sqlite3"}):
+            with tempfile.TemporaryDirectory(prefix="aider-seed-stale-") as tmp:
+                repo = Path(tmp)
+                case = by_name["facts_stale_control"]
+                run.write_fixture_files(repo, case.files)
+                mutated = run.seed_repo_facts(repo, case.seed_facts, **kwargs)
+                self.assertEqual(mutated, ["policy.py"])
+                self.assertIn("TAX_POLICY_VERSION = 2", (repo / "policy.py").read_text())
+
+                with open_project_fact_store(repo, enabled=True, **kwargs) as store:
+                    report = store.revalidate()
+                    self.assertEqual(report.stale, 1)
+                    self.assertEqual(report.active, 0)
+                    self.assertEqual(store.list_for_paths(["policy.py"]), ())
+
+    def test_preset_issue5_economy_defaults_and_overrides(self):
+        parser = heldout.build_arg_parser()
+        args = parser.parse_args(["--preset", "issue5-economy"])
+        self.assertEqual(args.preset, "issue5-economy")
+        self.assertEqual(args.suite, "issue5")
+        self.assertEqual(args.arms, "passive")
+        self.assertEqual(args.specs, "vague")
+        self.assertEqual(args.rounds, 1)
+        self.assertEqual(args.read_range_modes, "off,on")
+        self.assertEqual(args.facts_modes, "off,on")
+
+        grid = heldout.resolve_control_grid(args, parser)
+        self.assertEqual(
+            grid,
+            [
+                (None, False, False),
+                (None, False, True),
+                (None, True, False),
+                (None, True, True),
+            ],
+        )
+
+        # Explicit CLI overrides take precedence, including overriding back to base defaults
+        override_args = parser.parse_args(
+            [
+                "--preset",
+                "issue5-economy",
+                "--suite",
+                "synthetic",
+                "--rounds",
+                "3",
+                "--arms",
+                "baseline,passive",
+                "--specs",
+                "explicit",
+                "--read-range-modes",
+                "on",
+                "--facts",
+                "--facts-db",
+                ".aider.facts.sqlite3",
+            ]
+        )
+        self.assertEqual(override_args.suite, "synthetic")
+        self.assertEqual(override_args.rounds, 3)
+        self.assertEqual(override_args.arms, "baseline,passive")
+        self.assertEqual(override_args.specs, "explicit")
+        self.assertEqual(override_args.read_range_modes, "on")
+        self.assertIsNone(override_args.facts_modes)
+        self.assertIs(override_args.facts, True)
+        self.assertEqual(
+            heldout.resolve_control_grid(override_args, parser),
+            [(None, True, True)],
+        )
+
+    def test_economy_and_efficiency_summary_metrics_and_table(self):
+        self.assertIsNone(heldout._percentile([], 50))
+        self.assertEqual(heldout._percentile([42.0], 95), 42.0)
+        self.assertAlmostEqual(heldout._percentile([10.0, 20.0, 30.0, 40.0], 50), 25.0)
+        self.assertAlmostEqual(heldout._percentile([10.0, 20.0, 30.0, 40.0], 95), 38.5)
+
+        off_tokens = [1000, 1200, 1400, 2400]
+        on_tokens = [900, 1000, 1100, 1500]
+        off_secs = [4.0, 5.0, 6.0, 10.0]
+        on_secs = [3.0, 4.0, 5.0, 8.0]
+        off_pass = [True, False, False, False]
+        on_pass = [True, True, True, False]
+
+        rows = []
+        for idx in range(4):
+            rows.append(
+                {
+                    "schema_version": 2,
+                    "model": "qwen-test",
+                    "round": idx,
+                    "spec": "vague",
+                    "kind": "facts",
+                    "language": "python",
+                    "case": "facts_currency",
+                    "arm": "passive",
+                    "project_facts": False,
+                    "facts_backend": "off",
+                    "local_callers_enabled": True,
+                    "passed": off_pass[idx],
+                    "hidden_passed": off_pass[idx],
+                    "commit_passed": True,
+                    "evidence": True,
+                    "tokens": off_tokens[idx],
+                    "tokens_measured": True,
+                    "editor_tokens": off_tokens[idx],
+                    "audit_tokens": 0,
+                    "prompt_tokens": off_tokens[idx] - 200,
+                    "completion_tokens": 200,
+                    "editor_calls": 2,
+                    "seconds": off_secs[idx],
+                    "metadata": {"suite": "issue5", "seed": 20261123},
+                }
+            )
+            rows.append(
+                {
+                    "schema_version": 2,
+                    "model": "qwen-test",
+                    "round": idx,
+                    "spec": "vague",
+                    "kind": "facts",
+                    "language": "python",
+                    "case": "facts_currency",
+                    "arm": "passive",
+                    "project_facts": True,
+                    "facts_backend": "jsonl",
+                    "local_callers_enabled": True,
+                    "passed": on_pass[idx],
+                    "hidden_passed": on_pass[idx],
+                    "commit_passed": True,
+                    "evidence": True,
+                    "tokens": on_tokens[idx],
+                    "tokens_measured": True,
+                    "editor_tokens": on_tokens[idx],
+                    "audit_tokens": 0,
+                    "prompt_tokens": on_tokens[idx] - 150,
+                    "completion_tokens": 150,
+                    "editor_calls": 1,
+                    "seconds": on_secs[idx],
+                    "metadata": {"suite": "issue5", "seed": 20261123},
+                }
+            )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            summary = heldout.summarize(rows)
+        output = buf.getvalue()
+
+        self.assertEqual(summary["arms"], ["passive[facts=off]", "passive[facts=on(jsonl)]"])
+        self.assertEqual(summary["metadata"]["facts"], [False, True])
+        self.assertEqual(summary["metadata"]["facts_backends"], ["jsonl", "off"])
+
+        off_stat = summary["arm_outcomes"]["passive[facts=off]"]
+        on_stat = summary["arm_outcomes"]["passive[facts=on(jsonl)]"]
+
+        self.assertAlmostEqual(off_stat["p50_tokens"], 1300.0)
+        self.assertAlmostEqual(off_stat["p95_tokens"], 2250.0)
+        self.assertAlmostEqual(off_stat["tokens_per_solved"], 6000.0)
+        self.assertAlmostEqual(off_stat["p50_seconds"], 5.5)
+        self.assertAlmostEqual(off_stat["p95_seconds"], 9.4)
+        self.assertAlmostEqual(off_stat["mean_prompt_tokens"], 1300.0)
+        self.assertAlmostEqual(off_stat["mean_completion_tokens"], 200.0)
+        self.assertAlmostEqual(off_stat["mean_editor_calls"], 2.0)
+
+        self.assertAlmostEqual(on_stat["p50_tokens"], 1050.0)
+        self.assertAlmostEqual(on_stat["p95_tokens"], 1440.0)
+        self.assertAlmostEqual(on_stat["tokens_per_solved"], 1500.0)
+        self.assertAlmostEqual(on_stat["p50_seconds"], 4.5)
+        self.assertAlmostEqual(on_stat["p95_seconds"], 7.55)
+        self.assertAlmostEqual(on_stat["mean_prompt_tokens"], 975.0)
+        self.assertAlmostEqual(on_stat["mean_completion_tokens"], 150.0)
+        self.assertAlmostEqual(on_stat["mean_editor_calls"], 1.0)
+
+        # Paired % deltas: tokens (4500 - 6000) / 6000 = -25.0%, seconds (20 - 25) / 25 = -20.0%
+        overall = summary["paired_overall"][0]
+        self.assertAlmostEqual(overall["delta_tokens_pct"], -25.0)
+        self.assertAlmostEqual(overall["delta_seconds_pct"], -20.0)
+        self.assertAlmostEqual(on_stat["delta_tokens_pct"], -25.0)
+        self.assertAlmostEqual(on_stat["delta_seconds_pct"], -20.0)
+        self.assertIsNone(off_stat["delta_tokens_pct"])
+
+        self.assertIn("Economy & efficiency:", output)
+        self.assertIn("facts=off,on", output)
+        self.assertIn("facts_backend=jsonl,off", output)
+        self.assertIn("-25.0%", output)
+        self.assertIn("-20.0%", output)
+        self.assertIn("1500.0", output)
+
+        # Verify tokens_per_solved is None when passed == 0, and backend-only arm labels work
+        backend_rows = [
+            {
+                "round": 0,
+                "spec": "vague",
+                "kind": "facts",
+                "case": "facts_currency",
+                "arm": "passive",
+                "project_facts": True,
+                "facts_backend": "jsonl",
+                "passed": False,
+                "tokens": 1000,
+                "tokens_measured": True,
+                "seconds": 2.0,
+            },
+            {
+                "round": 0,
+                "spec": "vague",
+                "kind": "facts",
+                "case": "facts_currency",
+                "arm": "passive",
+                "project_facts": True,
+                "facts_backend": "sqlite",
+                "passed": True,
+                "tokens": 900,
+                "tokens_measured": True,
+                "seconds": 1.5,
+            },
+        ]
+        backend_summary = heldout.build_summary(backend_rows)
+        self.assertEqual(
+            backend_summary["arms"],
+            ["passive[facts_backend=jsonl]", "passive[facts_backend=sqlite]"],
+        )
+        self.assertIsNone(
+            backend_summary["arm_outcomes"]["passive[facts_backend=jsonl]"]["tokens_per_solved"]
+        )
+        self.assertAlmostEqual(
+            backend_summary["arm_outcomes"]["passive[facts_backend=sqlite]"]["tokens_per_solved"],
+            900.0,
+        )
 
 
 if __name__ == "__main__":

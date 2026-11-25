@@ -127,6 +127,7 @@ class CaseSpec:
     hidden_cmd: list[str]
     kind: str = "caller"
     additional_editable: tuple[str, ...] = ()
+    seed_facts: tuple[dict[str, object], ...] = ()
 
 
 def py_case(
@@ -138,6 +139,7 @@ def py_case(
     kind: str = "caller",
     editable_file: str = "api.py",
     smoke_file: str = "smoke.py",
+    seed_facts: tuple[dict[str, object], ...] = (),
 ) -> CaseSpec:
     """Build a Python CaseSpec."""
     return CaseSpec(
@@ -150,6 +152,7 @@ def py_case(
         test_cmd=f"{shlex.quote(sys.executable)} {smoke_file}",
         hidden_cmd=[sys.executable, "-c", hidden],
         kind=kind,
+        seed_facts=tuple(seed_facts),
     )
 
 
@@ -162,6 +165,7 @@ def js_case(
     kind: str = "caller",
     editable_file: str = "api.mjs",
     smoke_file: str = "smoke.mjs",
+    seed_facts: tuple[dict[str, object], ...] = (),
 ) -> CaseSpec:
     """Build a Node.js ESM CaseSpec."""
     return CaseSpec(
@@ -174,6 +178,7 @@ def js_case(
         test_cmd=f"node {smoke_file}",
         hidden_cmd=["node", "--input-type=module", "-e", hidden],
         kind=kind,
+        seed_facts=tuple(seed_facts),
     )
 
 
@@ -183,12 +188,16 @@ def resolve_arm_flags(
     backend: str | None = None,
     read_range: bool | None = None,
     facts: bool | None = None,
+    facts_db: str | None = None,
+    facts_file: str | None = None,
+    local_callers: bool | None = None,
 ) -> list[str]:
     """Return CLI flags for a trial arm ('context' aliases 'passive').
 
-    Optional independent controls override caller facts (--local-callers /
+    Optional independent controls override local callers (--local-callers /
     --no-local-callers), read-range (--local-callers-read-range /
-    --no-local-callers-read-range), and backend (--local-callers-backend).
+    --no-local-callers-read-range), backend (--local-callers-backend), and
+    Issue 5 project facts (--facts / --no-facts, --facts-db, --facts-file).
     Leaving any control as None preserves existing defaults.
     """
     if arm == "context":
@@ -198,8 +207,8 @@ def resolve_arm_flags(
     else:
         raise ValueError(f"Unknown arm {arm!r}; expected one of {', '.join(VALID_ARMS)}")
 
-    if facts is not None:
-        desired = "--local-callers" if facts else "--no-local-callers"
+    if local_callers is not None:
+        desired = "--local-callers" if local_callers else "--no-local-callers"
         flags = [flag for flag in flags if flag not in ("--local-callers", "--no-local-callers")]
         flags.insert(0, desired)
 
@@ -214,23 +223,52 @@ def resolve_arm_flags(
             raise ValueError("backend must be a non-empty string when specified")
         flags.extend(["--local-callers-backend", cleaned])
 
+    if facts is True:
+        flags.append("--facts")
+    elif facts is False:
+        flags.append("--no-facts")
+
+    if facts_db is not None:
+        cleaned = facts_db.strip()
+        if not cleaned:
+            raise ValueError("facts_db must be a non-empty string when specified")
+        flags.extend(["--facts-db", cleaned])
+
+    if facts_file is not None:
+        cleaned = facts_file.strip()
+        if not cleaned:
+            raise ValueError("facts_file must be a non-empty string when specified")
+        flags.extend(["--facts-file", cleaned])
+
     return flags
+
+
+def _slugify_control(value: str, fallback: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("_") or fallback
 
 
 def control_tag(
     backend: str | None = None,
     read_range: bool | None = None,
     facts: bool | None = None,
+    facts_db: str | None = None,
+    facts_file: str | None = None,
+    local_callers: bool | None = None,
 ) -> str:
     """Return a filesystem-safe tag suffix for non-default independent controls."""
     parts: list[str] = []
     if backend is not None:
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", backend.strip()).strip("_") or "backend"
-        parts.append(f"be-{slug}")
+        parts.append(f"be-{_slugify_control(backend, 'backend')}")
     if read_range is not None:
         parts.append("rr-on" if read_range else "rr-off")
     if facts is not None:
         parts.append("facts-on" if facts else "facts-off")
+    if facts_db is not None:
+        parts.append(f"fdb-{_slugify_control(facts_db, 'db')}")
+    if facts_file is not None:
+        parts.append(f"ffile-{_slugify_control(facts_file, 'file')}")
+    if local_callers is not None:
+        parts.append("lc-on" if local_callers else "lc-off")
     return "-".join(parts)
 
 
@@ -478,6 +516,89 @@ def init_git_repo(repo: Path) -> None:
     )
 
 
+def _exclude_facts_artifacts(
+    repo: Path,
+    *,
+    facts_db: str | None = None,
+    facts_file: str | None = None,
+) -> None:
+    """Exclude custom relative facts store paths from git status inside repo."""
+    exclude_file = repo / ".git" / "info" / "exclude"
+    if not exclude_file.exists():
+        return
+    patterns: list[str] = []
+    if facts_file:
+        raw = facts_file.strip()
+        if raw and not Path(raw).is_absolute() and not raw.startswith(".."):
+            patterns.append(raw)
+    if facts_db:
+        raw = facts_db.strip()
+        if raw.lower().startswith("sqlite://"):
+            raw = raw[len("sqlite://") :].split("?", 1)[0].split("#", 1)[0]
+        if (
+            raw
+            and not raw.startswith("/")
+            and not Path(raw).is_absolute()
+            and not raw.startswith("..")
+        ):
+            patterns.extend([raw, f"{raw}-wal", f"{raw}-shm"])
+    if not patterns:
+        return
+    existing = exclude_file.read_text()
+    existing_lines = set(existing.splitlines())
+    additions = [pat for pat in dict.fromkeys(patterns) if pat not in existing_lines]
+    if additions:
+        suffix = "" if not existing or existing.endswith("\n") else "\n"
+        exclude_file.write_text(existing + suffix + "\n".join(additions) + "\n")
+
+
+def seed_repo_facts(
+    repo: Path | str,
+    seed_facts: tuple[dict[str, object], ...] | list[dict[str, object]],
+    *,
+    facts_db: str | None = None,
+    facts_file: str | None = None,
+) -> list[str]:
+    """Seed confirmed project facts into repo and apply any post-seed mutations."""
+    if not seed_facts:
+        return []
+    repo_path = Path(repo)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from aider.project_facts import open_project_fact_store
+
+    store = open_project_fact_store(
+        repo_path,
+        enabled=True,
+        facts_db=facts_db,
+        facts_file=facts_file,
+    )
+    if not store.active:
+        diagnostic = store.diagnostic or "Project facts store could not be opened."
+        store.close()
+        raise RuntimeError(diagnostic)
+
+    mutations: dict[str, str] = {}
+    try:
+        for entry in seed_facts:
+            store.record_fact(
+                str(entry["statement"]),
+                source_paths=tuple(entry.get("source_paths") or ()),
+                tags=tuple(entry.get("tags") or ()),
+                note=str(entry.get("note") or ""),
+            )
+            post_mut = entry.get("mutate_after_seed")
+            if isinstance(post_mut, dict):
+                for rel_path, content in post_mut.items():
+                    mutations[str(rel_path)] = str(content)
+    finally:
+        store.close()
+
+    if mutations:
+        write_fixture_files(repo_path, mutations)
+    return list(mutations.keys())
+
+
 def run_verification_details(repo: Path, case_spec: CaseSpec, timeout: int = 15) -> dict:
     """Run smoke and hidden commands independently against repo and return separate results."""
     checks = (
@@ -538,6 +659,9 @@ def run_spec(
     backend: str | None = None,
     read_range: bool | None = None,
     facts: bool | None = None,
+    facts_db: str | None = None,
+    facts_file: str | None = None,
+    local_callers: bool | None = None,
     metadata: dict | None = None,
 ) -> dict:
     """Run a single Aider trial for case_spec under the requested arm and controls."""
@@ -548,13 +672,24 @@ def run_spec(
         backend=backend,
         read_range=read_range,
         facts=facts,
+        facts_db=facts_db,
+        facts_file=facts_file,
+        local_callers=local_callers,
     )
-    effective_facts = "--local-callers" in arm_flags
+    local_callers_enabled = "--local-callers" in arm_flags
+    facts_backend = "sqlite" if facts and facts_db else ("jsonl" if facts else "off")
     task = case_spec.task
     if spec == "explicit" and case_spec.explicit:
         task = f"{task} {case_spec.explicit}"
 
-    ctrl_suffix = control_tag(backend=backend, read_range=read_range, facts=facts)
+    ctrl_suffix = control_tag(
+        backend=backend,
+        read_range=read_range,
+        facts=facts,
+        facts_db=facts_db,
+        facts_file=facts_file,
+        local_callers=local_callers,
+    )
     if run_tag is not None:
         tag = run_tag
     elif ctrl_suffix:
@@ -567,6 +702,36 @@ def run_spec(
     repo.mkdir()
     write_fixture_files(repo, case_spec.files)
     init_git_repo(repo)
+    _exclude_facts_artifacts(repo, facts_db=facts_db, facts_file=facts_file)
+    if case_spec.seed_facts:
+        mutated_paths = seed_repo_facts(
+            repo,
+            case_spec.seed_facts,
+            facts_db=facts_db,
+            facts_file=facts_file,
+        )
+        if mutated_paths:
+            subprocess.run(
+                ["git", "add", "--", *mutated_paths],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Trial",
+                    "-c",
+                    "user.email=trial@localhost",
+                    "commit",
+                    "-qm",
+                    "post-seed fixture mutation",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
     base_rev = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
 
     env = dict(os.environ, PYTHONPATH=str(ROOT), AIDER_ANALYTICS="false", AIDER_TRIAL_USAGE="1")
@@ -619,7 +784,13 @@ def run_spec(
             code = 124
 
     log_text = (folder / "aider.log").read_text()
-    evidence = bool(re.search(r"^Local caller evidence: (SELECTED|INCOMPLETE)", log_text, re.M))
+    evidence = bool(
+        re.search(
+            r"^Local caller evidence: (SELECTED|INCOMPLETE|COMPLETE_WITHIN_SCOPE)",
+            log_text,
+            re.M,
+        )
+    )
     oracle = "required foundations loaded" in log_text
     contract_rejected = "Local caller contract check:" in log_text
     verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
@@ -681,7 +852,12 @@ def run_spec(
         arm_flags=arm_flags,
         local_callers_backend=backend,
         local_callers_read_range=read_range,
-        local_callers_facts=effective_facts,
+        local_callers_enabled=local_callers_enabled,
+        local_callers_facts=local_callers_enabled,
+        project_facts=facts,
+        facts_backend=facts_backend,
+        facts_db=facts_db,
+        facts_file=facts_file,
         map_tokens=map_tokens,
         exit=code,
         oracle=oracle,
@@ -733,6 +909,9 @@ def run_case(
     backend: str | None = None,
     read_range: bool | None = None,
     facts: bool | None = None,
+    facts_db: str | None = None,
+    facts_file: str | None = None,
+    local_callers: bool | None = None,
     metadata: dict | None = None,
 ):
     """Backwards-compatible wrapper for legacy tuple cases."""
@@ -746,7 +925,14 @@ def run_case(
     )
     arm = "context" if enabled else "baseline"
     spec = "explicit" if specify_behavior else "vague"
-    ctrl_suffix = control_tag(backend=backend, read_range=read_range, facts=facts)
+    ctrl_suffix = control_tag(
+        backend=backend,
+        read_range=read_range,
+        facts=facts,
+        facts_db=facts_db,
+        facts_file=facts_file,
+        local_callers=local_callers,
+    )
     run_tag = f"{run_id}-{ctrl_suffix}" if ctrl_suffix else str(run_id)
     result = run_spec(
         output=output,
@@ -759,6 +945,9 @@ def run_case(
         backend=backend,
         read_range=read_range,
         facts=facts,
+        facts_db=facts_db,
+        facts_file=facts_file,
+        local_callers=local_callers,
         metadata=metadata,
     )
     result["explicit_behavior"] = specify_behavior
@@ -782,12 +971,29 @@ def main():
         help="optional override for --local-callers-read-range / --no-local-callers-read-range",
     )
     parser.add_argument(
-        "--local-callers-facts",
         "--facts",
         action=argparse.BooleanOptionalAction,
         default=None,
-        dest="local_callers_facts",
-        help="optional independent override for caller facts (--local-callers / --no-local-callers)",
+        dest="facts",
+        help="optional override for Issue 5 project facts (--facts / --no-facts)",
+    )
+    parser.add_argument(
+        "--facts-db",
+        default=None,
+        help="optional SQLite path or sqlite:// URL passed via --facts-db",
+    )
+    parser.add_argument(
+        "--facts-file",
+        default=None,
+        help="optional JSONL file path passed via --facts-file",
+    )
+    parser.add_argument(
+        "--local-callers-override",
+        "--local-callers-facts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="local_callers_override",
+        help="optional override for --local-callers / --no-local-callers",
     )
     args = parser.parse_args()
     output = Path(tempfile.mkdtemp(prefix="aider-local-trial-"))
@@ -803,7 +1009,10 @@ def main():
         controls={
             "backend": args.local_callers_backend,
             "read_range": args.local_callers_read_range,
-            "facts": args.local_callers_facts,
+            "facts": args.facts,
+            "facts_db": args.facts_db,
+            "facts_file": args.facts_file,
+            "local_callers": args.local_callers_override,
         },
     )
     write_run_metadata(output / "metadata.json", run_meta)
@@ -829,16 +1038,25 @@ def main():
                     args.specify_behavior,
                     backend=args.local_callers_backend,
                     read_range=args.local_callers_read_range,
-                    facts=args.local_callers_facts,
+                    facts=args.facts,
+                    facts_db=args.facts_db,
+                    facts_file=args.facts_file,
+                    local_callers=args.local_callers_override,
                     metadata=row_meta,
                 )
                 print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)
                 with (output / "results.jsonl").open("a") as stream:
                     stream.write(json.dumps(result) + "\n")
-                expected_facts = (
-                    args.local_callers_facts if args.local_callers_facts is not None else enabled
+                expected_local_callers = (
+                    args.local_callers_override
+                    if args.local_callers_override is not None
+                    else enabled
                 )
-                if not result["oracle"] or result["exit"] or result["evidence"] != expected_facts:
+                if (
+                    not result["oracle"]
+                    or result["exit"]
+                    or result["evidence"] != expected_local_callers
+                ):
                     raise SystemExit("Invalid trial; inspect aider.log")
 
 
