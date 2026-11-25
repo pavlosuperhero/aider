@@ -1022,11 +1022,13 @@ def test_facts_never_override_incomplete_caller_evidence(project):
 # --- Regression tests: /arch handoff, /ask contract mode, /drop ranges, /read alias ---
 
 
-def _script_coder_sends(monkeypatch, replies):
+def _script_coder_sends(monkeypatch, replies, *, coders=None):
     calls = []
     remaining = list(replies)
 
     def send(self, messages, model=None, functions=None):
+        if coders is not None:
+            coders.append(self)
         user_text = "\n".join(
             m["content"]
             for m in messages
@@ -1174,6 +1176,138 @@ def test_architect_handoff_strict_audit_failure_reports_uncommitted(project, mon
         "left the changes uncommitted."
     )
     assert any(m["content"] == expected for m in arch_coder.done_messages)
+
+
+def test_architect_dry_run_valid_edit_preserves_file_and_reports_dry_run(project, monkeypatch):
+    dry_io = InputOutput(yes=True, pretty=False, fancy_input=False, dry_run=True)
+    coder = Coder.create(
+        edit_format="diff",
+        fnames=["pricing.py"],
+        io=dry_io,
+        main_model=Model("gpt-3.5-turbo", editor_edit_format="editor-diff"),
+        auto_commits=True,
+        auto_lint=False,
+        stream=False,
+        map_tokens=0,
+        detect_urls=False,
+        dry_run=True,
+        auto_accept_architect=True,
+    )
+    seen_coders = []
+    arch_reply = "Update `format_price` in `pricing.py` to prepend `$`."
+    calls = _script_coder_sends(monkeypatch, [arch_reply, EDIT_BLOCK], coders=seen_coders)
+    repo = git.Repo(project)
+    head = repo.head.commit
+    orig_bytes = (project / "pricing.py").read_bytes()
+
+    with pytest.raises(SwitchCoder) as exc_info:
+        coder.commands.run("/arch update format_price")
+
+    arch_coder = exc_info.value.kwargs["from_coder"]
+    editor_coder = next(c for c in seen_coders if c.edit_format == "editor-diff")
+    assert [fmt for fmt, _ in calls] == ["architect", "editor-diff"]
+    assert editor_coder.dry_run is True
+    assert editor_coder.dry_run_edited is True
+    assert (project / "pricing.py").read_bytes() == orig_bytes
+    assert repo.head.commit == head
+    assert not repo.is_dirty()
+    assert arch_coder.aider_edited_files == set()
+    assert any(
+        m["content"] == "Dry run: no files were modified." for m in arch_coder.done_messages
+    )
+    assert not any(
+        m["content"] == "I made those changes to the files." for m in arch_coder.done_messages
+    )
+
+
+def test_architect_strict_contract_no_callers_distinguishes_no_op_from_blocked(
+    project, monkeypatch
+):
+    repo = git.Repo(project)
+    standalone = project / "standalone.py"
+    standalone.write_text("def helper():\n    return 1\n", encoding="utf-8")
+    repo.index.add(["standalone.py"])
+    head = repo.index.commit("Add standalone module without callers")
+    orig_text = standalone.read_text(encoding="utf-8")
+    standalone_edit = (
+        "standalone.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "def helper():\n"
+        "    return 1\n"
+        "=======\n"
+        "def helper():\n"
+        "    return 2\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+    )
+    blocked_msg = (
+        "No changes were made to the files because "
+        "caller contract verification did not pass."
+    )
+
+    def make_standalone_coder():
+        return Coder.create(
+            edit_format="diff",
+            fnames=["standalone.py"],
+            io=InputOutput(yes=True, pretty=False, fancy_input=False),
+            main_model=Model("gpt-3.5-turbo", editor_edit_format="editor-diff"),
+            auto_commits=True,
+            auto_lint=False,
+            stream=False,
+            map_tokens=0,
+            detect_urls=False,
+            local_callers=True,
+            local_callers_mode="contract",
+            local_callers_policy="strict",
+            auto_accept_architect=True,
+        )
+
+    # No-op reply ("Already correct.") with NO caller excerpts: not blocked.
+    noop_coders = []
+    _script_coder_sends(
+        monkeypatch,
+        ["Check helper in standalone.py; no edits are required.", "Already correct."],
+        coders=noop_coders,
+    )
+    with pytest.raises(SwitchCoder) as noop_exc:
+        make_standalone_coder().commands.run("/arch check helper in standalone.py")
+
+    noop_arch = noop_exc.value.kwargs["from_coder"]
+    noop_editor = next(c for c in noop_coders if c.edit_format == "editor-diff")
+    assert noop_editor._local_caller_excerpts == ()
+    assert noop_editor.local_caller_contract_hook.blocked is False
+    assert standalone.read_text(encoding="utf-8") == orig_text
+    assert repo.head.commit == head
+    assert not repo.is_dirty()
+    assert noop_arch.aider_edited_files == set()
+    assert any(
+        m["content"] == "No changes were made to the files." for m in noop_arch.done_messages
+    )
+    assert not any(m["content"] == blocked_msg for m in noop_arch.done_messages)
+
+    # Edit proposal with NO caller excerpts in strict contract mode: blocked.
+    blocked_coders = []
+    _script_coder_sends(
+        monkeypatch,
+        ["Update helper in standalone.py to return 2.", standalone_edit],
+        coders=blocked_coders,
+    )
+    with pytest.raises(SwitchCoder) as blocked_exc:
+        make_standalone_coder().commands.run("/arch update helper in standalone.py")
+
+    blocked_arch = blocked_exc.value.kwargs["from_coder"]
+    blocked_editor = next(c for c in blocked_coders if c.edit_format == "editor-diff")
+    assert blocked_editor._local_caller_excerpts == ()
+    assert blocked_editor.local_caller_contract_hook.blocked is True
+    assert standalone.read_text(encoding="utf-8") == orig_text
+    assert repo.head.commit == head
+    assert not repo.is_dirty()
+    assert blocked_arch.aider_edited_files == set()
+    assert any(m["content"] == blocked_msg for m in blocked_arch.done_messages)
+    assert not any(
+        m["content"] == "No changes were made to the files." for m in blocked_arch.done_messages
+    )
 
 
 def test_ask_mode_contract_retains_context_and_allows_fenced_code(project):

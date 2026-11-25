@@ -101,6 +101,7 @@ class Coder:
     repo = None
     last_aider_commit_hash = None
     aider_edited_files = None
+    dry_run_edited = False
     last_asked_for_commit_time = 0
     repo_map = None
     functions = None
@@ -1690,6 +1691,7 @@ class Coder:
     def init_before_message(self):
         self.response_hook_pending = False
         self.aider_edited_files = set()
+        self.dry_run_edited = False
         self._unreviewed_paths.update(self._audit_originals)
         self._audit_originals.clear()
         self.reflected_message = None
@@ -3304,6 +3306,7 @@ class Coder:
                 return edited
             contract = self.local_caller_contract_hook
             if edits and contract.enabled and not contract.format_present and not contract.advisory:
+                contract.blocked = True
                 self.io.tool_warning(
                     "Local caller contract check: UNKNOWN (unverified edit format)"
                 )
@@ -3355,6 +3358,9 @@ class Coder:
 
             self.reflected_message = str(err)
             return edited
+
+        if self.dry_run and edited:
+            self.dry_run_edited = True
 
         for path in edited:
             if self.dry_run:

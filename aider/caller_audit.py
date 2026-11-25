@@ -333,6 +333,7 @@ class CallerContractHook:
         self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.rejections: int = 0
         self.format_present = False
+        self.blocked: bool = False
 
     def begin_turn(
         self,
@@ -350,6 +351,7 @@ class CallerContractHook:
         )
         self.rejections = 0
         self.format_present = False
+        self.blocked = False
 
     def set_supplementary_evidence(
         self,
@@ -385,6 +387,7 @@ class CallerContractHook:
         io=None,
     ) -> ResponseHookResult | None:
         self.format_present = False
+        self.blocked = False
         if not self.enabled or not content:
             return None
         edit_marker = re.search(
@@ -398,7 +401,10 @@ class CallerContractHook:
         if not self._excerpts:
             if io:
                 io.tool_output("Local caller contract check: NO_EVIDENCE")
-            return None if self.advisory else ResponseHookResult()
+            if self.advisory:
+                return None
+            self.blocked = True
+            return ResponseHookResult()
 
         pre_edit = content[: edit_marker.start()]
         contract = _CONTRACT_RE.search(pre_edit)
@@ -412,9 +418,13 @@ class CallerContractHook:
         if self.rejections >= self.max_rejections:
             if io:
                 io.tool_output("Local caller contract check: ENFORCEMENT_EXHAUSTED")
-            return None if self.advisory else ResponseHookResult()
+            if self.advisory:
+                return None
+            self.blocked = True
+            return ResponseHookResult()
 
         self.rejections += 1
+        self.blocked = True
         if io is not None:
             io.tool_output("Local caller contract check: missing contract/trace")
 

@@ -14,6 +14,11 @@ class ArchitectCoder(AskCoder):
 
         if edited_files:
             if (
+                getattr(editor_coder, "dry_run_edited", False) is True
+                or getattr(editor_coder, "dry_run", False) is True
+            ):
+                return "Dry run: no files were modified."
+            if (
                 getattr(editor_coder, "local_caller_auditor", None) is not None
                 and not getattr(editor_coder, "caller_advisory", False)
                 and getattr(editor_coder, "_audit_originals", None)
@@ -25,16 +30,7 @@ class ArchitectCoder(AskCoder):
             return "I made those changes to the files."
 
         contract = getattr(editor_coder, "local_caller_contract_hook", None)
-        if (
-            contract is not None
-            and getattr(contract, "enabled", False)
-            and not getattr(contract, "advisory", False)
-            and not getattr(contract, "format_present", False)
-            and (
-                getattr(contract, "rejections", 0) > 0
-                or not getattr(editor_coder, "_local_caller_excerpts", ())
-            )
-        ):
+        if contract is not None and getattr(contract, "blocked", False) is True:
             return (
                 "No changes were made to the files because "
                 "caller contract verification did not pass."
@@ -81,8 +77,12 @@ class ArchitectCoder(AskCoder):
         self.total_cost = editor_coder.total_cost
         self.aider_commit_hashes = editor_coder.aider_commit_hashes
 
+        is_dry_run = (
+            getattr(editor_coder, "dry_run_edited", False) is True
+            or getattr(editor_coder, "dry_run", False) is True
+        )
         edited_files = getattr(editor_coder, "aider_edited_files", None)
-        if isinstance(edited_files, (set, frozenset, list, tuple)):
+        if isinstance(edited_files, (set, frozenset, list, tuple)) and not is_dry_run:
             if isinstance(self.aider_edited_files, set):
                 self.aider_edited_files.update(edited_files)
             elif edited_files:
@@ -93,7 +93,7 @@ class ArchitectCoder(AskCoder):
         if isinstance(getattr(self, "_unreviewed_paths", None), dict):
             if isinstance(unreviewed, dict):
                 self._unreviewed_paths.update(unreviewed)
-            if isinstance(audit_originals, dict):
+            if isinstance(audit_originals, dict) and not is_dry_run:
                 self._unreviewed_paths.update(audit_originals)
 
         outcome_message = self._editor_outcome_message(editor_coder, edited_files)
