@@ -31,8 +31,10 @@ EXCEPTIONS = [
     ),
     ExInfo("AzureOpenAIError", True, None),
     ExInfo("MalformedRequestFieldError", False, None),
+    ExInfo("MissingMessageRoleError", False, None),
     ExInfo("ModelNotMappedError", False, None),
     ExInfo("PaymentRequiredError", False, None),
+    ExInfo("RequestOverDeploymentTpmError", False, None),
     ExInfo("UnsupportedEndpointError", False, None),
     ExInfo("ValidationError", False, None),
     ExInfo("VectorStoreSearchError", False, None),
@@ -85,12 +87,18 @@ class LiteLLMExceptions:
         import litellm
 
         for var in dir(litellm):
+            if not var.endswith("Error"):
+                continue
+            val = getattr(litellm, var, None)
             # Filter by BaseException because instances of non-exception classes cannot be caught.
             # `litellm.ErrorEventError` is an example of a regular class which just happens to end
             # with `Error`.
-            if var.endswith("Error") and issubclass(getattr(litellm, var), BaseException):
-                if var not in self.exception_info:
+            if not (isinstance(val, type) and issubclass(val, BaseException)):
+                continue
+            if var not in self.exception_info:
+                if strict:
                     raise ValueError(f"{var} is in litellm but not in aider's exceptions list")
+                self.exceptions[val] = ExInfo(var, False, None)
 
         for var in self.exception_info:
             ex = getattr(litellm, var, None)
