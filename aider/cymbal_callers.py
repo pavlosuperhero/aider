@@ -33,20 +33,20 @@ from typing import Any, Iterable, Literal, Protocol, Sequence
 import warnings
 
 from aider.local_callers import (
+    CONTROL_KEYWORDS,
+    DEF_REGEXES,
+    LARGE_FILE_LIMITATION,
+    WORD_RE,
     CallerEvidenceReport,
     CallerExcerpt,
     CallerFinder,
     PythonAstCallerFinder,
     TreeSitterCallerFinder,
-    _CONTROL_KEYWORDS,
-    _C_CPP_HEADER_SUFFIXES,
-    _DEF_REGEXES,
-    _LARGE_FILE_LIMITATION,
-    _WORD_RE,
-    _has_function_definition_declarator_ancestor,
-    _is_c_cpp_header,
-    _is_test_path,
-    _resolve_lang,
+    has_function_definition_declarator_ancestor,
+    is_c_cpp_header,
+    is_test_path,
+    resolve_lang,
+    select_target_definitions,
 )
 
 PINNED_CYMBAL_VERSION = "0.18.0"
@@ -495,7 +495,7 @@ class CymbalEvidenceReport(CallerEvidenceReport):
             "scan limit" in note.lower() or "large" in note.lower() for note in truncations
         )
         if self.skipped_large > 0 and not has_scan_limit_trunc:
-            truncations.append(_LARGE_FILE_LIMITATION)
+            truncations.append(LARGE_FILE_LIMITATION)
 
         unique_ambiguity = _unique_ordered(ambiguities)
         unique_truncation = _unique_ordered(truncations)
@@ -1980,6 +1980,7 @@ class _TargetDefinition:
     symbol: str
     kind: str
     line: int = 1
+    end_line: int = 0
 
 
 _NON_CODE_LANGS = frozenset(
@@ -2016,7 +2017,7 @@ def _is_supported_editable_code_path(rel_path: str) -> bool:
     suffix = Path(rel_path).suffix.lower()
     if suffix == ".py" or suffix in _C_CPP_SUFFIXES:
         return True
-    lang = _resolve_lang(rel_path)
+    lang = resolve_lang(rel_path)
     return bool(lang and lang not in _NON_CODE_LANGS)
 
 
@@ -2043,7 +2044,19 @@ def _read_editable_text(root: Path, rel_path: str, *, max_bytes: int) -> str:
     return _read_editable_text_checked(root, rel_path, max_bytes=max_bytes).text
 
 
-def _extract_python_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
+def _extract_python_targets(
+    path: str, source: str, words: set[str] | None
+) -> list[_TargetDefinition]:
+    """Extract candidate Python target definitions from ``source``.
+
+    Preconditions:
+        - ``path`` is a repository-relative POSIX path to a Python source file.
+        - ``words`` is either an explicit filter set of identifier names or ``None``
+          to extract all candidate definitions for downstream tiered selection.
+    Postconditions:
+        - Returns deduplicated ``_TargetDefinition`` entries with 1-based inclusive
+          ``line`` and ``end_line`` spans, or ``[]`` on syntax errors.
+    """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -2052,36 +2065,62 @@ def _extract_python_targets(path: str, source: str, words: set[str]) -> list[_Ta
     found: list[_TargetDefinition] = []
     seen: set[tuple[str, str, int]] = set()
 
-    def _add(sym: str, kind: str, line: int) -> None:
-        if sym in words and (path, sym, line) not in seen:
+    def _add(sym: str, kind: str, line: int, end_line: int) -> None:
+        if (words is None or sym in words) and (path, sym, line) not in seen:
             seen.add((path, sym, line))
-            found.append(_TargetDefinition(path=path, symbol=sym, kind=kind, line=line))
+            found.append(
+                _TargetDefinition(
+                    path=path,
+                    symbol=sym,
+                    kind=kind,
+                    line=line,
+                    end_line=max(line, end_line),
+                )
+            )
 
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            _add(node.name, "function", getattr(node, "lineno", 1))
+            line = getattr(node, "lineno", 1)
+            _add(node.name, "function", line, getattr(node, "end_lineno", line) or line)
         elif isinstance(node, ast.ClassDef):
-            _add(node.name, "class", getattr(node, "lineno", 1))
+            line = getattr(node, "lineno", 1)
+            _add(node.name, "class", line, getattr(node, "end_lineno", line) or line)
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    _add(item.name, "method", getattr(item, "lineno", 1))
+                    item_line = getattr(item, "lineno", 1)
+                    _add(
+                        item.name,
+                        "method",
+                        item_line,
+                        getattr(item, "end_lineno", item_line) or item_line,
+                    )
         elif isinstance(node, ast.Assign):
             if isinstance(node.value, (ast.Name, ast.Attribute)):
+                line = getattr(node, "lineno", 1)
+                end_line = getattr(node, "end_lineno", line) or line
                 for target in node.targets:
                     if isinstance(target, ast.Name):
-                        _add(target.id, "alias", getattr(node, "lineno", 1))
+                        _add(target.id, "alias", line, end_line)
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and isinstance(
                 node.value, (ast.Name, ast.Attribute)
             ):
-                _add(node.target.id, "alias", getattr(node, "lineno", 1))
+                line = getattr(node, "lineno", 1)
+                _add(
+                    node.target.id,
+                    "alias",
+                    line,
+                    getattr(node, "end_lineno", line) or line,
+                )
         elif isinstance(node, ast.ImportFrom):
+            line = getattr(node, "lineno", 1)
+            end_line = getattr(node, "end_lineno", line) or line
             for alias in node.names:
                 if alias.name == "*":
                     continue
                 bound = alias.asname or alias.name
                 if node.level > 0 or alias.asname:
-                    _add(bound, "alias", getattr(node, "lineno", 1))
+                    _add(bound, "alias", line, end_line)
     return found
 
 
@@ -2113,6 +2152,58 @@ _C_NON_DECL_KEYWORDS = frozenset(
         "co_yield",
     }
 )
+_C_PARAM_TYPE_KEYWORDS = frozenset(
+    {
+        "const",
+        "unsigned",
+        "signed",
+        "struct",
+        "enum",
+        "union",
+        "volatile",
+        "restrict",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "void",
+        "size_t",
+        "ssize_t",
+        "bool",
+        "uint8_t",
+        "uint16_t",
+        "uint32_t",
+        "uint64_t",
+        "int8_t",
+        "int16_t",
+        "int32_t",
+        "int64_t",
+        "ptrdiff_t",
+        "intptr_t",
+        "uintptr_t",
+        "wchar_t",
+        "char16_t",
+        "char32_t",
+        "FILE",
+    }
+)
+_C_DECL_LINE_PREFIX_RE = re.compile(
+    r"^(?:extern\s+\"C\"\s+)?"
+    r"(?:template\s*<[^<>{};]*>\s*)?"
+    r"(?:[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?(?:\s*[*&]+|\s+))+"
+    r"(?:[A-Za-z_]\w*\s*::\s*)?$"
+)
+_C_RETURN_TYPE_LINE_RE = re.compile(
+    r"^(?:extern\s+\"C\"\s+)?"
+    r"(?:template\s*<[^<>{};]*>\s*)?"
+    r"[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?"
+    r"(?:\s+[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?)*"
+    r"(?:\s*[*&]+)*$"
+)
+_C_VOID_PARAMS_RE = re.compile(r"^\s*void\s*\)")
+_C_FIRST_PARAM_WORD_RE = re.compile(r"^\s*([A-Za-z_]\w*)(?:\s+|\s*[*&])")
 _C_CPP_FUNC_DEF_RE = re.compile(
     r"(?m)^[ \t]*"
     r"(?P<prefix>(?:[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?(?:\s*[*&]+[ \t]*|[ \t]+))+)"
@@ -2121,6 +2212,67 @@ _C_CPP_FUNC_DEF_RE = re.compile(
     r"(?:(?:const|noexcept|override|final)\b[ \t\r\n]*)*"
     r"(?P<term>\{|;)"
 )
+
+
+def _is_c_cpp_declaration_line(
+    path: str,
+    line_text: str,
+    symbol: str,
+    *,
+    prev_line: str = "",
+) -> bool:
+    """Return True when ``line_text`` is a C/C++ prototype or definition header for ``symbol``.
+
+    Preconditions:
+        - ``path`` is a repository-relative path and ``line_text`` is a single source line.
+    Postconditions:
+        - Returns ``False`` for non-C/C++ paths and for genuine call expressions.
+        - Returns ``True`` for prototypes, ``extern`` declarations, and definition headers.
+    """
+    if Path(path).suffix.lower() not in _C_CPP_SUFFIXES:
+        return False
+    match = re.search(rf"\b{re.escape(symbol)}\s*\(", line_text)
+    if not match:
+        return False
+    before = line_text[: match.start()]
+    same_line_stmt_reset = "{" in before or ";" in before
+    stmt_before = before.rsplit("{", 1)[-1].rsplit(";", 1)[-1].lstrip()
+    stripped_before = stmt_before.strip()
+    if stripped_before:
+        if any(ch in stripped_before for ch in ("=", ",", "?", "(", ")", "[", "]", ".", "->")):
+            return False
+        if _C_DECL_LINE_PREFIX_RE.match(stmt_before):
+            first_word_match = WORD_RE.search(stripped_before)
+            first_word = first_word_match.group(0) if first_word_match else ""
+            if first_word and first_word not in _C_NON_DECL_KEYWORDS:
+                return True
+        return False
+    after_paren = line_text[match.end() :]
+    if _C_VOID_PARAMS_RE.match(after_paren):
+        return True
+    first_param = _C_FIRST_PARAM_WORD_RE.match(after_paren)
+    if first_param and first_param.group(1) in _C_PARAM_TYPE_KEYWORDS:
+        return True
+    if not same_line_stmt_reset and prev_line:
+        prev_stripped = prev_line.strip()
+        if prev_stripped and _C_RETURN_TYPE_LINE_RE.match(prev_stripped):
+            prev_word_match = WORD_RE.search(prev_stripped)
+            prev_word = prev_word_match.group(0) if prev_word_match else ""
+            if prev_word and prev_word not in _C_NON_DECL_KEYWORDS:
+                return True
+    return False
+
+
+def _is_python_definition_line(path: str, line_text: str, symbol: str) -> bool:
+    """Return True when ``line_text`` is a Python ``def``/``class`` header for ``symbol``."""
+    if Path(path).suffix.lower() != ".py":
+        return False
+    return bool(
+        re.match(
+            rf"^\s*(?:(?:async\s+)?def|class)\s+{re.escape(symbol)}\b",
+            line_text,
+        )
+    )
 
 
 def _unwrap_c_declarator_name(node: Any, *, in_class: bool = False) -> tuple[str | None, str]:
@@ -2200,11 +2352,11 @@ def _find_matching_brace(source: str, open_idx: int) -> int:
 def _extract_c_cpp_ts_targets(
     path: str,
     source: str,
-    words: set[str],
+    words: set[str] | None,
 ) -> list[_TargetDefinition]:
     suffix = Path(path).suffix.lower()
     lang = "cpp" if suffix in _CPP_ONLY_SUFFIXES else "c"
-    is_header = _is_c_cpp_header(path)
+    is_header = is_c_cpp_header(path)
     try:
         warnings.simplefilter("ignore", category=FutureWarning)
         from grep_ast.tsl import get_parser
@@ -2228,28 +2380,41 @@ def _extract_c_cpp_ts_targets(
         if node_type == "function_definition":
             decl = node.child_by_field_name("declarator")
             name, kind = _unwrap_c_declarator_name(decl, in_class=in_class)
-            if name and name in words and name not in _CONTROL_KEYWORDS and name not in seen_defs:
+            if (
+                name
+                and (words is None or name in words)
+                and name not in CONTROL_KEYWORDS
+                and name not in seen_defs
+            ):
                 seen_defs.add(name)
                 line = node.start_point[0] + 1
-                definitions.append(_TargetDefinition(path=path, symbol=name, kind=kind, line=line))
+                end_line = max(line, node.end_point[0] + 1)
+                definitions.append(
+                    _TargetDefinition(
+                        path=path, symbol=name, kind=kind, line=line, end_line=end_line
+                    )
+                )
         elif (
             is_header
             and node_type == "function_declarator"
             and not in_param
             and not (lang == "cpp" and in_compound)
-            and not _has_function_definition_declarator_ancestor(node)
+            and not has_function_definition_declarator_ancestor(node)
         ):
             name, kind = _unwrap_c_declarator_name(node, in_class=in_class)
             if (
                 name
-                and name in words
-                and name not in _CONTROL_KEYWORDS
+                and (words is None or name in words)
+                and name not in CONTROL_KEYWORDS
                 and name not in seen_decls
             ):
                 seen_decls.add(name)
                 line = node.start_point[0] + 1
+                end_line = max(line, node.end_point[0] + 1)
                 declarations.append(
-                    _TargetDefinition(path=path, symbol=name, kind=kind, line=line)
+                    _TargetDefinition(
+                        path=path, symbol=name, kind=kind, line=line, end_line=end_line
+                    )
                 )
 
         next_in_class = in_class or node_type in ("class_specifier", "struct_specifier")
@@ -2266,10 +2431,24 @@ def _extract_c_cpp_ts_targets(
     return found
 
 
-def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
+def _extract_c_cpp_targets(
+    path: str, source: str, words: set[str] | None
+) -> list[_TargetDefinition]:
+    """Extract C/C++ target definitions (and header prototypes) from ``source``.
+
+    Preconditions:
+        - ``path`` has a C/C++ file suffix.
+        - ``words`` is either an explicit symbol filter set or ``None`` for unfiltered
+          candidate extraction.
+    Postconditions:
+        - Unbacked ``extern``/forward/method declarations in non-header ``.c``/``.cpp``
+          files are strictly excluded regardless of ``words``.
+        - In header files, definitions take precedence over prototypes and block-scoped
+          ``extern`` declarations inside function bodies are excluded.
+    """
     found = _extract_c_cpp_ts_targets(path, source, words)
     seen = {item.symbol for item in found}
-    is_header = _is_c_cpp_header(path)
+    is_header = is_c_cpp_header(path)
 
     matches = list(_C_CPP_FUNC_DEF_RE.finditer(source))
     body_spans: list[tuple[int, int]] = []
@@ -2292,7 +2471,12 @@ def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_Tar
         name = match.group("name") or ""
         owner = match.group("owner") or ""
         term = match.group("term") or ""
-        if not name or name not in words or name in _CONTROL_KEYWORDS or name in seen:
+        if (
+            not name
+            or (words is not None and name not in words)
+            or name in CONTROL_KEYWORDS
+            or name in seen
+        ):
             continue
         if "=" in prefix:
             continue
@@ -2301,13 +2485,21 @@ def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_Tar
             continue
         line = source.count("\n", 0, match.start()) + 1
         kind = "method" if owner else "function"
-        target = _TargetDefinition(path=path, symbol=name, kind=kind, line=line)
         if term == "{":
+            close_idx = _find_matching_brace(source, match.end() - 1)
+            end_line = max(line, source.count("\n", 0, close_idx) + 1)
+            target = _TargetDefinition(
+                path=path, symbol=name, kind=kind, line=line, end_line=end_line
+            )
             seen.add(name)
             found.append(target)
         elif is_header:
             if any(start < match.start() < end for start, end in body_spans):
                 continue
+            end_line = max(line, source.count("\n", 0, match.end()) + 1)
+            target = _TargetDefinition(
+                path=path, symbol=name, kind=kind, line=line, end_line=end_line
+            )
             proto_candidates.append(target)
 
     for target in proto_candidates:
@@ -2317,18 +2509,40 @@ def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_Tar
     return found
 
 
-def _extract_generic_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
+def _extract_generic_targets(
+    path: str, source: str, words: set[str] | None
+) -> list[_TargetDefinition]:
     if Path(path).suffix.lower() in _C_CPP_SUFFIXES:
         return _extract_c_cpp_targets(path, source, words)
     found: list[_TargetDefinition] = []
     seen: set[str] = set()
-    for pattern in _DEF_REGEXES:
+    for pattern in DEF_REGEXES:
         for match in pattern.finditer(source):
             name = match.group(1)
-            if name and name in words and name not in _CONTROL_KEYWORDS and name not in seen:
+            if (
+                name
+                and (words is None or name in words)
+                and name not in CONTROL_KEYWORDS
+                and name not in seen
+            ):
                 seen.add(name)
                 line = source.count("\n", 0, match.start()) + 1
-                found.append(_TargetDefinition(path=path, symbol=name, kind="function", line=line))
+                end_line = line
+                line_end = source.find("\n", match.end())
+                search_end = len(source) if line_end == -1 else line_end
+                brace_idx = source.find("{", match.start(), search_end)
+                if brace_idx != -1:
+                    close_idx = _find_matching_brace(source, brace_idx)
+                    end_line = max(line, source.count("\n", 0, close_idx) + 1)
+                found.append(
+                    _TargetDefinition(
+                        path=path,
+                        symbol=name,
+                        kind="function",
+                        line=line,
+                        end_line=end_line,
+                    )
+                )
     return found
 
 
@@ -2339,8 +2553,21 @@ def _extract_editable_targets(
     *,
     max_scan_bytes: int,
     report: CallerEvidenceReport | None = None,
+    editable_sources: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[_TargetDefinition]], list[str]]:
-    by_symbol: dict[str, list[_TargetDefinition]] = {}
+    """Extract and select target definitions from editable files using shared tiered rules.
+
+    Preconditions:
+        - ``resolved_root`` is an existing resolved repository root path.
+        - ``editable_paths`` are normalized repository-relative POSIX paths.
+        - ``words`` contains identifier words extracted from the task message.
+    Postconditions:
+        - Returns ``(targets_by_symbol, impairment_truncations)`` filtered via
+          ``aider.local_callers.select_target_definitions`` for parity with built-in
+          finders under both exact and vague prompts.
+        - Populates ``editable_sources`` (when provided) with read text of editable files.
+    """
+    all_by_symbol: dict[str, list[_TargetDefinition]] = {}
     impairment_truncations: list[str] = []
     for rel_path in editable_paths:
         if not _is_supported_editable_code_path(rel_path):
@@ -2366,17 +2593,24 @@ def _extract_editable_targets(
             )
             continue
         source = read_res.text
-        if not source or not any(word in source for word in words):
+        if not source:
             continue
+        if editable_sources is not None:
+            editable_sources[rel_path] = source
         suffix = Path(rel_path).suffix.lower()
         if suffix == ".py":
-            defs = _extract_python_targets(rel_path, source, words)
+            defs = _extract_python_targets(rel_path, source, None)
         elif suffix in _C_CPP_SUFFIXES:
-            defs = _extract_c_cpp_targets(rel_path, source, words)
+            defs = _extract_c_cpp_targets(rel_path, source, None)
         else:
-            defs = _extract_generic_targets(rel_path, source, words)
+            defs = _extract_generic_targets(rel_path, source, None)
         for item in defs:
-            by_symbol.setdefault(item.symbol, []).append(item)
+            all_by_symbol.setdefault(item.symbol, []).append(item)
+
+    selected_symbols, _tier = select_target_definitions(all_by_symbol.keys(), words)
+    by_symbol = {
+        sym: defs for sym, defs in all_by_symbol.items() if sym in selected_symbols
+    }
     return by_symbol, impairment_truncations
 
 
@@ -2446,7 +2680,7 @@ class CymbalCallerFinder:
             return ()
 
         resolved_root = Path(root).resolve()
-        words = set(_WORD_RE.findall(message or ""))
+        words = set(WORD_RE.findall(message or ""))
         if not words:
             return ()
 
@@ -2464,18 +2698,28 @@ class CymbalCallerFinder:
         candidate_display_by_norm: dict[str, str] = {}
         for raw_cand in sorted(set(candidates)):
             norm = normalize_repo_path(resolved_root, raw_cand)
-            if norm is None or norm in editable_norm_set:
+            if norm is None:
                 continue
             candidate_display_by_norm.setdefault(norm, norm)
+        # Allow sibling same-file callers inside non-test editable files even when
+        # callers omit editable files from `candidates`, matching builtin parity.
+        for norm_ed in editable_norm_list:
+            if not is_test_path(norm_ed):
+                candidate_display_by_norm.setdefault(norm_ed, norm_ed)
 
         _report_add_scope(report, "no_federate")
+        editable_sources: dict[str, str] = {}
         targets_by_symbol, editable_truncations = _extract_editable_targets(
             resolved_root,
             editable_norm_list,
             words,
             max_scan_bytes=self.config.max_scan_bytes,
             report=report,
+            editable_sources=editable_sources,
         )
+        editable_lines_by_path = {
+            path: src.splitlines() for path, src in editable_sources.items()
+        }
         for sym, defs in sorted(targets_by_symbol.items()):
             for target_def in defs:
                 _report_add_definition(report, target_def.path, sym)
@@ -2521,6 +2765,7 @@ class CymbalCallerFinder:
                 symbol_ambiguities.append("ambiguous method receiver")
 
             combined_refs: list[tuple[CymbalReference, str]] = []
+            cymbal_def_locs: set[tuple[str, int]] = set()
             try:
                 refs_res = self.client.refs(resolved_root, symbol, deadline=deadline)
             except CymbalExecutionError as exc:
@@ -2542,6 +2787,7 @@ class CymbalCallerFinder:
                     d.path in editable_norm_set for d in refs_res.definitions
                 ):
                     symbol_ambiguities.append("ambiguous symbol binding")
+                cymbal_def_locs.update((d.path, d.line) for d in refs_res.definitions)
                 combined_refs.extend((ref, "cymbal:refs") for ref in refs_res.references)
 
             if self.config.use_impact:
@@ -2566,6 +2812,7 @@ class CymbalCallerFinder:
                         d.path in editable_norm_set for d in impact_res.definitions
                     ):
                         symbol_ambiguities.append("ambiguous symbol binding")
+                    cymbal_def_locs.update((d.path, d.line) for d in impact_res.definitions)
                     for ref in impact_res.direct_callers:
                         combined_refs.append((ref, "cymbal:impact"))
                     for ref in impact_res.transitive_callers:
@@ -2579,11 +2826,26 @@ class CymbalCallerFinder:
             for ref, source_tag in combined_refs:
                 if ref.kind in _DEFINITION_KINDS:
                     continue
-                if ref.path in editable_norm_set:
-                    continue
                 if ref.path not in candidate_display_by_norm:
                     out_of_scope_filtered = True
                     continue
+                if (ref.path, ref.line) in cymbal_def_locs:
+                    continue
+                if ref.path in editable_norm_set:
+                    if any(
+                        d.path == ref.path
+                        and d.line <= ref.line <= max(d.line, d.end_line)
+                        for d in target_defs
+                    ):
+                        continue
+                    ed_lines = editable_lines_by_path.get(ref.path)
+                    if ed_lines is not None and 1 <= ref.line <= len(ed_lines):
+                        call_line = ed_lines[ref.line - 1]
+                        prev_line = ed_lines[ref.line - 2] if ref.line >= 2 else ""
+                        if _is_c_cpp_declaration_line(
+                            ref.path, call_line, symbol, prev_line=prev_line
+                        ) or _is_python_definition_line(ref.path, call_line, symbol):
+                            continue
 
                 hit_ambiguities = list(symbol_ambiguities)
                 hit_truncations = list(symbol_truncations)
@@ -2634,16 +2896,23 @@ class CymbalCallerFinder:
         if not hits_by_path:
             return ()
 
-        # Production-first selection: prefer production callers over test/smoke callers.
-        prod_hits = [h for h in hits_by_path.values() if not _is_test_path(h.path)]
-        test_hits = [h for h in hits_by_path.values() if _is_test_path(h.path)]
+        # Production-first selection: prefer production callers over test/smoke callers,
+        # ranking cross-file callers strictly ahead of same-file callers.
+        prod_hits = [h for h in hits_by_path.values() if not is_test_path(h.path)]
+        test_hits = [h for h in hits_by_path.values() if is_test_path(h.path)]
         if prod_hits:
-            selected_pool = sorted(prod_hits, key=lambda h: (h.path, h.line))
+            selected_pool = sorted(
+                prod_hits,
+                key=lambda h: (1 if h.path in editable_norm_set else 0, h.path, h.line),
+            )
             pool_scope = "production_only"
             if test_hits:
                 _report_add_scope(report, "test_callers_deprioritized")
         else:
-            selected_pool = sorted(test_hits, key=lambda h: (h.path, h.line))
+            selected_pool = sorted(
+                test_hits,
+                key=lambda h: (1 if h.path in editable_norm_set else 0, h.path, h.line),
+            )
             pool_scope = "test_fallback"
         _report_add_scope(report, pool_scope)
 
@@ -2880,23 +3149,33 @@ class ReportingCompositeCallerFinder:
             return ()
         resolved_root = Path(root).resolve()
         editable_tuple = tuple(editable)
-        editable_norm = {
-            posixpath.normpath(p.replace("\\", "/")) for p in editable_tuple
-        }
-        unique_candidates = tuple(
-            c
-            for c in sorted(set(candidates))
-            if posixpath.normpath(c.replace("\\", "/")) not in editable_norm
+        editable_norm_list = sorted(
+            {posixpath.normpath(p.replace("\\", "/")) for p in editable_tuple if p}
         )
-        if not editable_tuple or (not unique_candidates and report is None):
+        editable_norm = set(editable_norm_list)
+        unique_candidates = tuple(
+            sorted({posixpath.normpath(c.replace("\\", "/")) for c in candidates if c})
+        )
+        seen_candidates = set(unique_candidates)
+        prod_candidates = tuple(c for c in unique_candidates if not is_test_path(c))
+        test_candidates = tuple(c for c in unique_candidates if is_test_path(c))
+        implicit_same_file = tuple(
+            ed for ed in editable_norm_list if ed not in seen_candidates and not is_test_path(ed)
+        )
+        prod_search_pool = tuple(
+            sorted(
+                (*prod_candidates, *implicit_same_file),
+                key=lambda item: (1 if item in editable_norm else 0, item),
+            )
+        )
+        if not editable_tuple or (
+            not prod_search_pool and not test_candidates and report is None
+        ):
             return ()
 
-        prod_candidates = tuple(c for c in unique_candidates if not _is_test_path(c))
-        test_candidates = tuple(c for c in unique_candidates if _is_test_path(c))
-
         pools: list[tuple[tuple[str, ...], str]] = []
-        if prod_candidates:
-            pools.append((prod_candidates, "production_only"))
+        if prod_search_pool:
+            pools.append((prod_search_pool, "production_only"))
         if test_candidates:
             pools.append((test_candidates, "test_fallback"))
         if not pools:
@@ -2928,7 +3207,15 @@ class ReportingCompositeCallerFinder:
                     by_path.setdefault(excerpt.path, (excerpt, source_name))
 
             if by_path:
-                ordered = sorted(by_path.values(), key=lambda pair: pair[0].path)
+                ordered = sorted(
+                    by_path.values(),
+                    key=lambda pair: (
+                        1
+                        if posixpath.normpath(pair[0].path.replace("\\", "/")) in editable_norm
+                        else 0,
+                        pair[0].path,
+                    ),
+                )
                 selected_pairs = ordered[:max_files]
                 selected = [pair[0] for pair in selected_pairs]
                 sources = [pair[1] for pair in selected_pairs]
@@ -3057,7 +3344,17 @@ class ReportingCompositeCallerFinder:
 
 
 class FallbackCallerFinder:
-    """Backend orchestrator implementing `builtin` (default), `auto`, and `cymbal` modes."""
+    """Backend orchestrator implementing ``builtin`` (default), ``auto``, and ``cymbal`` modes.
+
+    Contract:
+        - ``builtin``: Always delegates to the built-in finder; never invokes Cymbal.
+        - ``cymbal``: Always delegates to Cymbal; any ``CymbalError`` propagates directly.
+        - ``auto``: Invokes Cymbal first. Only Cymbal execution, binary, version,
+          timeout, output-limit, or protocol errors (``CymbalError``) trigger a
+          diagnostic fallback to the built-in finder. A successful Cymbal lookup—
+          including an empty (``NO_EVIDENCE``) or impaired (``INCOMPLETE``) result—
+          is authoritative and is never silently unioned with built-in results.
+    """
 
     def __init__(
         self,

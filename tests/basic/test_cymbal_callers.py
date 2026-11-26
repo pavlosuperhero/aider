@@ -1711,3 +1711,398 @@ def test_cymbal_zero_excerpts_with_ambiguity_is_incomplete(ambiguity_note):
         backend_requested=BACKEND_CYMBAL, backend_used=BACKEND_CYMBAL
     ).to_result(())
     assert clean.status == "NO_EVIDENCE"
+
+
+def test_cymbal_callers_imports_only_public_local_callers_contract():
+    import ast
+
+    cymbal_path = Path(__file__).resolve().parents[2] / "aider" / "cymbal_callers.py"
+    tree = ast.parse(cymbal_path.read_text(encoding="utf-8"))
+
+    imported_from_local_callers: list[str] = []
+    private_imports: list[str] = []
+    local_callers_aliases: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "aider.local_callers":
+            for alias in node.names:
+                imported_from_local_callers.append(alias.name)
+                if alias.name.startswith("_"):
+                    private_imports.append(alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "aider.local_callers":
+                    local_callers_aliases.add(alias.asname or "aider")
+
+    assert imported_from_local_callers, "expected public imports from aider.local_callers"
+    assert private_imports == [], (
+        "aider/cymbal_callers.py must not import private local_callers internals: "
+        f"{private_imports}"
+    )
+
+    if local_callers_aliases:
+        private_attrs = [
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in local_callers_aliases
+            and node.attr.startswith("_")
+        ]
+        assert private_attrs == []
+
+
+def test_cymbal_same_file_callers_parity_and_cross_file_ranking(tmp_path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    yajl_lines = [
+        "static long long yajl_parse_integer(const unsigned char *number, unsigned int length);",
+        "",
+        "/* parser helper */",
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length) {",
+        "    return (long long)length;",
+        "}",
+        *[f"/* padding {i} */" for i in range(7, 18)],
+        "long long yajl_do_parse(const unsigned char *buf, unsigned int len) {",
+        "    long long v = 0;",
+        "    v = yajl_parse_integer(buf, len);",
+        "    return v;",
+        "}",
+    ]
+    (src_dir / "yajl_parser.c").write_text("\n".join(yajl_lines) + "\n", encoding="utf-8")
+    (src_dir / "zzz_external.c").write_text(
+        "long long parse_ext(const unsigned char *b, unsigned int n) {\n"
+        "    return yajl_parse_integer(b, n);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # 1. Same-file caller returned while prototype (line 1) and definition (line 4) are skipped.
+    same_file_runner = FakeCymbalRunner(
+        refs={
+            "yajl_parse_integer": {
+                "definitions": [
+                    {"file": "src/yajl_parser.c", "line": 4, "name": "yajl_parse_integer"}
+                ],
+                "references": [
+                    {
+                        "file": "src/yajl_parser.c",
+                        "line": 1,
+                        "kind": "reference",
+                        "snippet": yajl_lines[0],
+                    },
+                    {
+                        "file": "src/yajl_parser.c",
+                        "line": 4,
+                        "kind": "reference",
+                        "snippet": yajl_lines[3],
+                    },
+                    {
+                        "file": "src/yajl_parser.c",
+                        "line": 20,
+                        "kind": "call",
+                        "snippet": "    v = yajl_parse_integer(buf, len);",
+                    },
+                ],
+            }
+        },
+        impact={"yajl_parse_integer": {"direct_callers": []}},
+    )
+    same_only = find_callers_with_backend(
+        tmp_path,
+        "fix yajl_parse_integer",
+        ["src/yajl_parser.c"],
+        [],
+        backend=BACKEND_CYMBAL,
+        runner=same_file_runner,
+    )
+    assert same_only.status == "COMPLETE_WITHIN_SCOPE"
+    assert len(same_only.excerpts) == 1
+    assert same_only.excerpts[0].path == "src/yajl_parser.c"
+    assert same_only.excerpts[0].line == 20
+    assert "v = yajl_parse_integer(buf, len);" in same_only.excerpts[0].code
+
+    # 2. Cross-file caller ranks strictly ahead of same-file caller (even when lexically later).
+    both_runner = FakeCymbalRunner(
+        refs={
+            "yajl_parse_integer": {
+                "definitions": [
+                    {"file": "src/yajl_parser.c", "line": 4, "name": "yajl_parse_integer"}
+                ],
+                "references": [
+                    {
+                        "file": "src/yajl_parser.c",
+                        "line": 4,
+                        "kind": "reference",
+                        "snippet": yajl_lines[3],
+                    },
+                    {
+                        "file": "src/yajl_parser.c",
+                        "line": 20,
+                        "kind": "call",
+                        "snippet": "    v = yajl_parse_integer(buf, len);",
+                    },
+                    {
+                        "file": "src/zzz_external.c",
+                        "line": 2,
+                        "kind": "call",
+                        "snippet": "    return yajl_parse_integer(b, n);",
+                    },
+                ],
+            }
+        },
+        impact={"yajl_parse_integer": {"direct_callers": []}},
+    )
+    ranked = find_callers_with_backend(
+        tmp_path,
+        "fix yajl_parse_integer",
+        ["src/yajl_parser.c"],
+        ["src/zzz_external.c"],
+        backend=BACKEND_CYMBAL,
+        max_files=2,
+        runner=both_runner,
+    )
+    assert [e.path for e in ranked.excerpts] == ["src/zzz_external.c", "src/yajl_parser.c"]
+
+    capped = find_callers_with_backend(
+        tmp_path,
+        "fix yajl_parse_integer",
+        ["src/yajl_parser.c"],
+        ["src/zzz_external.c"],
+        backend=BACKEND_CYMBAL,
+        max_files=1,
+        runner=both_runner,
+    )
+    assert [e.path for e in capped.excerpts] == ["src/zzz_external.c"]
+
+    # 3. Recursive self-call inside target's own body is skipped; sibling caller is returned.
+    (tmp_path / "algo.py").write_text(
+        "def compute(n):\n"
+        "    if n <= 1:\n"
+        "        return 1\n"
+        "    return n * compute(n - 1)\n"
+        "\n"
+        "def run(x):\n"
+        "    return compute(x) + 1\n",
+        encoding="utf-8",
+    )
+    py_runner = FakeCymbalRunner(
+        refs={
+            "compute": {
+                "definitions": [{"file": "algo.py", "line": 1, "name": "compute"}],
+                "references": [
+                    {"file": "algo.py", "line": 1, "kind": "reference"},
+                    {"file": "algo.py", "line": 4, "kind": "call"},
+                    {
+                        "file": "algo.py",
+                        "line": 7,
+                        "kind": "call",
+                        "snippet": "    return compute(x) + 1",
+                    },
+                ],
+            }
+        },
+        impact={"compute": {"direct_callers": []}},
+    )
+    py_res = find_callers_with_backend(
+        tmp_path,
+        "fix compute",
+        ["algo.py"],
+        ["algo.py"],
+        backend=BACKEND_CYMBAL,
+        runner=py_runner,
+    )
+    assert len(py_res.excerpts) == 1
+    assert py_res.excerpts[0].path == "algo.py"
+    assert py_res.excerpts[0].line == 7
+    assert "return compute(x) + 1" in py_res.excerpts[0].code
+
+
+def test_cymbal_vague_prompt_target_seeding_parity_and_c_decl_safety(tmp_path):
+    import aider.cymbal_callers as cc
+
+    # 1. Python vague prompt omitting exact function name seeds target via tiered selection.
+    (tmp_path / "api.py").write_text(
+        "def parse_payload(raw):\n    return int(raw)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.py").write_text(
+        "from api import parse_payload\n\ndef handle(x):\n    return parse_payload(x)\n",
+        encoding="utf-8",
+    )
+    py_runner = FakeCymbalRunner(
+        refs={
+            "parse_payload": {
+                "definitions": [{"file": "api.py", "line": 1, "name": "parse_payload"}],
+                "references": [
+                    {
+                        "file": "consumer.py",
+                        "line": 4,
+                        "kind": "call",
+                        "snippet": "    return parse_payload(x)",
+                    }
+                ],
+            }
+        },
+        impact={"parse_payload": {"direct_callers": []}},
+    )
+    py_vague = find_callers_with_backend(
+        tmp_path,
+        "fix the bug",
+        ["api.py"],
+        ["consumer.py"],
+        backend=BACKEND_CYMBAL,
+        runner=py_runner,
+    )
+    assert ("api.py", "parse_payload") in py_vague.definitions
+    assert [e.path for e in py_vague.excerpts] == ["consumer.py"]
+
+    # 2. C subtoken prompt omitting exact function name selects matching C definition only.
+    (tmp_path / "parser.c").write_text(
+        "void yajl_free_state(void *p) {\n"
+        "    (void)p;\n"
+        "}\n"
+        "long long yajl_parse_integer(const unsigned char *num, unsigned int len) {\n"
+        "    return (long long)len;\n"
+        "}\n"
+        "long long yajl_do_parse(const unsigned char *buf, unsigned int n) {\n"
+        "    return yajl_parse_integer(buf, n);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    c_runner = FakeCymbalRunner(
+        refs={
+            "yajl_parse_integer": {
+                "definitions": [{"file": "parser.c", "line": 4, "name": "yajl_parse_integer"}],
+                "references": [
+                    {
+                        "file": "parser.c",
+                        "line": 8,
+                        "kind": "call",
+                        "snippet": "    return yajl_parse_integer(buf, n);",
+                    }
+                ],
+            }
+        },
+        impact={"yajl_parse_integer": {"direct_callers": []}},
+    )
+    c_vague = find_callers_with_backend(
+        tmp_path,
+        "fix negative integer overflow",
+        ["parser.c"],
+        [],
+        backend=BACKEND_CYMBAL,
+        runner=c_runner,
+    )
+    assert c_vague.definitions == (("parser.c", "yajl_parse_integer"),)
+    assert len(c_vague.excerpts) == 1
+    assert c_vague.excerpts[0].path == "parser.c"
+    assert c_vague.excerpts[0].line == 8
+
+    # 3. Non-header .c file with ONLY unbacked extern/forward declarations still yields [].
+    (tmp_path / "decls_only.c").write_text(
+        "extern int parse_value(int input);\nint helper(int x);\n",
+        encoding="utf-8",
+    )
+    extracted, _ = cc._extract_editable_targets(
+        tmp_path,
+        ["decls_only.c"],
+        {"fix", "the", "bug"},
+        max_scan_bytes=65536,
+    )
+    assert extracted == {}
+    decls_res = find_callers_with_backend(
+        tmp_path,
+        "fix the bug",
+        ["decls_only.c"],
+        ["consumer.py"],
+        backend=BACKEND_CYMBAL,
+        runner=FakeCymbalRunner(),
+    )
+    assert decls_res.definitions == ()
+    assert decls_res.excerpts == ()
+    assert decls_res.status == "NO_EVIDENCE"
+
+
+def test_fallback_caller_finder_auto_mode_authoritative_cymbal_vs_error_fallback(tmp_path):
+    from aider.cymbal_callers import FallbackCallerFinder
+
+    _write_basic_repo(tmp_path)
+
+    # Explicit docstring contract for `auto` mode.
+    doc = (FallbackCallerFinder.__doc__ or "").lower()
+    assert "auto" in doc
+    assert "authoritative" in doc
+
+    class SpyBuiltinFinder:
+        def __init__(self):
+            self.calls = 0
+            self._inner = ReportingCompositeCallerFinder()
+
+        def supports(self, path: str) -> bool:
+            return self._inner.supports(path)
+
+        def find_callers(self, *args, **kwargs):
+            self.calls += 1
+            return self._inner.find_callers(*args, **kwargs)
+
+    # 1. Successful empty Cymbal result (NO_EVIDENCE) is authoritative; no silent builtin union.
+    empty_runner = FakeCymbalRunner(
+        refs={"parse": {"definitions": [{"file": "api.py", "line": 1}], "references": []}},
+        impact={"parse": {"direct_callers": []}},
+    )
+    spy_empty = SpyBuiltinFinder()
+    finder_empty = FallbackCallerFinder(
+        backend=BACKEND_AUTO,
+        cymbal_finder=CymbalCallerFinder(runner=empty_runner),
+        builtin_finder=spy_empty,
+    )
+    res_empty = finder_empty.lookup(tmp_path, "fix parse", ["api.py"], ["consumer.py"])
+    assert res_empty.source == BACKEND_CYMBAL
+    assert res_empty.fallback_used is False
+    assert res_empty.status == "NO_EVIDENCE"
+    assert res_empty.excerpts == ()
+    assert spy_empty.calls == 0
+
+    # 2. Successful impaired Cymbal result (INCOMPLETE) is authoritative; no silent builtin union.
+    stale_runner = FakeCymbalRunner(
+        refs={
+            "parse": {
+                "definitions": [{"file": "api.py", "line": 1}],
+                "references": [],
+                "stale": True,
+            }
+        },
+        impact={"parse": {"direct_callers": []}},
+    )
+    spy_incomplete = SpyBuiltinFinder()
+    finder_incomplete = FallbackCallerFinder(
+        backend=BACKEND_AUTO,
+        cymbal_finder=CymbalCallerFinder(runner=stale_runner),
+        builtin_finder=spy_incomplete,
+    )
+    res_incomplete = finder_incomplete.lookup(tmp_path, "fix parse", ["api.py"], ["consumer.py"])
+    assert res_incomplete.source == BACKEND_CYMBAL
+    assert res_incomplete.fallback_used is False
+    assert res_incomplete.status == "INCOMPLETE"
+    assert res_incomplete.excerpts == ()
+    assert "stale index" in res_incomplete.ambiguity
+    assert spy_incomplete.calls == 0
+
+    # 3. CymbalError triggers fallback to builtin with diagnostics.
+    err_runner = FakeCymbalRunner(
+        handler=lambda *args: (_ for _ in ()).throw(CymbalTimeoutError("deadline exceeded"))
+    )
+    spy_fallback = SpyBuiltinFinder()
+    finder_fallback = FallbackCallerFinder(
+        backend=BACKEND_AUTO,
+        cymbal_finder=CymbalCallerFinder(runner=err_runner),
+        builtin_finder=spy_fallback,
+    )
+    res_fallback = finder_fallback.lookup(tmp_path, "fix parse", ["api.py"], ["consumer.py"])
+    assert res_fallback.source == BACKEND_BUILTIN
+    assert res_fallback.fallback_used is True
+    assert res_fallback.status == "COMPLETE_WITHIN_SCOPE"
+    assert [e.path for e in res_fallback.excerpts] == ["consumer.py"]
+    assert spy_fallback.calls == 1
+    assert any("cymbal fallback (timeout)" in d for d in res_fallback.diagnostics)

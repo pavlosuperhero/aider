@@ -1481,3 +1481,149 @@ class TestMain(TestCase):
             )
         for call in mock_io_instance.tool_warning.call_args_list:
             self.assertNotIn("Cost estimates may be inaccurate", call[0][0])
+
+    def test_no_default_model_settings_ignores_home_and_default_files(self):
+        from aider import models
+
+        saved_model_settings = list(models.MODEL_SETTINGS)
+        saved_model_info_manager = models.model_info_manager
+
+        def reset_model_registries():
+            models.MODEL_SETTINGS[:] = list(saved_model_settings)
+            models.model_info_manager = models.ModelInfoManager()
+
+        def extract_provenance(tool_output_calls):
+            for call in tool_output_calls:
+                if call.args and isinstance(call.args[0], str):
+                    line = call.args[0]
+                    if line.startswith("Trial config provenance: "):
+                        return json.loads(line.removeprefix("Trial config provenance: "))
+            return None
+
+        try:
+            home_dir = Path(self.homedir_obj.name)
+            poisoned_home_settings = home_dir / ".aider.model.settings.yml"
+            poisoned_home_settings.write_text(
+                "- name: poisoned/unlisted-model\n"
+                "  edit_format: whole\n"
+                "  extra_params:\n"
+                "    temperature: 0.99\n"
+                "- name: test/explicit-model\n"
+                "  edit_format: whole\n"
+                "  extra_params:\n"
+                "    temperature: 0.99\n",
+                encoding="utf-8",
+            )
+            poisoned_home_metadata = home_dir / ".aider.model.metadata.json"
+            poisoned_home_metadata.write_text(
+                json.dumps({"poisoned/unlisted-model": {"max_input_tokens": 999999}}),
+                encoding="utf-8",
+            )
+
+            with GitTemporaryDirectory() as git_dir:
+                repo_dir = Path(git_dir)
+                poisoned_cwd_metadata = repo_dir / ".aider.model.metadata.json"
+                poisoned_cwd_metadata.write_text(
+                    json.dumps({"poisoned/cwd-model": {"max_input_tokens": 888888}}),
+                    encoding="utf-8",
+                )
+                explicit_settings = repo_dir / "explicit-model-settings.yml"
+                explicit_settings.write_text(
+                    "- name: test/explicit-model\n"
+                    "  edit_format: diff\n"
+                    "  extra_params:\n"
+                    "    temperature: 0.25\n",
+                    encoding="utf-8",
+                )
+
+                # 1. With --no-default-model-settings, poisoned HOME and default CWD files are ignored.
+                reset_model_registries()
+                with (
+                    patch.dict(os.environ, {"AIDER_TRIAL_USAGE": "1"}),
+                    patch("aider.io.InputOutput.tool_output") as mock_tool_output,
+                ):
+                    coder = main(
+                        [
+                            "--config",
+                            os.devnull,
+                            "--no-default-model-settings",
+                            "--model-settings-file",
+                            str(explicit_settings),
+                            "--model",
+                            "test/explicit-model",
+                            "--exit",
+                            "--yes",
+                        ],
+                        input=DummyInput(),
+                        output=DummyOutput(),
+                        return_coder=True,
+                    )
+
+                self.assertEqual(coder.main_model.edit_format, "diff")
+                self.assertEqual(coder.main_model.extra_params.get("temperature"), 0.25)
+                self.assertFalse(
+                    any(ms.name == "poisoned/unlisted-model" for ms in models.MODEL_SETTINGS)
+                )
+                self.assertNotIn(
+                    "poisoned/unlisted-model",
+                    models.model_info_manager.local_model_metadata,
+                )
+                self.assertNotIn(
+                    "poisoned/cwd-model",
+                    models.model_info_manager.local_model_metadata,
+                )
+                provenance = extract_provenance(mock_tool_output.call_args_list)
+                self.assertIsNotNone(provenance)
+                self.assertEqual(provenance["config_file"], os.devnull)
+                self.assertEqual(
+                    provenance["model_settings_files"],
+                    [str(explicit_settings.resolve())],
+                )
+                self.assertEqual(provenance["model_metadata_files"], [])
+                self.assertIs(provenance["default_model_settings"], False)
+
+                # 2. Default behavior (--default-model-settings omitted) still loads HOME files.
+                reset_model_registries()
+                with (
+                    patch.dict(os.environ, {"AIDER_TRIAL_USAGE": "1"}),
+                    patch("aider.io.InputOutput.tool_output") as mock_tool_output_default,
+                ):
+                    coder_default = main(
+                        [
+                            "--config",
+                            os.devnull,
+                            "--model-settings-file",
+                            str(explicit_settings),
+                            "--model",
+                            "test/explicit-model",
+                            "--exit",
+                            "--yes",
+                        ],
+                        input=DummyInput(),
+                        output=DummyOutput(),
+                        return_coder=True,
+                    )
+
+                self.assertEqual(coder_default.main_model.edit_format, "diff")
+                self.assertEqual(coder_default.main_model.extra_params.get("temperature"), 0.25)
+                self.assertTrue(
+                    any(ms.name == "poisoned/unlisted-model" for ms in models.MODEL_SETTINGS)
+                )
+                self.assertIn(
+                    "poisoned/unlisted-model",
+                    models.model_info_manager.local_model_metadata,
+                )
+                provenance_default = extract_provenance(mock_tool_output_default.call_args_list)
+                self.assertIsNotNone(provenance_default)
+                self.assertEqual(
+                    provenance_default["model_settings_files"],
+                    [str(poisoned_home_settings.resolve()), str(explicit_settings.resolve())],
+                )
+                self.assertIn(
+                    str(poisoned_home_metadata.resolve()),
+                    provenance_default["model_metadata_files"],
+                )
+                self.assertIs(provenance_default["default_model_settings"], True)
+        finally:
+            models.MODEL_SETTINGS[:] = saved_model_settings
+            models.model_info_manager = saved_model_info_manager

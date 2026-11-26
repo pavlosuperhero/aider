@@ -29,6 +29,14 @@ def test_scoped_import_and_budget(tmp_path):
     assert related_callers(tmp_path, "fix parse", ["api.py"], candidates) == (
         "consumer.py:1\nfrom api import parse as p\nvalue = p(1) + 1"
     )
+    # Exact match takes strict precedence over sibling definitions, while a vague prompt
+    # on a single-definition module seeds that exported definition via bounded fallback.
+    assert related_callers(tmp_path, "fix parser", ["api.py"], candidates) == (
+        "consumer.py:1\nfrom api import parse as p\nvalue = p(1) + 1"
+    )
+    (tmp_path / "api.py").write_text(
+        "def parse(value): return value\ndef parser(value): return value\n"
+    )
     assert not related_callers(tmp_path, "fix parser", ["api.py"], candidates)
 
 
@@ -1044,3 +1052,461 @@ def test_builtin_zero_excerpts_with_ambiguity_is_incomplete(ambiguity_note):
 
     clean = CallerEvidenceReport().to_result(())
     assert clean.status == "NO_EVIDENCE"
+
+
+def test_public_shared_exports_and_backward_compatible_aliases():
+    import aider.local_callers as lc
+
+    assert lc.CONTROL_KEYWORDS is lc._CONTROL_KEYWORDS
+    assert lc.C_CPP_HEADER_SUFFIXES is lc._C_CPP_HEADER_SUFFIXES
+    assert lc.DEF_REGEXES is lc._DEF_REGEXES
+    assert lc.LARGE_FILE_LIMITATION is lc._LARGE_FILE_LIMITATION
+    assert lc.WORD_RE is lc._WORD_RE
+    assert (
+        lc.has_function_definition_declarator_ancestor
+        is lc._has_function_definition_declarator_ancestor
+    )
+    assert lc.is_c_cpp_header is lc._is_c_cpp_header
+    assert lc.is_test_path is lc._is_test_path
+    assert lc.resolve_lang is lc._resolve_lang
+    assert callable(lc.select_target_definitions)
+
+
+def test_select_target_definitions_tiers_stopwords_and_bounds():
+    from aider.local_callers import select_target_definitions
+
+    # Tier 1: exact symbol match takes strict precedence over sub-token or fallback matches.
+    exact_syms, tier = select_target_definitions(
+        ["parse", "parse_integer", "helper"], {"fix", "parse", "integer"}
+    )
+    assert exact_syms == {"parse"}
+    assert tier == "exact"
+
+    # Tier 2: camelCase + snake_case sub-token overlap ignores generic stopwords and ranks deterministically.
+    sub_syms, tier = select_target_definitions(
+        ["yajl_parse_integer", "yajl_parse", "getValue", "handleError"],
+        {"Fix", "integer", "parsing", "for", "non", "digit", "input"},
+    )
+    assert sub_syms == {"yajl_parse_integer"}
+    assert tier == "subtoken"
+
+    camel_syms, tier = select_target_definitions(
+        ["redisReaderGetReply", "readLine", "processBulkItem"],
+        {"Fix", "reader", "reply", "handling"},
+    )
+    assert camel_syms == {"redisReaderGetReply"}
+    assert tier == "subtoken"
+
+    # Tier 3: bounded exported fallback skips _private and test_* when exported definitions exist.
+    fb_syms, tier = select_target_definitions(
+        ["_internal", "test_alpha", "zeta", "alpha", "beta", "gamma"],
+        {"Handle", "CRLF", "recovery"},
+        max_fallback=2,
+    )
+    assert fb_syms == {"alpha", "beta"}
+    assert tier == "fallback"
+
+    # Tier 3 falls back to non-test private definitions only when all non-test definitions are private.
+    priv_syms, tier = select_target_definitions(
+        ["_priv_b", "_priv_a", "test_priv"],
+        {"Handle", "CRLF", "recovery"},
+        max_fallback=1,
+    )
+    assert priv_syms == {"_priv_a"}
+    assert tier == "fallback"
+
+    # Empty definitions or empty task words return no targets.
+    assert select_target_definitions([], {"fix", "parse"}) == (set(), "none")
+    assert select_target_definitions(["parse"], set()) == (set(), "none")
+
+
+def test_same_file_callers_across_python_c_cpp_js_ts_rust_with_precision_guards(tmp_path):
+    # 1. Python: sibling & top-level same-file callers discovered; self-recursion excluded;
+    # cross-file production caller ranked ahead of same-file caller.
+    (tmp_path / "py_self_only.py").write_text(
+        "def factorial(n):\n"
+        "    if n <= 1:\n"
+        "        return 1\n"
+        "    return n * factorial(n - 1)\n",
+        encoding="utf-8",
+    )
+    self_only_py = discover_related_callers(
+        tmp_path, "fix factorial", ["py_self_only.py"], ["py_self_only.py"]
+    )
+    assert self_only_py.status == "NO_EVIDENCE"
+    assert self_only_py.excerpts == ()
+
+    (tmp_path / "api.py").write_text(
+        "def parse(value):\n"
+        "    if isinstance(value, list):\n"
+        "        return [parse(v) for v in value]\n"
+        "    return int(value)\n\n"
+        "def outer(raw):\n"
+        "    return parse(raw) + 10\n",
+        encoding="utf-8",
+    )
+    same_py = discover_related_callers(tmp_path, "fix parse", ["api.py"], [])
+    assert same_py.status == "COMPLETE_WITHIN_SCOPE"
+    assert [e.path for e in same_py.excerpts] == ["api.py"]
+    assert same_py.evidence[0].line == 7
+    assert "return parse(raw) + 10" in same_py.excerpts[0].code
+    assert "additional calls in file omitted" not in same_py.truncation
+
+    (tmp_path / "z_consumer.py").write_text(
+        "from api import parse\nval = parse('5')\n",
+        encoding="utf-8",
+    )
+    ranked_py = discover_related_callers(
+        tmp_path, "fix parse", ["api.py"], ["api.py", "z_consumer.py"]
+    )
+    assert [e.path for e in ranked_py.excerpts] == ["z_consumer.py", "api.py"]
+
+    # 2. C: exact yajl_parser.c scenario — prototype, definition, and self-recursion excluded,
+    # while sibling caller yajl_do_parse IS discovered.
+    (tmp_path / "yajl_parser.c").write_text(
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length);\n"
+        "\n"
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length) {\n"
+        "    if (length == 0) return yajl_parse_integer(number, 1);\n"
+        "    return (long long)length;\n"
+        "}\n"
+        "\n"
+        "int yajl_do_parse(const unsigned char *buf, unsigned int len) {\n"
+        "    long long i = yajl_parse_integer(buf, len);\n"
+        "    if ((i == LLONG_MIN || i == LLONG_MAX) && errno == ERANGE) {\n"
+        "        return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    c_res = discover_related_callers(
+        tmp_path, "fix yajl_parse_integer", ["yajl_parser.c"], ["yajl_parser.c"]
+    )
+    assert c_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert [e.path for e in c_res.excerpts] == ["yajl_parser.c"]
+    assert c_res.evidence[0].line == 9
+    assert "yajl_parse_integer(buf, len)" in c_res.excerpts[0].code
+    assert "LLONG_MIN" in c_res.excerpts[0].code
+
+    # 3. C++ same-file caller (prototype & self-recursion excluded).
+    (tmp_path / "calc.cpp").write_text(
+        "int compute_sum(int n);\n"
+        "int compute_sum(int n) {\n"
+        "    if (n <= 0) return 0;\n"
+        "    return n + compute_sum(n - 1);\n"
+        "}\n"
+        "int run_total(int k) {\n"
+        "    return compute_sum(k) * 2;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    cpp_res = discover_related_callers(
+        tmp_path, "fix compute_sum", ["calc.cpp"], ["calc.cpp"]
+    )
+    assert cpp_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert [e.path for e in cpp_res.excerpts] == ["calc.cpp"]
+    assert cpp_res.evidence[0].line == 7
+    assert "compute_sum(k) * 2" in cpp_res.excerpts[0].code
+
+    # 4. JS/TS same-file caller without false ambiguous symbol binding.
+    (tmp_path / "parser.ts").write_text(
+        "export function parsePrice(raw: string): number {\n"
+        "  if (raw.startsWith(' ')) return parsePrice(raw.trim());\n"
+        "  return Number(raw);\n"
+        "}\n"
+        "export function total(raw: string): number {\n"
+        "  return parsePrice(raw) * 100;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    ts_res = discover_related_callers(
+        tmp_path, "fix parsePrice", ["parser.ts"], ["parser.ts"]
+    )
+    assert ts_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert [e.path for e in ts_res.excerpts] == ["parser.ts"]
+    assert ts_res.evidence[0].line == 6
+    assert "parsePrice(raw) * 100" in ts_res.excerpts[0].code
+    assert "ambiguous symbol binding" not in ts_res.ambiguity
+
+    # 5. Rust same-file caller (definition & self-recursion excluded).
+    (tmp_path / "parse.rs").write_text(
+        "pub fn parse_num(s: &str) -> i64 {\n"
+        "    if s.starts_with(' ') { return parse_num(s.trim()); }\n"
+        "    0\n"
+        "}\n"
+        "pub fn run(s: &str) -> i64 {\n"
+        "    parse_num(s) + 1\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    rs_res = discover_related_callers(tmp_path, "fix parse_num", ["parse.rs"], ["parse.rs"])
+    assert rs_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert [e.path for e in rs_res.excerpts] == ["parse.rs"]
+    assert rs_res.evidence[0].line == 6
+    assert "parse_num(s) + 1" in rs_res.excerpts[0].code
+
+
+def test_vague_prompt_seeding_finds_callers_and_extern_only_c_stays_empty(tmp_path):
+    # Sub-token match: "Fix integer parsing for non-digit input" seeds yajl_parse_integer.
+    (tmp_path / "yajl_parser.c").write_text(
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length) {\n"
+        "    return (long long)length;\n"
+        "}\n"
+        "int yajl_do_parse(const unsigned char *buf, unsigned int len) {\n"
+        "    long long i = yajl_parse_integer(buf, len);\n"
+        "    return (int)i;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    sub_res = discover_related_callers(
+        tmp_path,
+        "Fix integer parsing for non-digit input",
+        ["yajl_parser.c"],
+        ["yajl_parser.c"],
+    )
+    assert ("yajl_parser.c", "yajl_parse_integer") in sub_res.definitions
+    assert [e.path for e in sub_res.excerpts] == ["yajl_parser.c"]
+    assert sub_res.evidence[0].symbol == "yajl_parse_integer"
+
+    # Fallback tier: vague prompt with zero sub-token overlap seeds exported Python function.
+    (tmp_path / "protocol.py").write_text(
+        "def _private_helper(buf):\n"
+        "    return buf\n\n"
+        "def decode_frame(buf):\n"
+        "    return _private_helper(buf)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "client.py").write_text(
+        "from protocol import decode_frame\n"
+        "def read_next(buf):\n"
+        "    return decode_frame(buf)\n",
+        encoding="utf-8",
+    )
+    fb_res = discover_related_callers(
+        tmp_path,
+        "Handle CRLF recovery in parser",
+        ["protocol.py"],
+        ["client.py"],
+    )
+    assert fb_res.definitions == (("protocol.py", "decode_frame"),)
+    assert [e.path for e in fb_res.excerpts] == ["client.py"]
+    assert fb_res.evidence[0].symbol == "decode_frame"
+
+    # Negative guard: extern-only .c file still yields definitions == () and NO_EVIDENCE.
+    (tmp_path / "extern_only.c").write_text(
+        "extern int parse_value(int input);\n", encoding="utf-8"
+    )
+    (tmp_path / "use_extern.c").write_text(
+        "int run(int x) { return parse_value(x); }\n", encoding="utf-8"
+    )
+    ext_res = discover_related_callers(
+        tmp_path,
+        "Fix value parsing",
+        ["extern_only.c"],
+        ["use_extern.c"],
+    )
+    assert ext_res.status == "NO_EVIDENCE"
+    assert ext_res.definitions == ()
+    assert ext_res.excerpts == ()
+
+
+def test_bash_shebang_resolution_definitions_and_command_callers(tmp_path):
+    from aider.local_callers import TreeSitterCallerFinder, resolve_lang
+
+    assert resolve_lang("script.sh") == "bash"
+    assert resolve_lang("script.bash") == "bash"
+    assert resolve_lang("suite.bats") == "bash"
+    assert resolve_lang("libexec/rbenv-init", "#!/usr/bin/env bash\necho hi\n") == "bash"
+    assert resolve_lang("libexec/rbenv-sh", "#!/bin/sh\necho hi\n") == "bash"
+    assert resolve_lang("README", "Plain text file\n") is None
+
+    libexec = tmp_path / "libexec"
+    libexec.mkdir()
+    (libexec / "rbenv-version-file-read").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        "read_version_file() {\n"
+        "  local file=\"$1\"\n"
+        "  cat \"$file\"\n"
+        "}\n"
+        "function trim_version {\n"
+        "  echo \"$1\"\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (libexec / "rbenv-init").write_text(
+        "#!/usr/bin/env bash\n"
+        "# read_version_file should not match comments\n"
+        "read_version_file=1\n"
+        'echo "read_version_file"\n'
+        "ver=$(read_version_file .ruby-version)\n"
+        "trim_version \"$ver\"\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "helper.sh").write_text(
+        "#!/bin/sh\n"
+        "if read_version_file .ruby-version; then\n"
+        "  echo ok\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "noise.sh").write_text(
+        "#!/bin/sh\n"
+        "# read_version_file in comment\n"
+        "read_version_file=assigned\n"
+        "echo 'read_version_file'\n"
+        'echo "read_version_file"\n',
+        encoding="utf-8",
+    )
+
+    res = discover_related_callers(
+        tmp_path,
+        "fix read_version_file",
+        ["libexec/rbenv-version-file-read"],
+        ["libexec/rbenv-init", "helper.sh", "noise.sh"],
+    )
+    assert res.status == "COMPLETE_WITHIN_SCOPE"
+    assert ("libexec/rbenv-version-file-read", "read_version_file") in res.definitions
+    assert [e.path for e in res.excerpts] == ["helper.sh", "libexec/rbenv-init"]
+    assert res.evidence[0].line == 2
+    assert res.evidence[1].line == 5
+    assert "ver=$(read_version_file .ruby-version)" in res.excerpts[1].code
+
+    # Direct regex fallback also ignores comments, assignments, definitions, and quoted literals.
+    noise_src = (tmp_path / "noise.sh").read_text(encoding="utf-8")
+    init_src = (libexec / "rbenv-init").read_text(encoding="utf-8")
+    def_src = (libexec / "rbenv-version-file-read").read_text(encoding="utf-8")
+    call_names = {"read_version_file": "read_version_file", "trim_version": "trim_version"}
+    assert TreeSitterCallerFinder._find_bash_regex_call_lines(noise_src, call_names) == []
+    assert TreeSitterCallerFinder._find_bash_regex_call_lines(def_src, call_names) == []
+    assert TreeSitterCallerFinder._find_bash_regex_call_lines(init_src, call_names) == [
+        (4, "read_version_file"),
+        (5, "trim_version"),
+    ]
+
+
+def test_rust_homonymous_trait_method_marks_ambiguous_receiver_incomplete(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "display.rs").write_text(
+        "use std::fmt::{Display, Formatter, Result};\n"
+        "pub struct Version(pub String);\n"
+        "impl Display for Version {\n"
+        "    fn fmt(&self, f: &mut Formatter<'_>) -> Result {\n"
+        "        write!(f, \"{}\", self.0)\n"
+        "    }\n"
+        "}\n"
+        "impl From<&str> for Version {\n"
+        "    fn from(s: &str) -> Self {\n"
+        "        Version(s.to_string())\n"
+        "    }\n"
+        "}\n"
+        "pub fn parse_version(s: &str) -> Version {\n"
+        "    Version(s.to_string())\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (src / "error.rs").write_text(
+        "use std::fmt::{Debug, Display, Formatter, Result};\n"
+        "pub struct Error(pub String);\n"
+        "impl Debug for Error {\n"
+        "    fn fmt(&self, f: &mut Formatter<'_>) -> Result {\n"
+        "        Display::fmt(self, f)\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (src / "consumer.rs").write_text(
+        "pub fn build(s: &str) -> Version {\n"
+        "    Version::from(s)\n"
+        "}\n"
+        "pub fn load(s: &str) -> Version {\n"
+        "    parse_version(s)\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # Homonymous trait call Display::fmt(self, f) inside impl Debug for Error -> INCOMPLETE.
+    fmt_res = discover_related_callers(
+        tmp_path,
+        "fix fmt formatting",
+        ["src/display.rs"],
+        ["src/error.rs"],
+    )
+    assert fmt_res.status == "INCOMPLETE"
+    assert [e.path for e in fmt_res.excerpts] == ["src/error.rs"]
+    assert "ambiguous trait method receiver" in fmt_res.ambiguity
+    assert "ambiguous trait method receiver" in fmt_res.evidence[0].ambiguity
+    assert fmt_res.excerpts[0].incomplete is True
+
+    # Provably matching target type Version::from(s) -> COMPLETE_WITHIN_SCOPE.
+    from_res = discover_related_callers(
+        tmp_path,
+        "fix from conversion",
+        ["src/display.rs"],
+        ["src/consumer.rs"],
+    )
+    assert from_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert "ambiguous trait method receiver" not in from_res.ambiguity
+
+    # Non-homonymous function parse_version(s) -> COMPLETE_WITHIN_SCOPE.
+    fn_res = discover_related_callers(
+        tmp_path,
+        "fix parse_version",
+        ["src/display.rs"],
+        ["src/consumer.rs"],
+    )
+    assert fn_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert "ambiguous trait method receiver" not in fn_res.ambiguity
+
+
+def test_coder_find_local_callers_searches_editable_files_for_same_file_callers(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import Mock
+    import git
+
+    from aider.coders import Coder
+    from aider.io import InputOutput
+    from aider.models import Model
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("webbrowser.open", Mock())
+    repo = git.Repo.init(tmp_path)
+    with repo.config_writer() as config:
+        config.set_value("user", "name", "Test")
+        config.set_value("user", "email", "test@example.invalid")
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "yajl_parser.c").write_text(
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length) {\n"
+        "    return (long long)length;\n"
+        "}\n"
+        "int yajl_do_parse(const unsigned char *buf, unsigned int len) {\n"
+        "    long long i = yajl_parse_integer(buf, len);\n"
+        "    return (int)i;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    repo.index.add(["src/yajl_parser.c"])
+    repo.index.commit("initial")
+
+    coder = Coder.create(
+        main_model=Model("gpt-3.5-turbo"),
+        edit_format="diff",
+        fnames=["src/yajl_parser.c"],
+        io=InputOutput(yes=True, pretty=False, fancy_input=False),
+        auto_lint=False,
+        stream=False,
+        map_tokens=0,
+        detect_urls=False,
+        local_callers=True,
+    )
+    excerpts, description, _, _ = coder._find_local_callers(
+        "Fix integer parsing for non-digit input"
+    )
+    assert [e.path for e in excerpts] == ["src/yajl_parser.c"]
+    assert excerpts[0].symbol == "yajl_parse_integer"
+    assert excerpts[0].line == 5
+    assert "yajl_parser.c:yajl_parse_integer" in description

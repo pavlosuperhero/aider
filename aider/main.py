@@ -332,9 +332,41 @@ def generate_search_path_list(default_file, git_root, command_line_file):
     return files
 
 
-def register_models(git_root, model_settings_fname, io, verbose=False, loaded_files_out=None):
-    model_settings_files = generate_search_path_list(
-        ".aider.model.settings.yml", git_root, model_settings_fname
+def _resolve_model_config_paths(
+    default_file, git_root, command_line_file, search_default_paths=True
+):
+    if search_default_paths:
+        return generate_search_path_list(default_file, git_root, command_line_file)
+    if not command_line_file:
+        return []
+    try:
+        return [str(Path(command_line_file).resolve())]
+    except OSError:
+        return []
+
+
+def _explicit_arg_or_none(parser, option_flag, value):
+    source_to_settings = getattr(parser, "_source_to_settings", None)
+    if isinstance(source_to_settings, dict):
+        defaults = source_to_settings.get("defaults")
+        if isinstance(defaults, dict) and option_flag in defaults:
+            return None
+    return value
+
+
+def register_models(
+    git_root,
+    model_settings_fname,
+    io,
+    verbose=False,
+    loaded_files_out=None,
+    search_default_paths=True,
+):
+    model_settings_files = _resolve_model_config_paths(
+        ".aider.model.settings.yml",
+        git_root,
+        model_settings_fname,
+        search_default_paths=search_default_paths,
     )
 
     try:
@@ -389,19 +421,35 @@ def load_dotenv_files(git_root, dotenv_fname, encoding="utf-8"):
     return loaded
 
 
-def register_litellm_models(git_root, model_metadata_fname, io, verbose=False):
+def register_litellm_models(
+    git_root,
+    model_metadata_fname,
+    io,
+    verbose=False,
+    loaded_files_out=None,
+    search_default_paths=True,
+):
     model_metadata_files = []
 
     # Add the resource file path
     resource_metadata = importlib_resources.files("aider.resources").joinpath("model-metadata.json")
-    model_metadata_files.append(str(resource_metadata))
+    resource_metadata_path = str(resource_metadata)
+    model_metadata_files.append(resource_metadata_path)
 
-    model_metadata_files += generate_search_path_list(
-        ".aider.model.metadata.json", git_root, model_metadata_fname
+    model_metadata_files += _resolve_model_config_paths(
+        ".aider.model.metadata.json",
+        git_root,
+        model_metadata_fname,
+        search_default_paths=search_default_paths,
     )
 
     try:
         model_metadata_files_loaded = models.register_litellm_models(model_metadata_files)
+        if loaded_files_out is not None:
+            external_loaded = list(model_metadata_files_loaded)
+            if external_loaded and external_loaded[0] == resource_metadata_path:
+                external_loaded = external_loaded[1:]
+            loaded_files_out.extend(external_loaded)
         if len(model_metadata_files_loaded) > 0 and verbose:
             io.tool_output("Loaded model metadata from:")
             for model_metadata_file in model_metadata_files_loaded:
@@ -1047,15 +1095,36 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     is_first_run = is_first_run_of_new_version(io, verbose=args.verbose)
     check_and_load_imports(io, is_first_run, verbose=args.verbose)
 
+    default_model_settings = getattr(args, "default_model_settings", True)
+    model_settings_file = (
+        args.model_settings_file
+        if default_model_settings
+        else _explicit_arg_or_none(parser, "--model-settings-file", args.model_settings_file)
+    )
+    model_metadata_file = (
+        args.model_metadata_file
+        if default_model_settings
+        else _explicit_arg_or_none(parser, "--model-metadata-file", args.model_metadata_file)
+    )
+
     loaded_model_settings_files = []
     register_models(
         git_root,
-        args.model_settings_file,
+        model_settings_file,
         io,
         verbose=args.verbose,
         loaded_files_out=loaded_model_settings_files,
+        search_default_paths=default_model_settings,
     )
-    register_litellm_models(git_root, args.model_metadata_file, io, verbose=args.verbose)
+    loaded_model_metadata_files = []
+    register_litellm_models(
+        git_root,
+        model_metadata_file,
+        io,
+        verbose=args.verbose,
+        loaded_files_out=loaded_model_metadata_files,
+        search_default_paths=default_model_settings,
+    )
 
     if args.list_models:
         models.print_matching_models(io, args.list_models)
@@ -1177,6 +1246,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         trial_provenance_line = "Trial config provenance: " + json.dumps(
             {
                 "config_file": args.config,
+                "default_model_settings": default_model_settings,
+                "model_metadata_files": loaded_model_metadata_files,
                 "model_settings_files": loaded_model_settings_files,
             },
             sort_keys=True,

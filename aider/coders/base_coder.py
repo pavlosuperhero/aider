@@ -1072,13 +1072,14 @@ class Coder:
 
         inchat = self.get_inchat_relative_files()
         addable = self.get_addable_relative_files()
+        candidates = list(dict.fromkeys([*addable, *inchat]))
         finder = self._get_local_caller_finder()
         root_path = Path(self.root)
 
         if finder is None:
             report = CallerEvidenceReport()
             excerpts = tuple(
-                find_related_callers(root_path, task, inchat, addable, report=report)
+                find_related_callers(root_path, task, inchat, candidates, report=report)
             )
             result = report.result if report.result is not None else report.to_result(excerpts)
             description = report.describe(excerpts)
@@ -1094,7 +1095,7 @@ class Coder:
 
             if isinstance(finder, FallbackCallerFinder):
                 report = CymbalEvidenceReport(backend_requested=finder.backend)
-                result = finder.lookup(root_path, task, inchat, addable, report=report)
+                result = finder.lookup(root_path, task, inchat, candidates, report=report)
                 excerpts = result.excerpts
                 description = report.describe(excerpts)
                 diagnostics = result.diagnostics
@@ -1105,7 +1106,7 @@ class Coder:
                     backend_used=BACKEND_CYMBAL,
                 )
                 excerpts = tuple(
-                    finder.find_callers(root_path, task, inchat, addable, report=report)
+                    finder.find_callers(root_path, task, inchat, candidates, report=report)
                 )
                 result = report.to_result(excerpts)
                 description = report.describe(excerpts)
@@ -1114,7 +1115,7 @@ class Coder:
             else:
                 report = CallerEvidenceReport()
                 excerpts = tuple(
-                    finder.find_callers(root_path, task, inchat, addable, report=report)
+                    finder.find_callers(root_path, task, inchat, candidates, report=report)
                 )
                 result = report.result if report.result is not None else report.to_result(excerpts)
                 description = report.describe(excerpts)

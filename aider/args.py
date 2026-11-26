@@ -319,6 +319,15 @@ def get_parser(default_config_files, git_root):
         help="Specify a file with context window and costs for unknown models",
     ).complete = shtab.FILE
     group.add_argument(
+        "--default-model-settings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Search default model settings and metadata files in home, git root, and current"
+            " directory (default: True)"
+        ),
+    )
+    group.add_argument(
         "--alias",
         action="append",
         metavar="ALIAS:MODEL",

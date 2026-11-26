@@ -262,6 +262,7 @@ def _hermetic_config_flags() -> list[str]:
     return [
         "--config",
         os.devnull,
+        "--no-default-model-settings",
         "--model-settings-file",
         str(REPO_MODEL_SETTINGS_FILE),
     ]

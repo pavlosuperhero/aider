@@ -854,6 +854,7 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIn("--no-dirty-commits", captured_cmd)
         self.assertIn("--config", captured_cmd)
         self.assertEqual(captured_cmd[captured_cmd.index("--config") + 1], os.devnull)
+        self.assertIn("--no-default-model-settings", captured_cmd)
         self.assertIn("--model-settings-file", captured_cmd)
         self.assertEqual(
             captured_cmd[captured_cmd.index("--model-settings-file") + 1],
@@ -1078,8 +1079,10 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         missing = run.compare_effective_model_params(expected_params, None)
         self.assertTrue(any("missing 'Trial model params:'" in d for d in missing))
 
-        # End-to-end preflight under poisoned HOME/.aider.model.settings.yml + HOME/.aider.conf.yml:
-        # hermetic flags (--config /dev/null --model-settings-file <repo>) MUST keep temperature=0.6.
+        # End-to-end preflight under poisoned HOME/.aider.model.settings.yml +
+        # HOME/.aider.model.metadata.json + HOME/.aider.conf.yml:
+        # hermetic flags (--config /dev/null --no-default-model-settings --model-settings-file <repo>)
+        # MUST keep temperature=0.6 and exclude host HOME files from config_provenance.
         with tempfile.TemporaryDirectory(prefix="aider-poisoned-home-") as fake_home:
             home_path = Path(fake_home)
             (home_path / ".aider.model.settings.yml").write_text(
@@ -1087,7 +1090,13 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
                 "  edit_format: diff\n"
                 "  use_repo_map: true\n"
                 "  extra_params:\n"
-                "    max_tokens: 32768\n",
+                "    max_tokens: 32768\n"
+                "- name: poisoned/home-only-model\n"
+                "  edit_format: whole\n",
+                encoding="utf-8",
+            )
+            (home_path / ".aider.model.metadata.json").write_text(
+                json.dumps({"lm_studio/qwen/qwen3.6-35b-a3b": {"max_input_tokens": 12345}}),
                 encoding="utf-8",
             )
             (home_path / ".aider.conf.yml").write_text(
@@ -1106,9 +1115,11 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
             self.assertIsNotNone(provenance)
             self.assertEqual(provenance["config_file"], os.devnull)
             self.assertEqual(
-                Path(provenance["model_settings_files"][-1]).resolve(),
-                run.REPO_MODEL_SETTINGS_FILE.resolve(),
+                provenance["model_settings_files"],
+                [str(run.REPO_MODEL_SETTINGS_FILE.resolve())],
             )
+            self.assertEqual(provenance["model_metadata_files"], [])
+            self.assertIs(provenance["default_model_settings"], False)
 
             # Preflight fails fast with RuntimeError if expected metadata disagrees with runtime
             with mock.patch.dict(os.environ, {"HOME": fake_home}):

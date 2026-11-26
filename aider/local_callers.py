@@ -47,7 +47,8 @@ CONTRACT_CALLER_INSTRUCTIONS = (
     "3. Output the edit block implementing the described contract."
 )
 
-_WORD_RE = re.compile(r"\b[A-Za-z_]\w*\b")
+WORD_RE = re.compile(r"\b[A-Za-z_]\w*\b")
+_WORD_RE = WORD_RE
 _JS_TS_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts"})
 _EXTRA_LANG_BY_SUFFIX = {
     ".cjs": "javascript",
@@ -56,8 +57,15 @@ _EXTRA_LANG_BY_SUFFIX = {
     ".hh": "cpp",
     ".ipp": "cpp",
     ".tpp": "cpp",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".bats": "bash",
 }
-_C_CPP_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx"})
+_BASH_SHEBANG_RE = re.compile(
+    r"^#!\s*(?:/usr/bin/env\s+(?:-\S+\s+)*)?(?:(?:/[^\s/]+)*/)?(?:ba|da|a|k|z)?sh(?:\s|$)"
+)
+C_CPP_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx"})
+_C_CPP_HEADER_SUFFIXES = C_CPP_HEADER_SUFFIXES
 _C_DECLARATION_BOUNDARY_NODES = frozenset(
     {
         "compound_statement",
@@ -67,7 +75,114 @@ _C_DECLARATION_BOUNDARY_NODES = frozenset(
         "parameter_list",
     }
 )
-_LARGE_FILE_LIMITATION = "large candidate file omitted (>128 KiB)"
+LARGE_FILE_LIMITATION = "large candidate file omitted (>128 KiB)"
+_LARGE_FILE_LIMITATION = LARGE_FILE_LIMITATION
+_SUBTOKEN_STOPWORDS = frozenset(
+    {
+        "fix",
+        "bug",
+        "add",
+        "set",
+        "get",
+        "run",
+        "file",
+        "edit",
+        "only",
+        "code",
+        "test",
+        "make",
+        "use",
+        "new",
+        "from",
+        "with",
+        "when",
+        "that",
+        "this",
+        "into",
+        "also",
+        "must",
+        "keep",
+        "return",
+        "value",
+        "error",
+        "check",
+        "handle",
+        "update",
+        "support",
+        "ensure",
+        "should",
+        "change",
+        "behavior",
+        "function",
+        "method",
+        "class",
+        "module",
+        "input",
+        "output",
+        "the",
+        "and",
+        "for",
+        "not",
+        "all",
+        "are",
+        "was",
+        "can",
+        "has",
+        "have",
+        "does",
+        "non",
+    }
+)
+_CAMEL_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+")
+_RUST_HOMONYMOUS_TRAIT_METHODS = frozenset(
+    {
+        "fmt",
+        "from",
+        "try_from",
+        "into",
+        "default",
+        "clone",
+        "eq",
+        "ne",
+        "cmp",
+        "partial_cmp",
+        "hash",
+        "drop",
+        "deref",
+        "index",
+        "next",
+        "read",
+        "write",
+        "as_ref",
+        "borrow",
+    }
+)
+_DEF_CONTAINER_NODE_TYPES = frozenset(
+    {
+        "function_definition",
+        "function_declaration",
+        "generator_function_declaration",
+        "function_item",
+        "method_definition",
+        "method_declaration",
+        "constructor_declaration",
+        "method",
+        "variable_declarator",
+    }
+)
+_BASH_DEF_REGEXES = (
+    re.compile(
+        r"(?:^|[;\n])\s*function\s+([A-Za-z_][A-Za-z0-9_-]*)(?:\s*\(\s*\))?\s*[\{(]"
+    ),
+    re.compile(r"(?:^|[;\n])\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\(\s*\)\s*[\{(]"),
+)
+_BASH_DEF_LINE_RE = re.compile(
+    r"^\s*(?:function\s+[A-Za-z_][A-Za-z0-9_-]*(?:\s*\(\s*\))?"
+    r"|[A-Za-z_][A-Za-z0-9_-]*\s*\(\s*\))\s*(?:[\{(]|$)"
+)
+_RUST_IMPL_HEADER_RE = re.compile(
+    r"\bimpl\b(?:\s*<[^>{}]*>)?\s+(?:[A-Za-z_][\w:<>'&,\s+]*?\bfor\s+)?([A-Za-z_]\w*)"
+)
 _C_NON_DECL_KEYWORDS = frozenset(
     {
         "return",
@@ -186,7 +301,7 @@ _IDENT_NODE_TYPES = frozenset(
         "scoped_identifier",
     }
 )
-_CONTROL_KEYWORDS = frozenset(
+CONTROL_KEYWORDS = frozenset(
     {
         "if",
         "for",
@@ -210,7 +325,8 @@ _CONTROL_KEYWORDS = frozenset(
         "require",
     }
 )
-_DEF_REGEXES = (
+_CONTROL_KEYWORDS = CONTROL_KEYWORDS
+DEF_REGEXES = (
     re.compile(
         r"(?:^|[\s;])(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s+"
         r"([A-Za-z_$]\w*)\s*[(<]"
@@ -231,6 +347,7 @@ _DEF_REGEXES = (
         r"(?:^|[\s;])(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$]\w*)\b"
     ),
 )
+_DEF_REGEXES = DEF_REGEXES
 _JS_NAMED_IMPORT_RE = re.compile(
     r"\bimport\s+(?!type\b)(?:[A-Za-z_$]\w*\s*,\s*)?\{([^}]+)\}\s*from\s*['\"]([^'\"]+)['\"]",
     re.DOTALL,
@@ -279,9 +396,354 @@ def _is_truncation_reason(reason: str) -> bool:
     return any(token in lowered for token in ("truncated", "omitted", "capped", "budget", "limit"))
 
 
-def _is_c_cpp_header(path: str) -> bool:
+def _norm_rel_path(path: str) -> str:
+    """Normalize a relative repository path to POSIX forward slashes."""
+    return Path(path.replace("\\", "/")).as_posix()
+
+
+def split_identifier_tokens(identifier: str) -> set[str]:
+    """Split a snake_case, kebab-case, or camelCase identifier into search tokens.
+
+    Preconditions:
+        - ``identifier`` is any string (symbol name or prompt word).
+    Postconditions:
+        - Returns lowercase alphanumeric sub-tokens of length >= 3 excluding
+          generic task stopwords.
+    """
+    if not identifier:
+        return set()
+    tokens: set[str] = set()
+    for part in re.split(r"[^A-Za-z0-9]+", identifier):
+        if not part:
+            continue
+        for sub in _CAMEL_TOKEN_RE.findall(part):
+            low = sub.lower()
+            if len(low) >= 3 and low not in _SUBTOKEN_STOPWORDS:
+                tokens.add(low)
+    return tokens
+
+
+def select_target_definitions(
+    defined_symbols: Iterable[str],
+    task_words: set[str],
+    *,
+    max_fallback: int = 6,
+) -> tuple[set[str], str]:
+    """Select target definitions from an editable file using tiered lexical matching.
+
+    Preconditions:
+        - ``defined_symbols`` contains candidate symbol names defined in editable files.
+        - ``task_words`` contains identifier words extracted from the task prompt.
+    Postconditions:
+        - Returns ``(selected_symbols, tier)`` where ``tier`` is one of
+          ``"exact"``, ``"subtoken"``, ``"fallback"``, or ``"none"``.
+        - Tier 1 returns exact word matches if non-empty.
+        - Tier 2 ranks by camelCase/snake_case sub-token overlap (bounded by ``max_fallback``).
+        - Tier 3 returns up to ``max_fallback`` deterministic exported (or non-test private)
+          definitions when Tier 1 and Tier 2 are both empty.
+    """
+    all_defs = sorted({str(sym).strip() for sym in defined_symbols if str(sym).strip()})
+    if not all_defs or not task_words or max_fallback <= 0:
+        return set(), "none"
+
+    exact = {sym for sym in all_defs if sym in task_words}
+    if exact:
+        return exact, "exact"
+
+    task_tokens: set[str] = set()
+    for word in task_words:
+        task_tokens.update(split_identifier_tokens(word))
+
+    if task_tokens:
+        scored: list[tuple[int, str]] = []
+        for sym in all_defs:
+            overlap = len(split_identifier_tokens(sym) & task_tokens)
+            if overlap > 0:
+                scored.append((-overlap, sym))
+        if scored:
+            scored.sort()
+            return {sym for _, sym in scored[:max_fallback]}, "subtoken"
+
+    non_test = [sym for sym in all_defs if not sym.startswith("test_")]
+    exported = [sym for sym in non_test if not sym.startswith("_")]
+    chosen = exported[:max_fallback] if exported else non_test[:max_fallback]
+    if chosen:
+        return set(chosen), "fallback"
+    return set(), "none"
+
+
+def is_rust_trait_method_ambiguous(
+    symbol: str,
+    *,
+    editable_impl_types: set[str],
+    call_line: str,
+    enclosing_impl_type: str | None = None,
+) -> bool:
+    """Return True if a Rust call to a homonymous trait method has an unprovable receiver.
+
+    Preconditions:
+        - ``symbol`` is the matched Rust method/function name.
+        - ``editable_impl_types`` lists the concrete target type names from editable
+          ``impl`` blocks defining ``symbol`` (may be empty if unknown).
+    Postconditions:
+        - Returns False for non-homonymous names or calls provably targeting one of
+          ``editable_impl_types``; returns True otherwise.
+    """
+    if symbol not in _RUST_HOMONYMOUS_TRAIT_METHODS:
+        return False
+    if not editable_impl_types:
+        return True
+    escaped_sym = re.escape(symbol)
+    for typ in editable_impl_types:
+        escaped_typ = re.escape(typ)
+        if re.search(rf"\b{escaped_typ}(?:<[^<>]*>)?\s*::\s*{escaped_sym}\s*\(", call_line):
+            return False
+        if re.search(
+            rf"<\s*{escaped_typ}(?:<[^<>]*>)?\s+as\b[^>]*>\s*::\s*{escaped_sym}\s*\(",
+            call_line,
+        ):
+            return False
+    if enclosing_impl_type and enclosing_impl_type in editable_impl_types:
+        if re.search(rf"\b(?:self\s*\.\s*|Self\s*::\s*){escaped_sym}\s*\(", call_line):
+            return False
+    return True
+
+
+def _strip_bash_comments_and_literals(line: str) -> str:
+    """Strip Bash comments and literal quoted text while preserving ``$(...)`` substitutions."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    in_single = False
+    in_double = False
+    subst_depth = 0
+    while i < n:
+        ch = line[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            out.append(" ")
+            i += 1
+            continue
+        if in_double and subst_depth == 0:
+            if ch == "\\" and i + 1 < n:
+                out.append("  ")
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "$" and i + 1 < n and line[i + 1] == "(":
+                subst_depth = 1
+                out.append("$(")
+                i += 2
+                continue
+            out.append(" ")
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(line[i + 1])
+            i += 2
+            continue
+        if ch == "#" and (i == 0 or line[i - 1].isspace() or line[i - 1] in ";|&({"):
+            break
+        if ch == "'":
+            in_single = True
+            out.append(" ")
+            i += 1
+            continue
+        if ch == '"' and subst_depth == 0:
+            in_double = True
+            out.append(" ")
+            i += 1
+            continue
+        if subst_depth > 0:
+            if ch == "(":
+                subst_depth += 1
+            elif ch == ")":
+                subst_depth -= 1
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _row_in_spans(row: int, spans: Sequence[tuple[int, int]]) -> bool:
+    """Return True when ``row`` falls within any inclusive ``(start, end)`` span."""
+    return any(start <= row <= end for start, end in spans)
+
+
+def _extract_rust_base_type_name(type_text: str) -> str | None:
+    """Extract the base Rust type identifier from a type expression like ``crate::Version<'a>``."""
+    head = type_text.split("<", 1)[0].strip()
+    if "::" in head:
+        head = head.rsplit("::", 1)[-1].strip()
+    head = head.lstrip("&").strip()
+    if head.startswith("mut "):
+        head = head[4:].strip()
+    match = re.match(r"^([A-Za-z_]\w*)$", head)
+    return match.group(1) if match else None
+
+
+def _extract_rust_impl_target_types(source: str) -> dict[str, set[str]]:
+    """Map Rust method names inside ``impl`` blocks to their concrete target type names."""
+    result: dict[str, set[str]] = {}
+    try:
+        warnings.simplefilter("ignore", category=FutureWarning)
+        from grep_ast.tsl import get_parser
+
+        parser = get_parser("rust")
+        tree = parser.parse(source.encode("utf-8"))
+    except Exception:
+        tree = None
+
+    if tree is not None:
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == "impl_item":
+                type_node = node.child_by_field_name("type")
+                type_name = (
+                    _extract_rust_base_type_name(type_node.text.decode("utf-8", errors="ignore"))
+                    if type_node is not None
+                    else None
+                )
+                body = node.child_by_field_name("body")
+                if type_name and body is not None:
+                    for child in body.children:
+                        if child.type == "function_item":
+                            fn_name = child.child_by_field_name("name")
+                            if fn_name is not None:
+                                sym = fn_name.text.decode("utf-8", errors="ignore")
+                                if sym:
+                                    result.setdefault(sym, set()).add(type_name)
+            stack.extend(reversed(node.children))
+        return result
+
+    # Regex fallback when tree-sitter Rust parser is unavailable.
+    current_type: str | None = None
+    brace_depth = 0
+    impl_depth: int | None = None
+    for line in source.splitlines():
+        impl_match = _RUST_IMPL_HEADER_RE.search(line)
+        if impl_match and impl_depth is None:
+            current_type = impl_match.group(1)
+            impl_depth = brace_depth + line.count("{") - line.count("}")
+        elif current_type is not None:
+            fn_match = re.search(r"\bfn\s+([A-Za-z_]\w*)\s*[(<]", line)
+            if fn_match:
+                result.setdefault(fn_match.group(1), set()).add(current_type)
+        brace_depth += line.count("{") - line.count("}")
+        if impl_depth is not None and brace_depth <= max(0, impl_depth - 1):
+            current_type = None
+            impl_depth = None
+    return result
+
+
+def _find_rust_enclosing_impl_type(source: str, row: int) -> str | None:
+    """Return the target type name of the innermost Rust ``impl`` enclosing 0-based ``row``."""
+    try:
+        warnings.simplefilter("ignore", category=FutureWarning)
+        from grep_ast.tsl import get_parser
+
+        parser = get_parser("rust")
+        tree = parser.parse(source.encode("utf-8"))
+    except Exception:
+        tree = None
+
+    if tree is not None:
+        best_type: str | None = None
+        best_span = 1 << 30
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.start_point[0] <= row <= node.end_point[0]:
+                if node.type == "impl_item":
+                    span = node.end_point[0] - node.start_point[0]
+                    if span <= best_span:
+                        type_node = node.child_by_field_name("type")
+                        if type_node is not None:
+                            parsed = _extract_rust_base_type_name(
+                                type_node.text.decode("utf-8", errors="ignore")
+                            )
+                            if parsed:
+                                best_type = parsed
+                                best_span = span
+                stack.extend(reversed(node.children))
+        return best_type
+
+    lines = source.splitlines()
+    for idx in range(min(row, len(lines) - 1), -1, -1):
+        match = _RUST_IMPL_HEADER_RE.search(lines[idx])
+        if match:
+            return match.group(1)
+    return None
+
+
+def _compute_brace_definition_spans(
+    source: str,
+    symbols: set[str],
+    *,
+    is_bash: bool = False,
+) -> dict[str, list[tuple[int, int]]]:
+    """Compute approximate 0-based ``(start_row, end_row)`` body spans for regex fallback."""
+    if not symbols:
+        return {}
+    spans: dict[str, list[tuple[int, int]]] = {}
+    lines = source.splitlines()
+    n = len(lines)
+    for row, line in enumerate(lines):
+        matched_sym: str | None = None
+        if is_bash:
+            for pattern in _BASH_DEF_REGEXES:
+                m = pattern.search(line)
+                if m and m.group(1) in symbols:
+                    matched_sym = m.group(1)
+                    break
+        else:
+            for pattern in DEF_REGEXES:
+                m = pattern.search(line)
+                if m and m.group(1) in symbols:
+                    matched_sym = m.group(1)
+                    break
+            if matched_sym is None:
+                for sym in symbols:
+                    m = re.search(rf"\b{re.escape(sym)}\s*\(", line)
+                    prev_line = lines[row - 1] if row > 0 else ""
+                    if m and _is_c_cpp_declaration_match(line, m.start(), m.end(), prev_line):
+                        if "{" in line or (row + 1 < n and "{" in lines[row + 1]):
+                            matched_sym = sym
+                            break
+        if matched_sym is None:
+            continue
+        depth = 0
+        opened = False
+        end_row = row
+        for cur in range(row, n):
+            cur_line = lines[cur]
+            opens = cur_line.count("{")
+            closes = cur_line.count("}")
+            if opens:
+                opened = True
+            depth += opens - closes
+            end_row = cur
+            if opened and depth <= 0:
+                break
+        spans.setdefault(matched_sym, []).append((row, end_row))
+    return spans
+
+
+def is_c_cpp_header(path: str) -> bool:
     """Return True for C/C++ header file extensions."""
-    return Path(path).suffix.lower() in _C_CPP_HEADER_SUFFIXES
+    return Path(path).suffix.lower() in C_CPP_HEADER_SUFFIXES
+
+
+_is_c_cpp_header = is_c_cpp_header
 
 
 def _has_ancestor_type(node, node_type: str) -> bool:
@@ -294,7 +756,7 @@ def _has_ancestor_type(node, node_type: str) -> bool:
     return False
 
 
-def _has_function_definition_declarator_ancestor(node) -> bool:
+def has_function_definition_declarator_ancestor(node) -> bool:
     """Return True when ``node`` belongs to a C/C++ ``function_definition`` declarator.
 
     Walks upward through declarator wrappers (such as ``pointer_declarator`` or
@@ -310,6 +772,9 @@ def _has_function_definition_declarator_ancestor(node) -> bool:
             return False
         cur = getattr(cur, "parent", None)
     return False
+
+
+_has_function_definition_declarator_ancestor = has_function_definition_declarator_ancestor
 
 
 def _supports_report_arg(finder: CallerFinder) -> bool:
@@ -874,11 +1339,18 @@ class PythonAstCallerFinder:
         target_methods: set[tuple[str, str, str]] = set()
         target_modules: set[str] = set()
         symbol_def_count: dict[str, int] = {}
+        editable_norm: set[str] = set()
+        own_def_spans_by_file: dict[str, dict[tuple[str, str], list[tuple[int, int]]]] = {}
 
+        # Collect all definitions first so tiered target selection works for vague prompts.
+        # Entries: (name, norm_name, module, kind, class_name, sym, start_line, end_line)
+        extracted_defs: list[tuple[str, str, str, str, str, str, int, int]] = []
         skipped_large = 0
         for name in editable:
             if not self.supports(name):
                 continue
+            norm_ed = _norm_rel_path(name)
+            editable_norm.add(norm_ed)
             source, is_large = _read_python_checked(resolved_root, name)
             if is_large:
                 skipped_large += 1
@@ -894,23 +1366,54 @@ class PythonAstCallerFinder:
             module = _python_module_name(name)
             for node in definitions:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if node.name in words:
-                        if report is not None:
-                            report.record_definition(name, node.name)
-                        target_funcs.add((module, node.name))
-                        target_modules.add(module)
-                        symbol_def_count[node.name] = symbol_def_count.get(node.name, 0) + 1
+                    extracted_defs.append(
+                        (
+                            name,
+                            norm_ed,
+                            module,
+                            "direct_call",
+                            "",
+                            node.name,
+                            node.lineno,
+                            node.end_lineno or node.lineno,
+                        )
+                    )
                 elif isinstance(node, ast.ClassDef):
                     for item in node.body:
-                        if (
-                            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                            and item.name in words
-                        ):
-                            if report is not None:
-                                report.record_definition(name, item.name)
-                            target_methods.add((module, node.name, item.name))
-                            target_modules.add(module)
-                            symbol_def_count[item.name] = symbol_def_count.get(item.name, 0) + 1
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            extracted_defs.append(
+                                (
+                                    name,
+                                    norm_ed,
+                                    module,
+                                    "method_call",
+                                    node.name,
+                                    item.name,
+                                    item.lineno,
+                                    item.end_lineno or item.lineno,
+                                )
+                            )
+
+        selected_names, _tier = select_target_definitions(
+            (entry[5] for entry in extracted_defs), words
+        )
+        if not selected_names:
+            return ()
+
+        for name, norm_ed, module, def_kind, cls_name, sym, start_line, end_line in extracted_defs:
+            if sym not in selected_names:
+                continue
+            if report is not None:
+                report.record_definition(name, sym)
+            if def_kind == "direct_call":
+                target_funcs.add((module, sym))
+            else:
+                target_methods.add((module, cls_name, sym))
+            target_modules.add(module)
+            symbol_def_count[sym] = symbol_def_count.get(sym, 0) + 1
+            own_def_spans_by_file.setdefault(norm_ed, {}).setdefault((def_kind, sym), []).append(
+                (start_line, end_line)
+            )
 
         if not target_funcs and not target_methods:
             return ()
@@ -921,7 +1424,11 @@ class PythonAstCallerFinder:
         target_symbols = {sym for _, sym in target_funcs} | {m for _, _, m in target_methods}
         excerpts: list[CallerExcerpt] = []
 
-        for name in sorted(candidates):
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda item: (1 if _norm_rel_path(item) in editable_norm else 0, item),
+        )
+        for name in ordered_candidates:
             if not self.supports(name):
                 continue
             source, is_large = _read_python_checked(resolved_root, name)
@@ -937,10 +1444,22 @@ class PythonAstCallerFinder:
             except (SyntaxError, ValueError):
                 continue
 
+            norm_cand = _norm_rel_path(name)
+            is_same_file = norm_cand in editable_norm
+            cand_mod = _python_module_name(name)
+
             func_aliases: dict[str, str] = {}
             module_aliases: dict[str, str] = {}
             unrelated_module_aliases: set[str] = set()
             allowed_method_names: set[str] = set()
+
+            if is_same_file:
+                for mod, sym in target_funcs:
+                    if mod == cand_mod:
+                        func_aliases[sym] = sym
+                for mod, _, meth in target_methods:
+                    if mod == cand_mod:
+                        allowed_method_names.add(meth)
 
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -1005,6 +1524,7 @@ class PythonAstCallerFinder:
                 target_funcs=target_funcs,
                 allowed_method_names=allowed_method_names,
                 unrelated_module_aliases=unrelated_module_aliases,
+                excluded_spans=own_def_spans_by_file.get(norm_cand),
             )
             if not matched_calls:
                 continue
@@ -1062,24 +1582,28 @@ class PythonAstCallerFinder:
         target_funcs: set[tuple[str, str]],
         allowed_method_names: set[str],
         unrelated_module_aliases: set[str],
+        excluded_spans: dict[tuple[str, str], list[tuple[int, int]]] | None = None,
     ) -> list[tuple[ast.Call, str, str]]:
+        spans = excluded_spans or {}
         matches: list[tuple[int, int, ast.Call, str, str]] = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in func_aliases:
-                matches.append(
-                    (node.lineno, node.col_offset, node, func_aliases[node.func.id], "direct_call")
-                )
+                sym = func_aliases[node.func.id]
+                if not _row_in_spans(node.lineno, spans.get(("direct_call", sym), ())):
+                    matches.append((node.lineno, node.col_offset, node, sym, "direct_call"))
                 continue
             if isinstance(node.func, ast.Attribute):
                 owner = _dotted_name(node.func.value)
                 attr = node.func.attr
                 if owner in module_aliases and (module_aliases[owner], attr) in target_funcs:
-                    matches.append((node.lineno, node.col_offset, node, attr, "direct_call"))
+                    if not _row_in_spans(node.lineno, spans.get(("direct_call", attr), ())):
+                        matches.append((node.lineno, node.col_offset, node, attr, "direct_call"))
                     continue
                 if attr in allowed_method_names and owner not in unrelated_module_aliases:
-                    matches.append((node.lineno, node.col_offset, node, attr, "method_call"))
+                    if not _row_in_spans(node.lineno, spans.get(("method_call", attr), ())):
+                        matches.append((node.lineno, node.col_offset, node, attr, "method_call"))
         matches.sort(key=lambda item: (item[0], item[1]))
         return [(call_node, symbol, kind) for _, _, call_node, symbol, kind in matches]
 
@@ -1108,7 +1632,15 @@ class PythonAstCallerFinder:
         return call_node, symbol
 
 
-def _resolve_lang(path: str) -> str | None:
+def resolve_lang(path: str, source: str | None = None) -> str | None:
+    """Resolve tree-sitter language name from file path suffix or shell shebang.
+
+    Preconditions:
+        - ``path`` is a relative or absolute filename.
+        - ``source`` is optional file text inspected only when the path has no mapped language.
+    Postconditions:
+        - Returns a tree-sitter language name (e.g. ``"bash"``, ``"rust"``, ``"c"``) or ``None``.
+    """
     try:
         from grep_ast import filename_to_lang
 
@@ -1117,7 +1649,17 @@ def _resolve_lang(path: str) -> str | None:
             return lang
     except Exception:
         pass
-    return _EXTRA_LANG_BY_SUFFIX.get(Path(path).suffix.lower())
+    by_suffix = _EXTRA_LANG_BY_SUFFIX.get(Path(path).suffix.lower())
+    if by_suffix:
+        return by_suffix
+    if source:
+        first_line = source.splitlines()[0] if source.splitlines() else ""
+        if _BASH_SHEBANG_RE.match(first_line):
+            return "bash"
+    return None
+
+
+_resolve_lang = resolve_lang
 
 
 def _get_scm_path(lang: str):
@@ -1377,24 +1919,59 @@ class TreeSitterCallerFinder:
 
         # Map symbol -> set of editable paths defining it.
         skipped_large = 0
-        targets: dict[str, set[str]] = {}
+        editable_norm: set[str] = set()
+        per_file_defs: list[tuple[str, str, str, set[str]]] = []
         for name in editable:
             if not self.supports(name):
                 continue
+            norm_ed = _norm_rel_path(name)
+            editable_norm.add(norm_ed)
             source, is_large = _read_source_checked(resolved_root, name)
             if is_large:
                 skipped_large += 1
                 if report is not None and hasattr(report, "record_skipped_large"):
                     report.record_skipped_large(name)
                 continue
-            if not source or not any(word in source for word in words):
+            if not source:
                 continue
             defined = self._extract_definitions(name, source)
-            for sym in defined:
-                if sym in words:
-                    if report is not None:
-                        report.record_definition(name, sym)
-                    targets.setdefault(sym, set()).add(name)
+            if defined:
+                per_file_defs.append((name, norm_ed, source, defined))
+
+        all_defined: set[str] = set()
+        for _, _, _, defined in per_file_defs:
+            all_defined.update(defined)
+
+        selected_names, _tier = select_target_definitions(all_defined, words)
+        if not selected_names:
+            return ()
+
+        targets: dict[str, set[str]] = {}
+        targets_norm: dict[str, set[str]] = {}
+        own_def_spans_by_file: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        rust_editable_symbols: set[str] = set()
+        rust_impl_types: dict[str, set[str]] = {}
+
+        for name, norm_ed, source, defined in per_file_defs:
+            chosen = defined & selected_names
+            if not chosen:
+                continue
+            for sym in sorted(chosen):
+                if report is not None:
+                    report.record_definition(name, sym)
+                targets.setdefault(sym, set()).add(name)
+                targets_norm.setdefault(sym, set()).add(norm_ed)
+            spans = self._extract_definition_spans(name, source, chosen)
+            if spans:
+                dest = own_def_spans_by_file.setdefault(norm_ed, {})
+                for sym, sym_spans in spans.items():
+                    dest.setdefault(sym, []).extend(sym_spans)
+            if resolve_lang(name, source) == "rust":
+                rust_editable_symbols.update(chosen)
+                extracted_impls = _extract_rust_impl_target_types(source)
+                for sym in chosen:
+                    if sym in extracted_impls:
+                        rust_impl_types.setdefault(sym, set()).update(extracted_impls[sym])
 
         if not targets:
             return ()
@@ -1403,7 +1980,11 @@ class TreeSitterCallerFinder:
             report.record_ambiguity("duplicate symbol definition")
 
         excerpts: list[CallerExcerpt] = []
-        for name in sorted(candidates):
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda item: (1 if _norm_rel_path(item) in editable_norm else 0, item),
+        )
+        for name in ordered_candidates:
             if not self.supports(name):
                 continue
             source, is_large = _read_source_checked(resolved_root, name)
@@ -1415,6 +1996,7 @@ class TreeSitterCallerFinder:
             if not source:
                 continue
 
+            norm_cand = _norm_rel_path(name)
             call_names, ns_aliases = self._resolve_candidate_bindings(name, source, targets)
             if not call_names and not ns_aliases:
                 continue
@@ -1425,7 +2007,10 @@ class TreeSitterCallerFinder:
             if not any(tok in source for tok in search_tokens):
                 continue
 
-            matches, kind = self._find_call_lines(name, source, call_names, ns_aliases)
+            own_spans = own_def_spans_by_file.get(norm_cand)
+            matches, kind = self._find_call_lines(
+                name, source, call_names, ns_aliases, own_def_spans=own_spans
+            )
             if not matches:
                 continue
 
@@ -1442,10 +2027,11 @@ class TreeSitterCallerFinder:
                 truncation.append("additional calls in file omitted")
             is_js_ts = Path(name).suffix.lower() in _JS_TS_SUFFIXES
             if is_js_ts:
+                is_same_file_target = norm_cand in targets_norm.get(symbol, set())
                 named, namespaces = _parse_js_imports(source)
                 specifiers = [spec for imported, _, spec in named if imported == symbol]
                 specifiers.extend(spec for _, spec in namespaces)
-                resolved = any(
+                resolved = is_same_file_target or any(
                     _js_specifier_matches_editable(spec, name, target)
                     for spec in specifiers
                     for target in targets[symbol]
@@ -1458,6 +2044,22 @@ class TreeSitterCallerFinder:
                 ambiguity.append("ambiguous symbol binding")
                 if len(targets[symbol]) > 1:
                     ambiguity.append("duplicate symbol definition")
+
+            if (
+                resolve_lang(name, source) == "rust"
+                and symbol in rust_editable_symbols
+                and symbol in _RUST_HOMONYMOUS_TRAIT_METHODS
+            ):
+                enclosing_impl = _find_rust_enclosing_impl_type(source, lineno)
+                call_line = lines[lineno] if 0 <= lineno < len(lines) else ""
+                if is_rust_trait_method_ambiguous(
+                    symbol,
+                    editable_impl_types=rust_impl_types.get(symbol, set()),
+                    call_line=call_line,
+                    enclosing_impl_type=enclosing_impl,
+                ):
+                    ambiguity.append("ambiguous trait method receiver")
+
             excerpts.append(
                 CallerExcerpt(
                     path=name,
@@ -1484,16 +2086,121 @@ class TreeSitterCallerFinder:
 
     def _extract_definitions(self, path: str, source: str) -> set[str]:
         defined: set[str] = set()
-        lang = _resolve_lang(path)
+        lang = resolve_lang(path, source)
         if lang:
             defined.update(self._extract_ts_definitions(lang, source, path=path))
+        if lang == "bash":
+            for pattern in _BASH_DEF_REGEXES:
+                for match in pattern.finditer(source):
+                    name = match.group(1)
+                    if name and name not in CONTROL_KEYWORDS:
+                        defined.add(name)
+            return defined
         # Augment with regex fallback (handles arrow functions in TS and unsupported languages).
-        for pattern in _DEF_REGEXES:
+        for pattern in DEF_REGEXES:
             for match in pattern.finditer(source):
                 name = match.group(1)
-                if name and name not in _CONTROL_KEYWORDS:
+                if name and name not in CONTROL_KEYWORDS:
                     defined.add(name)
         return defined
+
+    def _extract_definition_spans(
+        self,
+        path: str,
+        source: str,
+        symbols: set[str],
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Return 0-based inclusive ``(start_row, end_row)`` spans of definitions for ``symbols``."""
+        if not symbols:
+            return {}
+        lang = resolve_lang(path, source)
+        spans: dict[str, list[tuple[int, int]]] = {}
+        if lang:
+            spans = self._extract_ts_definition_spans(lang, source, symbols, path=path)
+        if not spans:
+            spans = _compute_brace_definition_spans(source, symbols, is_bash=(lang == "bash"))
+        return spans
+
+    def _extract_ts_definition_spans(
+        self,
+        lang: str,
+        source: str,
+        symbols: set[str],
+        *,
+        path: str = "",
+    ) -> dict[str, list[tuple[int, int]]]:
+        try:
+            warnings.simplefilter("ignore", category=FutureWarning)
+            from grep_ast.tsl import get_language, get_parser
+            from tree_sitter import Query
+
+            language = get_language(lang)
+            parser = get_parser(lang)
+            tree = parser.parse(source.encode("utf-8"))
+        except Exception:
+            return {}
+
+        spans: dict[str, list[tuple[int, int]]] = {}
+        scm_path = _get_scm_path(lang)
+        is_c_cpp_non_header = (
+            lang in ("c", "cpp") and bool(path) and not is_c_cpp_header(path)
+        )
+        if scm_path is not None:
+            try:
+                query = Query(language, scm_path.read_text(encoding="utf-8"))
+                captures = _run_ts_captures(query, tree.root_node)
+            except Exception:
+                captures = []
+            for node, tag in captures:
+                if not tag.startswith("name.definition."):
+                    continue
+                if lang == "bash" and tag != "name.definition.function":
+                    continue
+                if is_c_cpp_non_header and tag in (
+                    "name.definition.function",
+                    "name.definition.method",
+                ):
+                    if not has_function_definition_declarator_ancestor(node):
+                        continue
+                sym = node.text.decode("utf-8", errors="ignore")
+                if sym not in symbols:
+                    continue
+                cur = node
+                container = None
+                while cur is not None:
+                    if getattr(cur, "type", "") in _DEF_CONTAINER_NODE_TYPES:
+                        container = cur
+                        break
+                    cur = getattr(cur, "parent", None)
+                if container is not None:
+                    spans.setdefault(sym, []).append(
+                        (container.start_point[0], container.end_point[0])
+                    )
+
+        # Fallback AST scan for arrow functions / function definitions not covered by scm.
+        missing = symbols - set(spans)
+        if missing:
+            stack = [tree.root_node]
+            while stack:
+                node = stack.pop()
+                if node.type in _DEF_CONTAINER_NODE_TYPES:
+                    name_node = node.child_by_field_name("name")
+                    if name_node is None and node.type == "function_definition":
+                        decl = node.child_by_field_name("declarator")
+                        while decl is not None and decl.type not in _IDENT_NODE_TYPES:
+                            inner = decl.child_by_field_name("declarator")
+                            if inner is None:
+                                break
+                            decl = inner
+                        name_node = decl
+                    if name_node is not None:
+                        sym = name_node.text.decode("utf-8", errors="ignore")
+                        if sym in missing:
+                            spans.setdefault(sym, []).append(
+                                (node.start_point[0], node.end_point[0])
+                            )
+                stack.extend(reversed(node.children))
+        return spans
 
     def _extract_ts_definitions(self, lang: str, source: str, *, path: str = "") -> set[str]:
         scm_path = _get_scm_path(lang)
@@ -1513,22 +2220,24 @@ class TreeSitterCallerFinder:
             return set()
 
         is_c_cpp_non_header = (
-            lang in ("c", "cpp") and bool(path) and not _is_c_cpp_header(path)
+            lang in ("c", "cpp") and bool(path) and not is_c_cpp_header(path)
         )
-        is_cpp_header = lang == "cpp" and bool(path) and _is_c_cpp_header(path)
+        is_cpp_header = lang == "cpp" and bool(path) and is_c_cpp_header(path)
         defined: set[str] = set()
         for node, tag in captures:
             if tag.startswith("name.definition."):
+                if lang == "bash" and tag != "name.definition.function":
+                    continue
                 if is_c_cpp_non_header and tag in (
                     "name.definition.function",
                     "name.definition.method",
                 ):
-                    if not _has_function_definition_declarator_ancestor(node):
+                    if not has_function_definition_declarator_ancestor(node):
                         continue
                 elif (
                     is_cpp_header
                     and tag in ("name.definition.function", "name.definition.method")
-                    and not _has_function_definition_declarator_ancestor(node)
+                    and not has_function_definition_declarator_ancestor(node)
                     and _has_ancestor_type(node, "compound_statement")
                 ):
                     continue
@@ -1548,6 +2257,7 @@ class TreeSitterCallerFinder:
         if not is_js_ts:
             return {sym: sym for sym in targets}, {}
 
+        norm_cand = _norm_rel_path(candidate_path)
         named_imports, ns_imports = _parse_js_imports(source)
         if not named_imports and not ns_imports:
             return {sym: sym for sym in targets}, {}
@@ -1556,6 +2266,11 @@ class TreeSitterCallerFinder:
         ns_aliases: dict[str, set[str]] = {}
         imported_from_matching: set[str] = set()
         imported_from_other: set[str] = set()
+
+        for sym, editable_paths in targets.items():
+            if any(_norm_rel_path(ed) == norm_cand for ed in editable_paths):
+                call_names[sym] = sym
+                imported_from_matching.add(sym)
 
         for orig, local, specifier in named_imports:
             if orig not in targets:
@@ -1592,13 +2307,29 @@ class TreeSitterCallerFinder:
         source: str,
         call_names: dict[str, str],
         ns_aliases: dict[str, set[str]],
+        *,
+        own_def_spans: dict[str, list[tuple[int, int]]] | None = None,
     ) -> tuple[list[tuple[int, str]], str]:
-        lang = _resolve_lang(path)
+        lang = resolve_lang(path, source)
         if lang:
-            matches = self._find_ts_call_lines(lang, source, call_names, ns_aliases)
+            matches = self._find_ts_call_lines(
+                lang, source, call_names, ns_aliases, own_def_spans=own_def_spans
+            )
             if matches:
                 return matches, "direct_call"
-        return self._find_regex_call_lines(source, call_names, ns_aliases), "regex_call"
+        if lang == "bash":
+            return (
+                self._find_bash_regex_call_lines(
+                    source, call_names, own_def_spans=own_def_spans
+                ),
+                "regex_call",
+            )
+        return (
+            self._find_regex_call_lines(
+                source, call_names, ns_aliases, own_def_spans=own_def_spans
+            ),
+            "regex_call",
+        )
 
     def _find_first_call_line(
         self,
@@ -1616,7 +2347,10 @@ class TreeSitterCallerFinder:
         source: str,
         call_names: dict[str, str],
         ns_aliases: dict[str, set[str]],
+        *,
+        own_def_spans: dict[str, list[tuple[int, int]]] | None = None,
     ) -> list[tuple[int, str]]:
+        spans = own_def_spans or {}
         try:
             warnings.simplefilter("ignore", category=FutureWarning)
             from grep_ast.tsl import get_language, get_parser
@@ -1651,7 +2385,9 @@ class TreeSitterCallerFinder:
                 called = node.text.decode("utf-8", errors="ignore")
                 row, col = node.start_point
                 if called in call_names:
-                    matches.append((row, col, call_names[called]))
+                    sym = call_names[called]
+                    if not _row_in_spans(row, spans.get(sym, ())):
+                        matches.append((row, col, sym))
                     continue
                 if ns_aliases and node.parent is not None:
                     owner_node = node.parent.child_by_field_name("object")
@@ -1661,26 +2397,39 @@ class TreeSitterCallerFinder:
                         else None
                     )
                     if owner in ns_aliases and called in ns_aliases[owner]:
-                        matches.append((row, col, called))
+                        if not _row_in_spans(row, spans.get(called, ())):
+                            matches.append((row, col, called))
             if matches:
                 matches.sort(key=lambda item: (item[0], item[1]))
                 return [(row, sym) for row, _, sym in matches]
 
-        # Path 2: Tree-sitter AST walk for call nodes (e.g. TypeScript, Java, C#).
+        # Path 2: Tree-sitter AST walk for call nodes (e.g. TypeScript, Java, C#, Rust, Bash).
         ast_matches: list[tuple[int, int, str]] = []
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
             if node.type == "function_declarator":
                 continue
-            if node.type in _CALL_NODE_TYPES:
+            if lang == "bash" and node.type == "command":
+                cmd_name = node.child_by_field_name("name")
+                if cmd_name is not None:
+                    called = cmd_name.text.decode("utf-8", errors="ignore")
+                    row, col = cmd_name.start_point
+                    if called in call_names:
+                        sym = call_names[called]
+                        if not _row_in_spans(row, spans.get(sym, ())):
+                            ast_matches.append((row, col, sym))
+            elif node.type in _CALL_NODE_TYPES:
                 if not _is_c_declaration_node(node):
                     owner, called = _extract_callee_name(node)
                     row, col = node.start_point
                     if called and called in call_names:
-                        ast_matches.append((row, col, call_names[called]))
+                        sym = call_names[called]
+                        if not _row_in_spans(row, spans.get(sym, ())):
+                            ast_matches.append((row, col, sym))
                     elif owner and called and owner in ns_aliases and called in ns_aliases[owner]:
-                        ast_matches.append((row, col, called))
+                        if not _row_in_spans(row, spans.get(called, ())):
+                            ast_matches.append((row, col, called))
             stack.extend(reversed(node.children))
 
         if ast_matches:
@@ -1699,11 +2448,52 @@ class TreeSitterCallerFinder:
         return matches[0] if matches else None
 
     @staticmethod
+    def _find_bash_regex_call_lines(
+        source: str,
+        call_names: dict[str, str],
+        *,
+        own_def_spans: dict[str, list[tuple[int, int]]] | None = None,
+    ) -> list[tuple[int, str]]:
+        """Regex fallback for Bash command calls skipping comments, definitions, assignments, and literals."""
+        if not call_names:
+            return []
+        spans = own_def_spans or {}
+        patterns: list[tuple[re.Pattern[str], str]] = [
+            (
+                re.compile(
+                    r"(?:^|[;|&(`{]|!|\b(?:if|elif|then|else|do|while|until|time|command|builtin)\b)"
+                    r"\s*(?:\$\(\s*)?"
+                    rf"({re.escape(local)})"
+                    r"(?=$|[\s;|&)`<>])"
+                ),
+                sym,
+            )
+            for local, sym in sorted(call_names.items())
+        ]
+        matches: list[tuple[int, str]] = []
+        for row, raw_line in enumerate(source.splitlines()):
+            if _BASH_DEF_LINE_RE.match(raw_line):
+                continue
+            cleaned = _strip_bash_comments_and_literals(raw_line)
+            if not cleaned.strip():
+                continue
+            for pattern, sym in patterns:
+                if _row_in_spans(row, spans.get(sym, ())):
+                    continue
+                if pattern.search(cleaned):
+                    matches.append((row, sym))
+                    break
+        return matches
+
+    @staticmethod
     def _find_regex_call_lines(
         source: str,
         call_names: dict[str, str],
         ns_aliases: dict[str, set[str]],
+        *,
+        own_def_spans: dict[str, list[tuple[int, int]]] | None = None,
     ) -> list[tuple[int, str]]:
+        spans = own_def_spans or {}
         patterns: list[tuple[re.Pattern[str], str]] = [
             (re.compile(rf"\b{re.escape(local)}\s*\("), sym)
             for local, sym in sorted(call_names.items())
@@ -1727,6 +2517,8 @@ class TreeSitterCallerFinder:
                 continue
             matched_line = False
             for pattern, sym in patterns:
+                if _row_in_spans(row, spans.get(sym, ())):
+                    continue
                 for match in pattern.finditer(line):
                     if _is_c_cpp_declaration_match(
                         line, match.start(), match.end(), prev_nonempty
@@ -1755,7 +2547,7 @@ class TreeSitterCallerFinder:
 _TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs"})
 
 
-def _is_test_path(path: str) -> bool:
+def is_test_path(path: str) -> bool:
     """Return True for test or smoke harness files (deprioritized vs production callers)."""
     p = Path(path.replace("\\", "/"))
     if any(part.lower() in _TEST_DIR_NAMES for part in p.parts[:-1]):
@@ -1770,6 +2562,9 @@ def _is_test_path(path: str) -> bool:
         or ".test." in name
         or ".spec." in name
     )
+
+
+_is_test_path = is_test_path
 
 
 class CompositeCallerFinder:
@@ -1799,29 +2594,45 @@ class CompositeCallerFinder:
     ) -> CallerEvidenceResult:
         active_report = report if report is not None else CallerEvidenceReport()
         editable_tuple = tuple(editable)
-        editable_norm = {Path(p.replace("\\", "/")).as_posix() for p in editable_tuple if p}
+        editable_norm_list = sorted({_norm_rel_path(p) for p in editable_tuple if p})
+        editable_norm = set(editable_norm_list)
 
         seen_candidates: set[str] = set()
         unique_candidates_list: list[str] = []
         for candidate in candidates:
             if not candidate:
                 continue
-            norm = Path(candidate.replace("\\", "/")).as_posix()
-            if norm not in editable_norm and norm not in seen_candidates:
+            norm = _norm_rel_path(candidate)
+            if norm not in seen_candidates:
                 seen_candidates.add(norm)
                 unique_candidates_list.append(norm)
         unique_candidates = tuple(sorted(unique_candidates_list))
-        prod_candidates = tuple(c for c in unique_candidates if not _is_test_path(c))
-        test_candidates = tuple(c for c in unique_candidates if _is_test_path(c))
+        prod_candidates = tuple(c for c in unique_candidates if not is_test_path(c))
+        test_candidates = tuple(c for c in unique_candidates if is_test_path(c))
+        implicit_same_file = tuple(
+            ed for ed in editable_norm_list if ed not in seen_candidates and not is_test_path(ed)
+        )
+        prod_search_pool = tuple(
+            sorted(
+                (*prod_candidates, *implicit_same_file),
+                key=lambda item: (1 if item in editable_norm else 0, item),
+            )
+        )
+        total_candidates = (
+            len(unique_candidates) if unique_candidates else len(implicit_same_file)
+        )
+        prod_candidate_count = (
+            len(prod_candidates) if unique_candidates else len(implicit_same_file)
+        )
 
         if max_files <= 0 or max_chars <= 0:
             active_report.record_truncation("budget cap zero")
             active_report.scope = CallerScope(
                 pool="none",
                 editable=editable_tuple,
-                candidates_total=len(unique_candidates),
+                candidates_total=total_candidates,
                 candidates_searched=0,
-                production_candidates=len(prod_candidates),
+                production_candidates=prod_candidate_count,
                 test_candidates=len(test_candidates),
                 omitted_test_candidates=len(test_candidates),
                 matched_files=0,
@@ -1839,9 +2650,9 @@ class CompositeCallerFinder:
             active_report.scope = CallerScope(
                 pool="none",
                 editable=(),
-                candidates_total=len(unique_candidates),
+                candidates_total=total_candidates,
                 candidates_searched=0,
-                production_candidates=len(prod_candidates),
+                production_candidates=prod_candidate_count,
                 test_candidates=len(test_candidates),
                 omitted_test_candidates=0,
                 matched_files=0,
@@ -1857,19 +2668,20 @@ class CompositeCallerFinder:
 
         resolved_root = Path(root).resolve()
 
-        # Prefer real production callers; only fall back to test/smoke files when no
-        # production caller matches (prevents weak smoke assertions from diluting contracts).
-        named_pools: list[tuple[ScopePool, tuple[str, ...]]] = []
-        if prod_candidates:
-            named_pools.append(("production", prod_candidates))
+        # Prefer real production callers (cross-file first, then same-file); only fall back
+        # to test/smoke files when no production caller matches.
+        named_pools: list[tuple[ScopePool, tuple[str, ...], int]] = []
+        if prod_search_pool:
+            counted = len(prod_candidates) if unique_candidates else len(implicit_same_file)
+            named_pools.append(("production", prod_search_pool, counted))
         if test_candidates:
-            named_pools.append(("tests", test_candidates))
+            named_pools.append(("tests", test_candidates, len(test_candidates)))
         if not named_pools:
-            named_pools.append(("none", ()))
+            named_pools.append(("none", (), 0))
 
         searched_count = 0
-        for pool_name, pool in named_pools:
-            searched_count += len(pool)
+        for pool_name, pool, pool_counted in named_pools:
+            searched_count += pool_counted
             by_key: dict[tuple[str, int, str], CallerExcerpt] = {}
             for finder in self.finders:
                 supported_editable = [p for p in editable_tuple if finder.supports(p)]
@@ -1932,7 +2744,13 @@ class CompositeCallerFinder:
 
             if by_key:
                 ordered = sorted(
-                    by_key.values(), key=lambda item: (item.path, item.line, item.symbol)
+                    by_key.values(),
+                    key=lambda item: (
+                        1 if _norm_rel_path(item.path) in editable_norm else 0,
+                        item.path,
+                        item.line,
+                        item.symbol,
+                    ),
                 )
                 distinct_paths = tuple(dict.fromkeys(item.path for item in ordered))
                 allowed_paths = set(distinct_paths[:max_files])
@@ -1975,9 +2793,9 @@ class CompositeCallerFinder:
                 active_report.scope = CallerScope(
                     pool=pool_name,
                     editable=editable_tuple,
-                    candidates_total=len(unique_candidates),
+                    candidates_total=total_candidates,
                     candidates_searched=searched_count,
-                    production_candidates=len(prod_candidates),
+                    production_candidates=prod_candidate_count,
                     test_candidates=len(test_candidates),
                     omitted_test_candidates=omitted_tests,
                     matched_files=len(distinct_paths),
@@ -1994,7 +2812,7 @@ class CompositeCallerFinder:
 
         if prod_candidates and test_candidates:
             final_pool: ScopePool = "production+tests"
-        elif prod_candidates:
+        elif prod_candidates or implicit_same_file:
             final_pool = "production"
         elif test_candidates:
             final_pool = "tests"
@@ -2004,9 +2822,9 @@ class CompositeCallerFinder:
         active_report.scope = CallerScope(
             pool=final_pool,
             editable=editable_tuple,
-            candidates_total=len(unique_candidates),
+            candidates_total=total_candidates,
             candidates_searched=searched_count,
-            production_candidates=len(prod_candidates),
+            production_candidates=prod_candidate_count,
             test_candidates=len(test_candidates),
             omitted_test_candidates=0,
             matched_files=0,
