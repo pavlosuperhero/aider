@@ -1946,9 +1946,23 @@ def test_cymbal_vague_prompt_target_seeding_parity_and_c_decl_safety(tmp_path):
         },
         impact={"parse_payload": {"direct_callers": []}},
     )
-    py_vague = find_callers_with_backend(
+    # 1a. Generic/unrelated prompt with zero lexical or sub-token overlap attaches NO callers.
+    py_unrelated = find_callers_with_backend(
         tmp_path,
         "fix the bug",
+        ["api.py"],
+        ["consumer.py"],
+        backend=BACKEND_CYMBAL,
+        runner=py_runner,
+    )
+    assert py_unrelated.definitions == ()
+    assert py_unrelated.excerpts == ()
+    assert py_unrelated.status == "NO_EVIDENCE"
+
+    # 1b. Python vague prompt with domain sub-token overlap seeds target via Tier 2.
+    py_vague = find_callers_with_backend(
+        tmp_path,
+        "fix payload validation",
         ["api.py"],
         ["consumer.py"],
         backend=BACKEND_CYMBAL,
@@ -2210,9 +2224,23 @@ def test_cymbal_extracts_bash_targets_and_extensionless_shebang_scripts(tmp_path
         },
         impact={"bats_semaphore_release_wrapper": {"direct_callers": []}},
     )
+    # Zero-overlap prompt must not attach arbitrary callers (Precision Gate).
+    unrelated_sem = find_callers_with_backend(
+        tmp_path,
+        "unrelated task",
+        ["lib/bats-core/semaphore.bash"],
+        [],
+        backend=BACKEND_CYMBAL,
+        runner=sem_runner,
+    )
+    assert unrelated_sem.status == "NO_EVIDENCE"
+    assert unrelated_sem.definitions == ()
+    assert unrelated_sem.excerpts == ()
+
+    # End-to-end Cymbal lookup on .bash file under a vague domain prompt finds the sibling caller.
     sem_res = find_callers_with_backend(
         tmp_path,
-        "fix premature trap exit status expansion",
+        "fix semaphore release trap exit status",
         ["lib/bats-core/semaphore.bash"],
         [],
         backend=BACKEND_CYMBAL,
@@ -2258,8 +2286,8 @@ def test_cymbal_extracts_bash_targets_and_extensionless_shebang_scripts(tmp_path
     assert [e.path for e in rbenv_res.excerpts] == ["completions/rbenv.bash"]
     assert "unreadable or binary editable file omitted" not in rbenv_res.truncation
 
-    # Vague prompt on extensionless shebang script seeds both Bash definitions via Tier 3 fallback.
-    rbenv_vague = find_callers_with_backend(
+    # Zero-overlap prompt on extensionless shebang script must NOT attach arbitrary callers.
+    rbenv_unrelated = find_callers_with_backend(
         tmp_path,
         "fix auto detection",
         ["libexec/rbenv-init", "logo.png", "README.md", "README"],
@@ -2267,7 +2295,19 @@ def test_cymbal_extracts_bash_targets_and_extensionless_shebang_scripts(tmp_path
         backend=BACKEND_CYMBAL,
         runner=rbenv_runner,
     )
-    assert ("libexec/rbenv-init", "rbenv") in rbenv_vague.definitions
-    assert ("libexec/rbenv-init", "detect_shell") in rbenv_vague.definitions
-    assert [e.path for e in rbenv_vague.excerpts] == ["completions/rbenv.bash"]
-    assert "unreadable or binary editable file omitted" not in rbenv_vague.truncation
+    assert rbenv_unrelated.status == "NO_EVIDENCE"
+    assert rbenv_unrelated.definitions == ()
+    assert rbenv_unrelated.excerpts == ()
+    assert "unreadable or binary editable file omitted" not in rbenv_unrelated.truncation
+
+    # Sub-token prompt on extensionless shebang script selects only the matching Bash definition.
+    rbenv_subtoken = find_callers_with_backend(
+        tmp_path,
+        "fix shell profile handling",
+        ["libexec/rbenv-init", "logo.png", "README.md", "README"],
+        ["completions/rbenv.bash"],
+        backend=BACKEND_CYMBAL,
+        runner=rbenv_runner,
+    )
+    assert rbenv_subtoken.definitions == (("libexec/rbenv-init", "detect_shell"),)
+    assert "unreadable or binary editable file omitted" not in rbenv_subtoken.truncation

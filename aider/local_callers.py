@@ -424,24 +424,32 @@ def split_identifier_tokens(identifier: str) -> set[str]:
     return tokens
 
 
+_C_CPP_MACRO_NAME_RE = re.compile(r"^[A-Z][A-Z0-9]*_[A-Z0-9_]+$")
+
+
+def is_c_cpp_macro_name(name: str) -> bool:
+    """Return True for C/C++ ALL_CAPS_WITH_UNDERSCORE macro identifiers (e.g. ``FMT_ENABLE_IF``)."""
+    return bool(name and _C_CPP_MACRO_NAME_RE.match(name))
+
+
 def select_target_definitions(
     defined_symbols: Iterable[str],
     task_words: set[str],
     *,
     max_fallback: int = 6,
 ) -> tuple[set[str], str]:
-    """Select target definitions from an editable file using tiered lexical matching.
+    """Select target definitions from an editable file using precision-gated lexical matching.
 
     Preconditions:
         - ``defined_symbols`` contains candidate symbol names defined in editable files.
         - ``task_words`` contains identifier words extracted from the task prompt.
     Postconditions:
         - Returns ``(selected_symbols, tier)`` where ``tier`` is one of
-          ``"exact"``, ``"subtoken"``, ``"fallback"``, or ``"none"``.
+          ``"exact"``, ``"subtoken"``, or ``"none"``.
         - Tier 1 returns exact word matches if non-empty.
         - Tier 2 ranks by camelCase/snake_case sub-token overlap (bounded by ``max_fallback``).
-        - Tier 3 returns up to ``max_fallback`` deterministic exported (or non-test private)
-          definitions when Tier 1 and Tier 2 are both empty.
+        - When neither exact nor sub-token overlap exists, returns ``(set(), "none")`` rather
+          than attaching unrelated functions as noise.
     """
     all_defs = sorted({str(sym).strip() for sym in defined_symbols if str(sym).strip()})
     if not all_defs or not task_words or max_fallback <= 0:
@@ -465,11 +473,6 @@ def select_target_definitions(
             scored.sort()
             return {sym for _, sym in scored[:max_fallback]}, "subtoken"
 
-    non_test = [sym for sym in all_defs if not sym.startswith("test_")]
-    exported = [sym for sym in non_test if not sym.startswith("_")]
-    chosen = exported[:max_fallback] if exported else non_test[:max_fallback]
-    if chosen:
-        return set(chosen), "fallback"
     return set(), "none"
 
 
@@ -2103,6 +2106,8 @@ class TreeSitterCallerFinder:
                 name = match.group(1)
                 if name and name not in CONTROL_KEYWORDS:
                     defined.add(name)
+        if lang in ("c", "cpp"):
+            defined = {name for name in defined if not is_c_cpp_macro_name(name)}
         return defined
 
     def _extract_definition_spans(

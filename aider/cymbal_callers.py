@@ -45,6 +45,7 @@ from aider.local_callers import (
     TreeSitterCallerFinder,
     has_function_definition_declarator_ancestor,
     is_c_cpp_header,
+    is_c_cpp_macro_name,
     is_test_path,
     resolve_lang,
     select_target_definitions,
@@ -2490,7 +2491,11 @@ def _extract_c_cpp_targets(
         - In header files, definitions take precedence over prototypes and block-scoped
           ``extern`` declarations inside function bodies are excluded.
     """
-    found = _extract_c_cpp_ts_targets(path, source, words)
+    found = [
+        item
+        for item in _extract_c_cpp_ts_targets(path, source, words)
+        if not is_c_cpp_macro_name(item.symbol)
+    ]
     seen = {item.symbol for item in found}
     is_header = is_c_cpp_header(path)
 
@@ -2517,6 +2522,7 @@ def _extract_c_cpp_targets(
         term = match.group("term") or ""
         if (
             not name
+            or is_c_cpp_macro_name(name)
             or (words is not None and name not in words)
             or name in CONTROL_KEYWORDS
             or name in seen

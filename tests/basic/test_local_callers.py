@@ -29,11 +29,8 @@ def test_scoped_import_and_budget(tmp_path):
     assert related_callers(tmp_path, "fix parse", ["api.py"], candidates) == (
         "consumer.py:1\nfrom api import parse as p\nvalue = p(1) + 1"
     )
-    # Exact match takes strict precedence over sibling definitions, while a vague prompt
-    # on a single-definition module seeds that exported definition via bounded fallback.
-    assert related_callers(tmp_path, "fix parser", ["api.py"], candidates) == (
-        "consumer.py:1\nfrom api import parse as p\nvalue = p(1) + 1"
-    )
+    # Unrelated or non-overlapping prompt words must NOT attach arbitrary callers.
+    assert not related_callers(tmp_path, "fix parser", ["api.py"], candidates)
     (tmp_path / "api.py").write_text(
         "def parse(value): return value\ndef parser(value): return value\n"
     )
@@ -1097,27 +1094,76 @@ def test_select_target_definitions_tiers_stopwords_and_bounds():
     assert camel_syms == {"redisReaderGetReply"}
     assert tier == "subtoken"
 
-    # Tier 3: bounded exported fallback skips _private and test_* when exported definitions exist.
-    fb_syms, tier = select_target_definitions(
+    # Precision gate: zero exact and zero sub-token overlap returns (set(), "none")
+    # instead of grabbing arbitrary functions as noise.
+    assert select_target_definitions(
         ["_internal", "test_alpha", "zeta", "alpha", "beta", "gamma"],
-        {"Handle", "CRLF", "recovery"},
+        {"unrelated", "task"},
         max_fallback=2,
-    )
-    assert fb_syms == {"alpha", "beta"}
-    assert tier == "fallback"
-
-    # Tier 3 falls back to non-test private definitions only when all non-test definitions are private.
-    priv_syms, tier = select_target_definitions(
+    ) == (set(), "none")
+    assert select_target_definitions(
         ["_priv_b", "_priv_a", "test_priv"],
         {"Handle", "CRLF", "recovery"},
         max_fallback=1,
-    )
-    assert priv_syms == {"_priv_a"}
-    assert tier == "fallback"
+    ) == (set(), "none")
 
     # Empty definitions or empty task words return no targets.
     assert select_target_definitions([], {"fix", "parse"}) == (set(), "none")
     assert select_target_definitions(["parse"], set()) == (set(), "none")
+
+
+def test_phase2a1_precision_gate_unrelated_prompts_and_cpp_macros(tmp_path):
+    # 1. Unrelated task attaches ZERO callers (no arbitrary fallback noise).
+    (tmp_path / "service.py").write_text(
+        "def render_invoice(total):\n    return str(total)\n\n"
+        "def compute_tax(amount):\n    return amount * 0.2\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "caller.py").write_text(
+        "from service import render_invoice, compute_tax\n"
+        "x = render_invoice(compute_tax(100))\n",
+        encoding="utf-8",
+    )
+    unrelated = discover_related_callers(
+        tmp_path, "unrelated task", ["service.py"], ["caller.py"]
+    )
+    assert unrelated.status == "NO_EVIDENCE"
+    assert unrelated.excerpts == ()
+    assert unrelated.definitions == ()
+
+    # 2. Vague task with domain sub-token context finds only the matching target's caller.
+    vague_match = discover_related_callers(
+        tmp_path, "fix tax calculation rounding", ["service.py"], ["caller.py"]
+    )
+    assert vague_match.definitions == (("service.py", "compute_tax"),)
+    assert [e.path for e in vague_match.excerpts] == ["caller.py"]
+
+    # 3. C++ ALL_CAPS macros (e.g. FMT_ENABLE_IF) are filtered out and never produce macro noise.
+    (tmp_path / "printf.hpp").write_text(
+        "#define FMT_ENABLE_IF(...) enable_if_t<(__VA_ARGS__), int> = 0\n"
+        "template <typename T, FMT_ENABLE_IF(sizeof(T) > 0)>\n"
+        "int format_unsigned_sign(T v) { return (int)v; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "chrono.hpp").write_text(
+        "template <typename T, FMT_ENABLE_IF(sizeof(T) > 1)>\n"
+        "int chrono_helper(T v) { return (int)v; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.cpp").write_text(
+        '#include "printf.hpp"\n'
+        "int run(unsigned x) { return format_unsigned_sign(x); }\n",
+        encoding="utf-8",
+    )
+    cpp_res = discover_related_callers(
+        tmp_path,
+        "fix unsigned sign enable formatting",
+        ["printf.hpp"],
+        ["chrono.hpp", "consumer.cpp"],
+    )
+    assert all(sym != "FMT_ENABLE_IF" for _, sym in cpp_res.definitions)
+    assert ("printf.hpp", "format_unsigned_sign") in cpp_res.definitions
+    assert [e.path for e in cpp_res.excerpts] == ["consumer.cpp"]
 
 
 def test_same_file_callers_across_python_c_cpp_js_ts_rust_with_precision_guards(tmp_path):
@@ -1269,7 +1315,8 @@ def test_vague_prompt_seeding_finds_callers_and_extern_only_c_stays_empty(tmp_pa
     assert [e.path for e in sub_res.excerpts] == ["yajl_parser.c"]
     assert sub_res.evidence[0].symbol == "yajl_parse_integer"
 
-    # Fallback tier: vague prompt with zero sub-token overlap seeds exported Python function.
+    # Precision gate: zero sub-token overlap must NOT seed arbitrary functions, while
+    # meaningful sub-token overlap ("frame") still seeds decode_frame cleanly.
     (tmp_path / "protocol.py").write_text(
         "def _private_helper(buf):\n"
         "    return buf\n\n"
@@ -1283,15 +1330,25 @@ def test_vague_prompt_seeding_finds_callers_and_extern_only_c_stays_empty(tmp_pa
         "    return decode_frame(buf)\n",
         encoding="utf-8",
     )
-    fb_res = discover_related_callers(
+    unrelated_res = discover_related_callers(
         tmp_path,
         "Handle CRLF recovery in parser",
         ["protocol.py"],
         ["client.py"],
     )
-    assert fb_res.definitions == (("protocol.py", "decode_frame"),)
-    assert [e.path for e in fb_res.excerpts] == ["client.py"]
-    assert fb_res.evidence[0].symbol == "decode_frame"
+    assert unrelated_res.status == "NO_EVIDENCE"
+    assert unrelated_res.definitions == ()
+    assert unrelated_res.excerpts == ()
+
+    subtoken_py_res = discover_related_callers(
+        tmp_path,
+        "Handle frame CRLF recovery",
+        ["protocol.py"],
+        ["client.py"],
+    )
+    assert subtoken_py_res.definitions == (("protocol.py", "decode_frame"),)
+    assert [e.path for e in subtoken_py_res.excerpts] == ["client.py"]
+    assert subtoken_py_res.evidence[0].symbol == "decode_frame"
 
     # Negative guard: extern-only .c file still yields definitions == () and NO_EVIDENCE.
     (tmp_path / "extern_only.c").write_text(
