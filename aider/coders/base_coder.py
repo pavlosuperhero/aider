@@ -449,6 +449,7 @@ class Coder:
         self._last_caller_result = None
         self._local_caller_task = ""
         self._audit_originals = {}
+        self._last_audited_diff = None
         self._unreviewed_paths = {}
         self.local_callers_audit = local_callers_audit
         self.oracle_provider = oracle_provider
@@ -470,9 +471,7 @@ class Coder:
         if self.local_caller_contract_hook.enabled:
             self.response_hooks += (self.local_caller_contract_hook,)
         if self.local_callers and (
-            self.local_callers_audit
-            or self.local_callers_mode == "contract"
-            or self.local_callers_read_range
+            self.local_callers_audit or self.local_callers_mode == "contract"
         ):
             self.max_reflections = max(self.max_reflections, 4)
         self.local_caller_auditor = (
@@ -1698,6 +1697,7 @@ class Coder:
         self.dry_run_edited = False
         self._unreviewed_paths.update(self._audit_originals)
         self._audit_originals.clear()
+        self._last_audited_diff = None
         self.reflected_message = None
         self.num_reflections = 0
         self.lint_outcome = None
@@ -2568,7 +2568,13 @@ class Coder:
                 if auditing:
                     self.io.tool_warning("Tests failed. Edits remain uncommitted.")
 
-        if auditing and edited and not test_errors and not self.dry_run:
+        if (
+            auditing
+            and (edited or self._audit_originals)
+            and not test_errors
+            and self.test_outcome is not False
+            and not self.dry_run
+        ):
             self._finish_local_caller_audit()
 
     def _share_shell_output(self):
@@ -2583,9 +2589,12 @@ class Coder:
         try:
             self._sync_local_caller_supplementary_evidence()
             patch = self._get_local_caller_audit_diff()
+            if self._last_audited_diff is not None and patch == self._last_audited_diff:
+                return
             verdict = self.local_caller_auditor.audit(
                 patch, task=self._local_caller_task, io=self.io
             )
+            self._last_audited_diff = patch
             if verdict.status == "UNKNOWN" and verdict.raw_response:
                 if self.verbose or os.getenv("AIDER_TRIAL_USAGE"):
                     self.io.tool_output(f"Audit response tail: {verdict.raw_response[-200:]!r}")
@@ -2605,6 +2614,7 @@ class Coder:
             return
         saved_message = self.auto_commit(set(self._audit_originals))
         self._audit_originals.clear()
+        self._last_audited_diff = None
         if not saved_message:
             saved_message = getattr(self.gpt_prompts, "files_content_gpt_edits_no_repo", None)
         self.move_back_cur_messages(saved_message)
@@ -3337,7 +3347,13 @@ class Coder:
             if self.edit_hooks and self.handle_edit_hooks(edits, shell_commands_before):
                 return edited
             contract = self.local_caller_contract_hook
-            if edits and contract.enabled and not contract.format_present and not contract.advisory:
+            if (
+                edits
+                and contract.enabled
+                and contract.has_evidence
+                and not contract.format_present
+                and not contract.advisory
+            ):
                 contract.blocked = True
                 self.io.tool_warning(
                     "Local caller contract check: UNKNOWN (unverified edit format)"

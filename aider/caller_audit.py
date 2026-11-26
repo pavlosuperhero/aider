@@ -31,29 +31,45 @@ summary, the caller snippets, optional supplementary evidence, and the proposed 
 diff (with no prior conversation history).
 
 Evaluate strictly whether the proposed diff satisfies every caller's \
-contract. Do NOT assume any previous buggy behavior should be preserved; judge \
-only against the task and the callers. Supplementary evidence (such as project \
-facts or read-range excerpts) is auxiliary context only and NEVER substitutes \
-for missing or incomplete caller snippets.
+contract. Judge only against the task and the attached caller snippets; \
+supplementary evidence (such as project facts or read-range excerpts) is \
+auxiliary context only and never replaces missing or incomplete caller snippets.
+
+Evidence sufficiency rule (calibration):
+- Emit `VERDICT: PASS` ONLY when the attached caller excerpts directly show \
+the relevant arguments and how the caller inspects or consumes the return \
+value, side effect, or error condition affected by the diff, and your trace \
+verifies every observed caller expectation.
+- `VERDICT: UNKNOWN: <reason>` is REQUIRED whenever the attached caller \
+excerpts do not inspect the return value, error condition, or relevant \
+arguments of the changed symbol (for example, a bare call with no arguments, \
+a header declaration/prototype only, or a call site that omits how the changed \
+behavior is consumed). Abstain with `VERDICT: UNKNOWN` instead of guessing \
+unshown caller behavior to emit `PASS`.
 
 Complete these 4 steps in order:
 1. CALLER_EXPECTS: Quote each caller line and state the exact semantic role of \
 every variable assigned or unpacked from the call, plus how downstream lines use \
-it (element order, types, units, prefixes/formatting, and null/sentinel checks).
+it (element order, types, units, prefixes/formatting, and null/sentinel/error \
+checks). Explicitly note whether the snippet actually observes the return \
+value, error condition, or relevant arguments touched by the diff.
 2. TRACE_REALISTIC: Pick 1 realistic, standard-format, asymmetric input matching \
-the task and parameter names (never use symmetric placeholders like 'A B' or \
+the task and parameter names (avoid symmetric placeholders like 'A B' or \
 [1, 1]) and 1 edge case. Trace the EXACT changed behavior in the proposed diff \
-line by line to compute its literal return value, then substitute that return \
-value into the caller's exact variable names AND evaluate the caller's final \
-output expression.
+line by line to compute its literal return value and error/side-effect state, \
+then substitute that result into the caller's exact variable names AND evaluate \
+the caller's final output expression.
 3. MISMATCH_CHECK: Verify that every variable bound in the caller actually holds \
 what its variable name and downstream expression require (e.g., unpacked items \
 are not swapped, numeric values use the caller's expected unit, types and \
-null/sentinel checks match, and the caller's final output is valid).
+null/sentinel/error checks match, and the caller's final output is valid). If \
+the snippet does not observe the affected return value, error condition, or \
+relevant arguments, record that evidence is insufficient for PASS.
 4. Output your verdict on a separate final line in plain text, without numbering or Markdown.
-For a verified match output:
+For a verified match where the caller snippet directly observes the changed behavior output:
 VERDICT: PASS
-If evidence is insufficient output:
+Whenever evidence is insufficient or the caller snippet does not inspect the \
+affected return value, error condition, or relevant arguments output:
 VERDICT: UNKNOWN: <reason>
 ONLY if you proved a concrete input where a caller variable or caller result \
 is wrong output:
@@ -372,6 +388,10 @@ class CallerContractHook:
         return self._supplementary_evidence
 
     @property
+    def has_evidence(self) -> bool:
+        return bool(self._excerpts)
+
+    @property
     def attached_paths(self) -> frozenset[str]:
         return frozenset(
             path
@@ -397,14 +417,12 @@ class CallerContractHook:
         ) or re.search(r"```", content)
         if not edit_marker:
             return None
-        # Supplementary evidence (facts/read-ranges) NEVER satisfies missing caller evidence.
+        # Without caller excerpts (NO_EVIDENCE), pass through so valid edits are not discarded.
+        # Supplementary evidence (facts/read-ranges) still never satisfies caller checks.
         if not self._excerpts:
             if io:
-                io.tool_output("Local caller contract check: NO_EVIDENCE")
-            if self.advisory:
-                return None
-            self.blocked = True
-            return ResponseHookResult()
+                io.tool_output("Local caller contract check: NO_EVIDENCE (pass-through)")
+            return None
 
         pre_edit = content[: edit_marker.start()]
         contract = _CONTRACT_RE.search(pre_edit)
