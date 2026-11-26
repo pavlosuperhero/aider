@@ -984,3 +984,68 @@ def test_reflection_without_new_edits_runs_audit_once_without_double_auditing(pr
     assert len(fail_audit_calls) == 1
     assert repo.head.commit == fail_head
     assert repo.is_dirty()
+
+
+def test_empty_excerpt_incomplete_reported_as_incomplete_not_no_evidence(project):
+    # 1. Direct unit checks for CallerContractHook and IsolatedCallerAuditor.
+    io = Mock()
+    hook = CallerContractHook(enabled=True, max_rejections=2)
+    hook.begin_turn((), caller_evidence_status="INCOMPLETE")
+    assert hook(EDIT_BLOCK, io=io) is None
+    assert hook.blocked is False
+    io.tool_output.assert_called_once_with(
+        "Local caller contract check: INCOMPLETE (no excerpts; pass-through)"
+    )
+
+    audit_io = Mock()
+    complete_fn = Mock(return_value="VERDICT: PASS")
+    auditor = IsolatedCallerAuditor(complete_fn)
+    auditor.begin_turn((), caller_evidence_status="INCOMPLETE")
+    verdict = auditor.audit("+    return '10.50'", io=audit_io)
+    assert verdict == AuditVerdict(
+        "UNKNOWN", "INCOMPLETE: caller evidence incomplete (no excerpts)"
+    )
+    complete_fn.assert_not_called()
+    audit_io.tool_output.assert_called_once_with(
+        "Local caller audit: UNKNOWN - INCOMPLETE: caller evidence incomplete (no excerpts)"
+    )
+
+    # 2. End-to-end Coder turn with an oversized candidate file (empty excerpts + INCOMPLETE):
+    # contract hook and auditor must report INCOMPLETE, never NO_EVIDENCE.
+    repo = git.Repo(project)
+    padding = "\n".join(f"# pad {i:04d} " + ("x" * 64) for i in range(2200))
+    (project / "pkg" / "consumer.py").write_text(
+        f"from pricing import format_price\n{padding}\nraw = format_price(1050)\n",
+        encoding="utf-8",
+    )
+    repo.index.add(["pkg/consumer.py"])
+    repo.index.commit("make consumer oversized")
+
+    coder = make_coder(
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_audit=True,
+    )
+    outputs = []
+    coder.io.tool_output = lambda *a, **kw: outputs.append(" ".join(str(x) for x in a))
+    audit_complete = Mock(return_value="VERDICT: PASS")
+    coder.local_caller_auditor._complete_fn = audit_complete
+    fake_send(coder, [EDIT_BLOCK])
+
+    coder.run("update format_price")
+
+    assert coder._last_caller_result is not None
+    assert coder._last_caller_result.status == "INCOMPLETE"
+    assert coder._last_caller_result.excerpts == ()
+    assert any(
+        "Local caller contract check: INCOMPLETE (no excerpts; pass-through)" in line
+        for line in outputs
+    )
+    assert not any("Local caller contract check: NO_EVIDENCE" in line for line in outputs)
+    assert any(
+        "Local caller audit: UNKNOWN - INCOMPLETE: caller evidence incomplete (no excerpts)"
+        in line
+        for line in outputs
+    )
+    assert not any("Local caller audit: UNKNOWN - NO_EVIDENCE" in line for line in outputs)
+    audit_complete.assert_not_called()

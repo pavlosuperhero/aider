@@ -898,3 +898,126 @@ def test_large_file_skip_marks_report_incomplete_even_with_test_fallback(tmp_pat
     assert js_res.scope.skipped_large == 1
     assert [e.path for e in js_res.excerpts] == ["valid.mjs"]
     assert js_res.excerpts[0].incomplete is True
+
+
+def test_builtin_c_cpp_non_header_skips_unbacked_declarations_while_headers_keep_them(tmp_path):
+    from aider.local_callers import TreeSitterCallerFinder
+
+    finder = TreeSitterCallerFinder()
+    c_src = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+        "int *ptr_func(int x) { return 0; }\n"
+        "int real_func(int x) {\n"
+        "    extern int block_extern(int y);\n"
+        "    return block_extern(x);\n"
+        "}\n"
+    )
+    cpp_src = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+        "class Engine {\n"
+        "public:\n"
+        "    int unbacked_method(int x);\n"
+        "    int inline_method(int x) {\n"
+        "        extern int block_extern(int y);\n"
+        "        return block_extern(x);\n"
+        "    }\n"
+        "};\n"
+        "int *ptr_func(int x) { return nullptr; }\n"
+        "int Engine::out_of_line(int x) { return x; }\n"
+    )
+    h_src = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+    )
+    hpp_src = (
+        "extern int parse_value(int input);\n"
+        "class Engine {\n"
+        "public:\n"
+        "    int decl_method(int x);\n"
+        "    int inline_method(int x) {\n"
+        "        extern int block_extern(int y);\n"
+        "        return block_extern(x);\n"
+        "    }\n"
+        "};\n"
+    )
+
+    c_defs = finder._extract_definitions("mod.c", c_src)
+    assert "ptr_func" in c_defs
+    assert "real_func" in c_defs
+    assert "parse_value" not in c_defs
+    assert "helper" not in c_defs
+    assert "block_extern" not in c_defs
+
+    cpp_defs = finder._extract_definitions("mod.cpp", cpp_src)
+    assert {"inline_method", "ptr_func", "out_of_line"}.issubset(cpp_defs)
+    assert "parse_value" not in cpp_defs
+    assert "helper" not in cpp_defs
+    assert "unbacked_method" not in cpp_defs
+    assert "block_extern" not in cpp_defs
+
+    h_defs = finder._extract_definitions("api.h", h_src)
+    assert {"parse_value", "helper"}.issubset(h_defs)
+
+    hpp_defs = finder._extract_definitions("api.hpp", hpp_src)
+    assert {"parse_value", "decl_method", "inline_method"}.issubset(hpp_defs)
+    assert "block_extern" not in hpp_defs
+
+    # End-to-end: editable .c with only unbacked extern declaration does NOT produce false matches.
+    (tmp_path / "mod.c").write_text("extern int parse_value(int input);\n", encoding="utf-8")
+    (tmp_path / "consumer.c").write_text(
+        "int run(int x) { return parse_value(x); }\n", encoding="utf-8"
+    )
+    res = discover_related_callers(tmp_path, "fix parse_value", ["mod.c"], ["consumer.c"])
+    assert res.status == "NO_EVIDENCE"
+    assert res.definitions == ()
+    assert res.excerpts == ()
+
+
+def test_oversized_editable_file_marks_builtin_result_incomplete(tmp_path):
+    padding = "\n".join(f"# pad {i:04d} " + ("x" * 64) for i in range(2200))
+    (tmp_path / "big_api.py").write_text(
+        f"{padding}\ndef normalize_code(raw):\n    return raw.strip()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.py").write_text(
+        "from big_api import normalize_code\nval = normalize_code('a')\n",
+        encoding="utf-8",
+    )
+    py_report = CallerEvidenceReport()
+    py_res = discover_related_callers(
+        tmp_path,
+        "fix normalize_code",
+        ["big_api.py"],
+        ["consumer.py"],
+        report=py_report,
+    )
+    assert py_res.status == "INCOMPLETE"
+    assert py_res.excerpts == ()
+    assert py_report.skipped_large == 1
+    assert py_res.scope.skipped_large == 1
+    assert any("128 KiB" in note for note in py_res.truncation)
+
+    cpp_padding = "\n".join(f"// pad {i:04d} " + ("y" * 64) for i in range(2200))
+    (tmp_path / "big_api.cpp").write_text(
+        f"{cpp_padding}\nint parse_value(int x) {{ return x + 1; }}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.cpp").write_text(
+        "int handle(int v) { return parse_value(v); }\n",
+        encoding="utf-8",
+    )
+    cpp_report = CallerEvidenceReport()
+    cpp_res = discover_related_callers(
+        tmp_path,
+        "fix parse_value",
+        ["big_api.cpp"],
+        ["consumer.cpp"],
+        report=cpp_report,
+    )
+    assert cpp_res.status == "INCOMPLETE"
+    assert cpp_res.excerpts == ()
+    assert cpp_report.skipped_large == 1
+    assert cpp_res.scope.skipped_large == 1
+    assert any("128 KiB" in note for note in cpp_res.truncation)

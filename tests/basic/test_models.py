@@ -660,6 +660,78 @@ class TestModels(unittest.TestCase):
                 self.assertEqual(model.editor_model.name, editor_name)
                 self.assertIn("reasoning_effort", model.accepts_settings)
 
+    @patch("aider.models.litellm.completion")
+    @patch("httpx.Client.send", side_effect=AssertionError("Unexpected network request"))
+    def test_lm_studio_qwen36_temperature_and_effective_params(self, mock_send, mock_completion):
+        from litellm.utils import get_optional_params
+
+        model = Model.from_settings_only("lm_studio/qwen/qwen3.6-35b-a3b")
+        self.assertEqual(model.use_temperature, 0.6)
+        self.assertEqual(model.extra_params["max_tokens"], 32768)
+        self.assertNotIn("thinking_tokens", model.accepts_settings)
+
+        params = model.effective_completion_params()
+        self.assertEqual(params["model"], "lm_studio/qwen/qwen3.6-35b-a3b")
+        self.assertEqual(params["temperature"], 0.6)
+        self.assertEqual(params["max_tokens"], 32768)
+        self.assertIsNone(params["thinking_tokens"])
+        self.assertIsNone(params["reasoning_effort"])
+        self.assertEqual(params["provider"], "lm_studio")
+        self.assertEqual(params["dropped_params"], [])
+
+        messages = [{"role": "user", "content": "Hello"}]
+        model.send_completion(messages, functions=None, stream=False)
+        mock_completion.assert_called_once_with(
+            model="lm_studio/qwen/qwen3.6-35b-a3b",
+            messages=messages,
+            stream=False,
+            temperature=0.6,
+            max_tokens=32768,
+            timeout=600,
+        )
+
+        # Even if thinking_tokens is forced, LiteLLM's lm_studio config drops 'thinking'
+        forced = Model.from_settings_only("lm_studio/qwen/qwen3.6-35b-a3b")
+        forced.set_thinking_tokens("4096")
+        forced_params = forced.effective_completion_params()
+        self.assertIn("thinking", forced_params["dropped_params"])
+        optional_params = get_optional_params(
+            model="qwen/qwen3.6-35b-a3b",
+            custom_llm_provider="lm_studio",
+            drop_params=True,
+            **forced.extra_params,
+        )
+        self.assertNotIn("thinking", optional_params)
+        self.assertEqual(optional_params["max_tokens"], 32768)
+        mock_send.assert_not_called()
+
+    @patch("httpx.Client.send", side_effect=AssertionError("Unexpected network request"))
+    def test_effective_completion_params_anthropic_thinking_and_isolation(self, mock_send):
+        from litellm.utils import get_optional_params
+
+        model = Model.from_settings_only("claude-3-7-sonnet-20250219")
+        self.assertIn("thinking_tokens", model.accepts_settings)
+        model.set_thinking_tokens("4096")
+        params = model.effective_completion_params()
+        self.assertEqual(params["provider"], "anthropic")
+        self.assertEqual(params["thinking_tokens"], 4096)
+        self.assertIsNone(params["temperature"])
+        self.assertEqual(params["dropped_params"], [])
+
+        optional_params = get_optional_params(
+            model="claude-3-7-sonnet-20250219",
+            custom_llm_provider="anthropic",
+            drop_params=True,
+            **model.extra_params,
+        )
+        self.assertEqual(optional_params["thinking"], {"type": "enabled", "budget_tokens": 4096})
+
+        # Ensure setting extra_params on one instance does not leak into MODEL_SETTINGS
+        fresh = Model.from_settings_only("claude-3-7-sonnet-20250219")
+        self.assertIsNone(fresh.get_raw_thinking_tokens())
+        self.assertNotIn("thinking", fresh.extra_params or {})
+        mock_send.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

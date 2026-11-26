@@ -1870,6 +1870,8 @@ def _build_error_row(
         "completion_tokens": None,
         "calls_by_role": {},
         "tokens_by_role": {},
+        "effective_model_params": None,
+        "ignored_settings": [],
         "patch_hidden_passed": False,
         "strict_accepted": False,
         "passed": False,
@@ -1914,10 +1916,24 @@ def main(argv: list[str] | None = None):
     random.Random(args.seed).shuffle(jobs)
     if not jobs:
         parser.error("select at least one trial attempt")
+    model_contract: dict | None = None
+    if args.thinking_tokens is not None:
+        model_contract = run.inspect_model_request_contract(
+            args.model, thinking_tokens=args.thinking_tokens
+        )
+        if not model_contract["thinking_tokens_supported"]:
+            parser.error(
+                model_contract["unsupported_reason"]
+                or f"--thinking-tokens is not supported for model {args.model!r}"
+            )
     if args.plan:
         print(json.dumps({"suite": args.suite, "cases": len(selected_cases), "attempts": len(jobs)}))
         return
 
+    if model_contract is None:
+        model_contract = run.inspect_model_request_contract(
+            args.model, thinking_tokens=args.thinking_tokens
+        )
     run_meta = run.collect_run_metadata(
         model=args.model,
         suite=args.suite,
@@ -1930,6 +1946,7 @@ def main(argv: list[str] | None = None):
         auto_lint=args.auto_lint,
         pythonhashseed=run.DEFAULT_PYTHONHASHSEED,
         thinking_tokens=args.thinking_tokens,
+        model_contract=model_contract,
         controls={
             "backends": [b for b in dict.fromkeys(b for b, _, _ in control_grid)],
             "read_ranges": [rr for rr in dict.fromkeys(rr for _, rr, _ in control_grid)],
@@ -1941,6 +1958,8 @@ def main(argv: list[str] | None = None):
             "auto_lint": args.auto_lint,
             "pythonhashseed": run.DEFAULT_PYTHONHASHSEED,
             "thinking_tokens": args.thinking_tokens,
+            "requested_thinking_tokens": model_contract["requested_thinking_tokens"],
+            "effective_model_params": model_contract["effective_params"],
         },
     )
     if args.checkpoint:

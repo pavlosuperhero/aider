@@ -1160,6 +1160,21 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                     " setting."
                 )
 
+    if os.getenv("AIDER_TRIAL_USAGE"):
+        trial_params_line = (
+            "Trial model params: "
+            + json.dumps(main_model.effective_completion_params(), sort_keys=True)
+        )
+        console = getattr(io, "console", None)
+        prev_soft_wrap = getattr(console, "soft_wrap", None)
+        if prev_soft_wrap is not None:
+            console.soft_wrap = True
+        try:
+            io.tool_output(trial_params_line)
+        finally:
+            if prev_soft_wrap is not None:
+                console.soft_wrap = prev_soft_wrap
+
     if args.copy_paste and args.edit_format is None:
         if main_model.edit_format in ("diff", "whole", "diff-fenced"):
             main_model.edit_format = "editor-" + main_model.edit_format

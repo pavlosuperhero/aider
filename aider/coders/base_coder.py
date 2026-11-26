@@ -136,6 +136,7 @@ class Coder:
     local_callers_mode = "passive"
     local_callers_hint = None
     _local_caller_excerpts = ()
+    _local_caller_evidence_status = None
     _local_caller_task = ""
     _turn_supplementary_evidence = ()
     _turn_facts_context = ""
@@ -446,6 +447,7 @@ class Coder:
         self.read_only_ranges = list(read_only_ranges or ())
         self._local_caller_excerpts = ()
         self._local_caller_search_error = False
+        self._local_caller_evidence_status = None
         self._turn_supplementary_evidence = ()
         self._turn_facts_context = ""
         self._turn_auto_ranges = ()
@@ -1476,12 +1478,19 @@ class Coder:
             self.local_caller_auditor.set_supplementary_evidence(combined)
 
     def _reset_local_caller_state(
-        self, excerpts, task="", supplementary_evidence=(), *, search_error=False
+        self,
+        excerpts,
+        task="",
+        supplementary_evidence=(),
+        *,
+        search_error=False,
+        caller_evidence_status=None,
     ):
         from aider.caller_audit import normalize_supplementary_evidence
 
         self._local_caller_excerpts = tuple(excerpts or ())
         self._local_caller_search_error = search_error
+        self._local_caller_evidence_status = caller_evidence_status
         self._local_caller_task = task or ""
         self._turn_supplementary_evidence = normalize_supplementary_evidence(
             supplementary_evidence
@@ -1490,12 +1499,14 @@ class Coder:
             self._local_caller_excerpts,
             supplementary_evidence=self._turn_supplementary_evidence,
             search_error=search_error,
+            caller_evidence_status=caller_evidence_status,
         )
         if self.local_caller_auditor is not None:
             self.local_caller_auditor.begin_turn(
                 self._local_caller_excerpts,
                 supplementary_evidence=self._turn_supplementary_evidence,
                 search_error=search_error,
+                caller_evidence_status=caller_evidence_status,
             )
 
     def handoff_local_caller_turn_state(self, target_coder) -> str:
@@ -1516,6 +1527,7 @@ class Coder:
             task=task,
             supplementary_evidence=supplementary,
             search_error=self._local_caller_search_error,
+            caller_evidence_status=self._local_caller_evidence_status,
         )
         target_coder._preserve_local_caller_state = True
 
@@ -1675,11 +1687,15 @@ class Coder:
             )
             self._turn_auto_ranges = tuple(auto_ranges)
             supplementary = supplementary + auto_ranges
+            evidence_status = (
+                getattr(self._last_caller_result, "status", None) if not search_error else None
+            )
             self._reset_local_caller_state(
                 excerpts,
                 task=task,
                 supplementary_evidence=supplementary,
                 search_error=search_error,
+                caller_evidence_status=evidence_status,
             )
             self.io.tool_output("Local caller evidence: " + description)
             if excerpts:

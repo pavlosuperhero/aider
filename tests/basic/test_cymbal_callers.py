@@ -13,6 +13,7 @@ from aider.cymbal_callers import (
     BACKEND_BUILTIN,
     BACKEND_CYMBAL,
     PINNED_CYMBAL_VERSION,
+    BoundedWindow,
     CallerEvidenceItem,
     CallerLookupResult,
     CommandResult,
@@ -440,13 +441,21 @@ def test_robust_path_normalization_and_large_file_bounded_window(tmp_path):
     assert big_file.stat().st_size > 131_072
 
     win = read_bounded_window(project, "big.py", 2500, context_lines=1, max_chars=700)
-    assert win is not None
-    start_line, snippet, center_text, exists, truncated = win
-    assert exists is True
-    assert truncated is False
-    assert start_line == 2499
-    assert center_text == "result = parse(payload)"
-    assert "result = parse(payload)" in snippet
+    assert isinstance(win, BoundedWindow)
+    assert win.line_exists is True
+    assert win.truncated is False
+    assert win.hit_scan_cap is False
+    assert win.start_line == 2499
+    assert win.call_line_text == "result = parse(payload)"
+    assert "result = parse(payload)" in win.text
+
+    # Reading past max_scan_bytes preserves hit_scan_cap=True instead of looking like EOF.
+    capped = read_bounded_window(
+        project, "big.py", 2500, context_lines=1, max_chars=700, max_scan_bytes=1024
+    )
+    assert isinstance(capped, BoundedWindow)
+    assert capped.line_exists is False
+    assert capped.hit_scan_cap is True
 
 
 def test_conservative_stale_alias_and_duplicate_ambiguity(tmp_path):
@@ -502,7 +511,8 @@ def test_conservative_stale_alias_and_duplicate_ambiguity(tmp_path):
     # Uses fresh disk text rather than stale Cymbal snippet.
     assert "return p(v)" in result.excerpts[0].code
 
-    # 2. Out-of-range line past EOF on disk records stale index and does not fabricate code.
+    # 2. Out-of-range line past EOF on disk records stale index, does not fabricate code,
+    # and reports INCOMPLETE (not NO_EVIDENCE) because a reported caller could not be inspected.
     runner_eof = FakeCymbalRunner(
         refs={
             "parse": {
@@ -521,7 +531,7 @@ def test_conservative_stale_alias_and_duplicate_ambiguity(tmp_path):
         backend=BACKEND_CYMBAL,
         runner=runner_eof,
     )
-    assert eof_result.status == "NO_EVIDENCE"
+    assert eof_result.status == "INCOMPLETE"
     assert eof_result.excerpts == ()
     assert "stale index" in eof_result.ambiguity
     assert any("out-of-range" in d for d in eof_result.diagnostics)
@@ -1385,3 +1395,295 @@ def test_builtin_backend_large_file_skip_marks_lookup_result_incomplete(tmp_path
     assert [e.path for e in res.excerpts] == ["test_smoke.py"]
     assert res.excerpts[0].incomplete is True
     assert any("128 KiB" in note for note in res.truncation)
+
+
+def test_cymbal_scan_cap_candidate_is_incomplete_not_stale_or_128kib(tmp_path):
+    (tmp_path / "parser.cpp").write_text(
+        "int parse_value(int input) {\n    return input + 1;\n}\n",
+        encoding="utf-8",
+    )
+    padding_lines = [f"// padding {i:04d} " + ("x" * 64) for i in range(60)]
+    call_line = len(padding_lines) + 2
+    (tmp_path / "consumer.cpp").write_text(
+        "\n".join(padding_lines)
+        + "\nint handle(int v) {\n    return parse_value(v);\n}\n",
+        encoding="utf-8",
+    )
+
+    runner = FakeCymbalRunner(
+        refs={
+            "parse_value": {
+                "definitions": [{"file": "parser.cpp", "line": 1, "name": "parse_value"}],
+                "references": [
+                    {
+                        "file": "consumer.cpp",
+                        "line": call_line,
+                        "kind": "call",
+                        "snippet": "    return parse_value(v);",
+                    }
+                ],
+            }
+        },
+        impact={"parse_value": {"direct_callers": []}},
+        changed={"changed": [], "stale": False},
+        show={
+            f"consumer.cpp:{call_line}": {
+                "file": "consumer.cpp",
+                "start_line": call_line,
+                "end_line": call_line,
+                "lines": [{"line": call_line, "content": "    return parse_value(v);"}],
+            }
+        },
+    )
+    cfg = CymbalConfig(enforce_pinned_version=False, max_scan_bytes=2048)
+    report = CymbalEvidenceReport()
+    res = find_callers_with_backend(
+        tmp_path,
+        "fix parse_value",
+        ["parser.cpp"],
+        ["consumer.cpp"],
+        backend=BACKEND_CYMBAL,
+        cymbal_config=cfg,
+        runner=runner,
+        report=report,
+    )
+    assert res.status == "INCOMPLETE"
+    assert res.status != "NO_EVIDENCE"
+    assert res.excerpts == ()
+    assert report.skipped_large == 1
+    assert "stale index" not in res.ambiguity
+    assert any("scan limit (>2 KiB)" in note for note in res.truncation)
+    assert not any("128 KiB" in note for note in res.truncation)
+
+    # CymbalClient.show hitting max_scan_bytes marks truncated, NOT stale index.
+    client = CymbalClient(cfg, runner=runner)
+    show_res = client.show(tmp_path, f"consumer.cpp:{call_line}", verify_disk=True)
+    assert show_res.truncated is True
+    assert show_res.stale is False
+    assert len(show_res.slices) == 1
+    assert show_res.slices[0].truncated is True
+    assert show_res.slices[0].stale is False
+    assert "stale index" not in show_res.slices[0].ambiguity
+    assert any("scan limit (>2 KiB)" in d for d in show_res.diagnostics)
+
+
+def test_cymbal_binary_unreadable_candidate_and_oversized_editable_are_incomplete(tmp_path):
+    (tmp_path / "api.py").write_text("def parse_value(x):\n    return x\n", encoding="utf-8")
+    (tmp_path / "binary_caller.py").write_bytes(b"from api import parse_value\n\x00parse_value(1)\n")
+
+    runner = FakeCymbalRunner(
+        refs={
+            "parse_value": {
+                "definitions": [{"file": "api.py", "line": 1, "name": "parse_value"}],
+                "references": [{"file": "binary_caller.py", "line": 2, "kind": "call"}],
+            }
+        },
+        impact={"parse_value": {"direct_callers": []}},
+        changed={"changed": [], "stale": False},
+    )
+    res_bin = find_callers_with_backend(
+        tmp_path,
+        "fix parse_value",
+        ["api.py"],
+        ["binary_caller.py"],
+        backend=BACKEND_CYMBAL,
+        runner=runner,
+    )
+    assert res_bin.status == "INCOMPLETE"
+    assert res_bin.excerpts == ()
+    assert "unreadable or binary candidate file omitted" in res_bin.truncation
+    assert any("unreadable or binary caller" in d for d in res_bin.diagnostics)
+
+    # Oversized editable source file (> max_scan_bytes) yields INCOMPLETE, not NO_EVIDENCE.
+    big_editable = tmp_path / "big_api.cpp"
+    big_editable.write_text(
+        ("// pad " + ("a" * 80) + "\n") * 50 + "int parse_value(int x) { return x; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.cpp").write_text("int run() { return parse_value(1); }\n", encoding="utf-8")
+    cfg = CymbalConfig(enforce_pinned_version=False, max_scan_bytes=1024)
+    ed_report = CymbalEvidenceReport()
+    res_big_ed = find_callers_with_backend(
+        tmp_path,
+        "fix parse_value",
+        ["big_api.cpp"],
+        ["consumer.cpp"],
+        backend=BACKEND_CYMBAL,
+        cymbal_config=cfg,
+        runner=FakeCymbalRunner(),
+        report=ed_report,
+    )
+    assert res_big_ed.status == "INCOMPLETE"
+    assert res_big_ed.excerpts == ()
+    assert ed_report.skipped_large == 1
+    assert any("editable file exceeded scan limit (>1 KiB)" in note for note in res_big_ed.truncation)
+    assert not any("128 KiB" in note for note in res_big_ed.truncation)
+
+    # Binary editable code file yields INCOMPLETE, whereas binary non-code asset does not.
+    (tmp_path / "broken_api.py").write_bytes(b"def parse_value(x):\n\x00return x\n")
+    res_bin_ed = find_callers_with_backend(
+        tmp_path,
+        "fix parse_value",
+        ["broken_api.py"],
+        ["consumer.cpp"],
+        backend=BACKEND_CYMBAL,
+        runner=FakeCymbalRunner(),
+    )
+    assert res_bin_ed.status == "INCOMPLETE"
+    assert "unreadable or binary editable file omitted" in res_bin_ed.truncation
+
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00" + (b"x" * 2048))
+    empty_runner = FakeCymbalRunner(
+        refs={"parse_value": {"references": []}},
+        impact={"parse_value": {"direct_callers": []}},
+        changed={"changed": [], "stale": False},
+    )
+    res_asset = find_callers_with_backend(
+        tmp_path,
+        "fix parse_value",
+        ["api.py", "logo.png"],
+        ["consumer.cpp"],
+        backend=BACKEND_CYMBAL,
+        cymbal_config=cfg,
+        runner=empty_runner,
+    )
+    assert res_asset.status == "NO_EVIDENCE"
+
+
+def test_auto_mode_propagates_cymbal_skipped_large_and_truncation(tmp_path):
+    (tmp_path / "parser.cpp").write_text(
+        "int parse_value(int input) {\n    return input + 1;\n}\n",
+        encoding="utf-8",
+    )
+    padding_lines = [f"// pad {i:04d} " + ("z" * 64) for i in range(60)]
+    call_line = len(padding_lines) + 2
+    (tmp_path / "consumer.cpp").write_text(
+        "\n".join(padding_lines)
+        + "\nint handle(int v) {\n    return parse_value(v);\n}\n",
+        encoding="utf-8",
+    )
+
+    runner = FakeCymbalRunner(
+        refs={
+            "parse_value": {
+                "definitions": [{"file": "parser.cpp", "line": 1, "name": "parse_value"}],
+                "references": [{"file": "consumer.cpp", "line": call_line, "kind": "call"}],
+            }
+        },
+        impact={"parse_value": {"direct_callers": []}},
+        changed={"changed": [], "stale": False},
+    )
+    cfg = CymbalConfig(enforce_pinned_version=False, max_scan_bytes=2048)
+    report = CymbalEvidenceReport()
+    res = find_callers_with_backend(
+        tmp_path,
+        "fix parse_value",
+        ["parser.cpp"],
+        ["consumer.cpp"],
+        backend=BACKEND_AUTO,
+        cymbal_config=cfg,
+        runner=runner,
+        report=report,
+    )
+    assert res.source == BACKEND_CYMBAL
+    assert res.fallback_used is False
+    assert res.status == "INCOMPLETE"
+    assert report.skipped_large == 1
+    assert "consumer.cpp" in report._skipped_large_paths
+    assert any("scan limit (>2 KiB)" in note for note in res.truncation)
+    assert not any("128 KiB" in note for note in res.truncation)
+
+
+def test_c_cpp_target_extraction_declaration_rules_ts_and_regex(monkeypatch):
+    import aider.cymbal_callers as cc
+
+    c_decls_only = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+    )
+    cpp_decls_only = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+        "class Engine {\n"
+        "public:\n"
+        "    int unbacked_method(int x);\n"
+        "};\n"
+    )
+    cpp_with_defs = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+        "int *ptr_func(int x) { return nullptr; }\n"
+        "class Engine {\n"
+        "public:\n"
+        "    int unbacked_method(int x);\n"
+        "    int inline_method(int x) {\n"
+        "        extern int block_extern(int y);\n"
+        "        return block_extern(x);\n"
+        "    }\n"
+        "};\n"
+        "int Engine::out_of_line(int x) { return x; }\n"
+    )
+    header_h = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+        "static inline int helper(int x) { return x + 1; }\n"
+        "class Widget {\n"
+        "public:\n"
+        "    int render(int w);\n"
+        "};\n"
+    )
+    header_hpp = (
+        "extern int parse_value(int input);\n"
+        "int helper(int x);\n"
+        "inline int helper(int x) {\n"
+        "    extern int block_extern(int y);\n"
+        "    return block_extern(x);\n"
+        "}\n"
+        "class Widget {\n"
+        "public:\n"
+        "    int render(int w);\n"
+        "    int draw(int w) {\n"
+        "        extern int nested_extern(int z);\n"
+        "        return nested_extern(w);\n"
+        "    }\n"
+        "};\n"
+    )
+
+    words_decl = {"parse_value", "helper", "unbacked_method"}
+    words_all = {
+        "parse_value",
+        "helper",
+        "ptr_func",
+        "unbacked_method",
+        "inline_method",
+        "block_extern",
+        "out_of_line",
+        "render",
+        "draw",
+        "nested_extern",
+    }
+
+    for mode in ("tree_sitter", "regex_fallback"):
+        if mode == "regex_fallback":
+            monkeypatch.setattr(cc, "_extract_c_cpp_ts_targets", lambda path, source, words: [])
+
+        # Non-header .c and .cpp MUST NOT extract unbacked extern / forward / method declarations.
+        assert cc._extract_c_cpp_targets("mod.c", c_decls_only, words_decl) == []
+        assert cc._extract_c_cpp_targets("mod.cpp", cpp_decls_only, words_decl) == []
+
+        cpp_targets = cc._extract_c_cpp_targets("mod.cpp", cpp_with_defs, words_all)
+        assert {t.symbol for t in cpp_targets} == {"ptr_func", "inline_method", "out_of_line"}
+
+        # Headers .h and .hpp keep prototypes, externs, inline defs, and class method declarations,
+        # preferring definitions over prototypes and excluding block-scoped externs in .hpp bodies.
+        h_targets = cc._extract_c_cpp_targets("api.h", header_h, words_all)
+        h_by_sym = {t.symbol: t for t in h_targets}
+        assert set(h_by_sym) == {"parse_value", "helper", "render"}
+        assert h_by_sym["helper"].line == 3  # definition preferred over line-2 prototype
+
+        hpp_targets = cc._extract_c_cpp_targets("api.hpp", header_hpp, words_all)
+        hpp_by_sym = {t.symbol: t for t in hpp_targets}
+        assert set(hpp_by_sym) == {"parse_value", "helper", "render", "draw"}
+        assert hpp_by_sym["helper"].line == 3  # definition preferred over line-2 prototype
+        assert "block_extern" not in hpp_by_sym
+        assert "nested_extern" not in hpp_by_sym

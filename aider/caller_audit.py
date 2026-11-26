@@ -377,6 +377,7 @@ class CallerContractHook:
         )
         self._excerpts: tuple = ()
         self._search_error = False
+        self._evidence_status: str | None = None
         self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.rejections: int = 0
         self.format_present = False
@@ -390,9 +391,11 @@ class CallerContractHook:
         facts: Iterable = (),
         read_ranges: Iterable = (),
         search_error: bool = False,
+        caller_evidence_status: str | None = None,
     ) -> None:
         self._excerpts = tuple(excerpts or ())
         self._search_error = search_error
+        self._evidence_status = caller_evidence_status
         self._supplementary_evidence = _combine_supplementary(
             supplementary_evidence=supplementary_evidence,
             facts=facts,
@@ -450,11 +453,16 @@ class CallerContractHook:
             if io:
                 io.tool_output("Local caller contract check: SEARCH_ERROR (pass-through)")
             return None
-        # Without caller excerpts (NO_EVIDENCE), pass through so valid edits are not discarded.
-        # Supplementary evidence (facts/read-ranges) still never satisfies caller checks.
+        # Without caller excerpts (NO_EVIDENCE or empty-excerpt INCOMPLETE), pass through
+        # so valid edits are not discarded. Supplementary evidence never satisfies caller checks.
         if not self._excerpts:
             if io:
-                io.tool_output("Local caller contract check: NO_EVIDENCE (pass-through)")
+                if self._evidence_status == "INCOMPLETE":
+                    io.tool_output(
+                        "Local caller contract check: INCOMPLETE (no excerpts; pass-through)"
+                    )
+                else:
+                    io.tool_output("Local caller contract check: NO_EVIDENCE (pass-through)")
             return None
 
         pre_edit = content[: edit_marker.start()]
@@ -528,6 +536,7 @@ class IsolatedCallerAuditor:
         self.max_audits = max_audits
         self._excerpts: tuple = ()
         self._search_error = False
+        self._evidence_status: str | None = None
         self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.audits_run: int = 0
 
@@ -539,9 +548,11 @@ class IsolatedCallerAuditor:
         facts: Iterable = (),
         read_ranges: Iterable = (),
         search_error: bool = False,
+        caller_evidence_status: str | None = None,
     ) -> None:
         self._excerpts = tuple(excerpts or ())
         self._search_error = search_error
+        self._evidence_status = caller_evidence_status
         self._supplementary_evidence = _combine_supplementary(
             supplementary_evidence=supplementary_evidence,
             facts=facts,
@@ -611,10 +622,18 @@ class IsolatedCallerAuditor:
         if self._search_error:
             verdict = AuditVerdict("ERROR", "SEARCH_ERROR")
         elif not self._excerpts:
-            verdict = AuditVerdict("UNKNOWN", "NO_EVIDENCE")
+            if self._evidence_status == "INCOMPLETE":
+                verdict = AuditVerdict(
+                    "UNKNOWN", "INCOMPLETE: caller evidence incomplete (no excerpts)"
+                )
+            else:
+                verdict = AuditVerdict("UNKNOWN", "NO_EVIDENCE")
         elif not diff_text.strip() or len(diff_text) > _MAX_PATCH_CHARS:
             verdict = AuditVerdict("UNKNOWN", "INCOMPLETE: patch missing or truncated")
-        elif any(getattr(e, "incomplete", False) for e in self._excerpts):
+        elif (
+            any(getattr(e, "incomplete", False) for e in self._excerpts)
+            or self._evidence_status == "INCOMPLETE"
+        ):
             verdict = AuditVerdict("UNKNOWN", "INCOMPLETE: caller evidence")
         elif self.audits_run >= self.max_audits:
             verdict = AuditVerdict("UNKNOWN", "Audit budget exhausted")

@@ -39,10 +39,14 @@ from aider.local_callers import (
     PythonAstCallerFinder,
     TreeSitterCallerFinder,
     _CONTROL_KEYWORDS,
+    _C_CPP_HEADER_SUFFIXES,
     _DEF_REGEXES,
     _LARGE_FILE_LIMITATION,
     _WORD_RE,
+    _has_function_definition_declarator_ancestor,
+    _is_c_cpp_header,
     _is_test_path,
+    _resolve_lang,
 )
 
 PINNED_CYMBAL_VERSION = "0.18.0"
@@ -487,7 +491,10 @@ class CymbalEvidenceReport(CallerEvidenceReport):
                 else:
                     ambiguities.append(lim)
 
-        if self.skipped_large > 0:
+        has_scan_limit_trunc = any(
+            "scan limit" in note.lower() or "large" in note.lower() for note in truncations
+        )
+        if self.skipped_large > 0 and not has_scan_limit_trunc:
             truncations.append(_LARGE_FILE_LIMITATION)
 
         unique_ambiguity = _unique_ordered(ambiguities)
@@ -501,7 +508,12 @@ class CymbalEvidenceReport(CallerEvidenceReport):
         unique_diagnostics = _unique_ordered(self.diagnostics)
 
         if not excerpt_tuple:
-            status: EvidenceStatus = "INCOMPLETE" if self.skipped_large > 0 else "NO_EVIDENCE"
+            has_impairment = (
+                self.skipped_large > 0
+                or bool(unique_truncation)
+                or "stale index" in unique_ambiguity
+            )
+            status: EvidenceStatus = "INCOMPLETE" if has_impairment else "NO_EVIDENCE"
         elif (
             unique_ambiguity
             or unique_truncation
@@ -592,6 +604,48 @@ def _report_add_truncation(report: Any, note: str) -> None:
 
 def _report_add_diagnostic(report: Any, note: str) -> None:
     _report_add_list_or_call(report, "add_diagnostic", ("diagnostics",), note)
+
+
+def _format_byte_limit(max_bytes: int) -> str:
+    if max_bytes >= 1024 * 1024 and max_bytes % (1024 * 1024) == 0:
+        return f"{max_bytes // (1024 * 1024)} MiB"
+    if max_bytes >= 1024 and max_bytes % 1024 == 0:
+        return f"{max_bytes // 1024} KiB"
+    if max_bytes >= 1024 * 1024:
+        return f"{max_bytes / (1024 * 1024):.1f} MiB"
+    if max_bytes >= 1024:
+        return f"{max_bytes / 1024:.1f} KiB"
+    return f"{max_bytes} B"
+
+
+def _format_scan_limit_note(max_scan_bytes: int, *, role: str = "candidate") -> str:
+    return f"{role} file exceeded scan limit (>{_format_byte_limit(max_scan_bytes)})"
+
+
+def _report_record_skipped_large(
+    report: Any, path: str, *, reason: str | None = None
+) -> None:
+    if report is None:
+        return
+    method = getattr(report, "record_skipped_large", None)
+    if callable(method):
+        try:
+            sig = inspect.signature(method)
+            if "reason" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                method(path, reason=reason)
+                return
+        except (TypeError, ValueError):
+            pass
+        method(path)
+        if reason:
+            _report_add_truncation(report, reason)
+        return
+    if hasattr(report, "skipped_large"):
+        report.skipped_large += 1
+    if reason:
+        _report_add_truncation(report, reason)
 
 
 def _report_add_item(report: Any, item: CallerEvidenceItem) -> None:
@@ -918,6 +972,18 @@ def read_bounded_lines(
     return collected, current_line, hit_scan_cap
 
 
+@dataclass(frozen=True)
+class BoundedWindow:
+    """Bounded UTF-8 text window safely read around a target 1-based line."""
+
+    start_line: int
+    text: str
+    call_line_text: str
+    line_exists: bool
+    truncated: bool
+    hit_scan_cap: bool = False
+
+
 def read_bounded_window(
     root: Path | str,
     rel_path: str,
@@ -926,11 +992,11 @@ def read_bounded_window(
     context_lines: int = 3,
     max_chars: int = 700,
     max_scan_bytes: int = DEFAULT_MAX_SCAN_BYTES,
-) -> tuple[int, str, str, bool, bool] | None:
+) -> BoundedWindow | None:
     """Read a bounded line window around 1-based ``center_line``.
 
-    Returns ``(start_line, snippet, center_line_text, line_exists, truncated_chars)``
-    or ``None`` if the file cannot be safely read as UTF-8 text.
+    Returns a ``BoundedWindow`` or ``None`` if the file cannot be safely read as
+    UTF-8 text (e.g., missing, unsafe path, symlink, binary NUL, or invalid UTF-8).
     """
     if center_line < 1 or max_chars <= 0:
         return None
@@ -946,14 +1012,28 @@ def read_bounded_window(
     )
     if result is None:
         return None
-    lines, last_line, _ = result
+    lines, last_line, hit_scan_cap = result
     line_exists = last_line >= center_line and (center_line - start_line) < len(lines)
     if not line_exists:
-        return start_line, "", "", False, False
+        return BoundedWindow(
+            start_line=start_line,
+            text="",
+            call_line_text="",
+            line_exists=False,
+            truncated=False,
+            hit_scan_cap=hit_scan_cap,
+        )
     center_text = lines[center_line - start_line]
     snippet = "\n".join(lines)
     truncated_chars = len(snippet) > max_chars
-    return start_line, snippet[:max_chars], center_text, True, truncated_chars
+    return BoundedWindow(
+        start_line=start_line,
+        text=snippet[:max_chars],
+        call_line_text=center_text,
+        line_exists=True,
+        truncated=truncated_chars,
+        hit_scan_cap=hit_scan_cap,
+    )
 
 
 def _validate_cli_arg(value: str, *, label: str) -> str:
@@ -1807,15 +1887,22 @@ class CymbalClient:
                 disk_lines, last_line, hit_cap = disk
                 if hit_cap:
                     slice_truncated = True
+                    diagnostics.append(
+                        f"{_format_scan_limit_note(self.config.max_scan_bytes, role='file')}: "
+                        f"{norm_path}:{start_line}"
+                    )
                 if last_line < start_line or not disk_lines:
-                    slice_stale = True
-                    slice_ambiguity.append("stale index")
+                    if not hit_cap:
+                        slice_stale = True
+                        slice_ambiguity.append("stale index")
                 else:
                     disk_text = "\n".join(disk_lines)
                     if code_lines:
                         compare_lines = code_lines[: len(disk_lines)]
                         if "\n".join(compare_lines) != disk_text or (
-                            last_line < disk_end and len(code_lines) > len(disk_lines)
+                            not hit_cap
+                            and last_line < disk_end
+                            and len(code_lines) > len(disk_lines)
                         ):
                             slice_stale = True
                             slice_ambiguity.append("stale index")
@@ -1895,19 +1982,65 @@ class _TargetDefinition:
     line: int = 1
 
 
-def _read_editable_text(root: Path, rel_path: str, *, max_bytes: int) -> str:
+_NON_CODE_LANGS = frozenset(
+    {
+        "markdown",
+        "json",
+        "toml",
+        "xml",
+        "html",
+        "css",
+        "yaml",
+        "csv",
+        "rst",
+        "ini",
+        "org",
+        "bibtex",
+        "dockerfile",
+        "make",
+        "cmake",
+        "sql",
+        "regex",
+        "diff",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _EditableReadResult:
+    text: str
+    status: Literal["ok", "too_large", "unreadable"]
+
+
+def _is_supported_editable_code_path(rel_path: str) -> bool:
+    suffix = Path(rel_path).suffix.lower()
+    if suffix == ".py" or suffix in _C_CPP_SUFFIXES:
+        return True
+    lang = _resolve_lang(rel_path)
+    return bool(lang and lang not in _NON_CODE_LANGS)
+
+
+def _read_editable_text_checked(
+    root: Path, rel_path: str, *, max_bytes: int
+) -> _EditableReadResult:
     norm = normalize_repo_path(root, rel_path)
     if norm is None:
-        return ""
+        return _EditableReadResult(text="", status="unreadable")
     full_path = root / norm
     try:
         with full_path.open("rb") as stream:
             data = stream.read(max_bytes + 1)
-        if len(data) > max_bytes or b"\x00" in data:
-            return ""
-        return data.decode("utf-8")
+        if b"\x00" in data:
+            return _EditableReadResult(text="", status="unreadable")
+        if len(data) > max_bytes:
+            return _EditableReadResult(text="", status="too_large")
+        return _EditableReadResult(text=data.decode("utf-8"), status="ok")
     except (OSError, UnicodeDecodeError):
-        return ""
+        return _EditableReadResult(text="", status="unreadable")
+
+
+def _read_editable_text(root: Path, rel_path: str, *, max_bytes: int) -> str:
+    return _read_editable_text_checked(root, rel_path, max_bytes=max_bytes).text
 
 
 def _extract_python_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
@@ -1956,7 +2089,6 @@ _C_CPP_SUFFIXES = frozenset(
     {".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".tpp"}
 )
 _CPP_ONLY_SUFFIXES = frozenset({".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".tpp"})
-_C_CPP_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx"})
 _C_NON_DECL_KEYWORDS = frozenset(
     {
         "return",
@@ -1983,7 +2115,7 @@ _C_NON_DECL_KEYWORDS = frozenset(
 )
 _C_CPP_FUNC_DEF_RE = re.compile(
     r"(?m)^[ \t]*"
-    r"(?P<prefix>(?:[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?(?:\s*[*&]+)?[ \t]+)+)"
+    r"(?P<prefix>(?:[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?(?:\s*[*&]+[ \t]*|[ \t]+))+)"
     r"(?:(?P<owner>[A-Za-z_]\w*)\s*::\s*)?"
     r"(?P<name>[A-Za-z_]\w*)[ \t]*\([^;{}]*\)[ \t\r\n]*"
     r"(?:(?:const|noexcept|override|final)\b[ \t\r\n]*)*"
@@ -2027,6 +2159,44 @@ def _unwrap_c_declarator_name(node: Any, *, in_class: bool = False) -> tuple[str
     return None, "function"
 
 
+def _find_matching_brace(source: str, open_idx: int) -> int:
+    """Return index of the closing ``}`` matching ``source[open_idx] == '{'`` (or len(source))."""
+    depth = 0
+    i = open_idx
+    n = len(source)
+    in_str = ""
+    while i < n:
+        ch = source[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = ""
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            nxt = source[i + 1]
+            if nxt == "/":
+                nl = source.find("\n", i + 2)
+                i = n if nl == -1 else nl + 1
+                continue
+            if nxt == "*":
+                end = source.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+                continue
+        if ch in ('"', "'"):
+            in_str = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
 def _extract_c_cpp_ts_targets(
     path: str,
     source: str,
@@ -2034,6 +2204,7 @@ def _extract_c_cpp_ts_targets(
 ) -> list[_TargetDefinition]:
     suffix = Path(path).suffix.lower()
     lang = "cpp" if suffix in _CPP_ONLY_SUFFIXES else "c"
+    is_header = _is_c_cpp_header(path)
     try:
         warnings.simplefilter("ignore", category=FutureWarning)
         from grep_ast.tsl import get_parser
@@ -2048,9 +2219,9 @@ def _extract_c_cpp_ts_targets(
     seen_defs: set[str] = set()
     seen_decls: set[str] = set()
 
-    stack: list[tuple[Any, bool, bool]] = [(tree.root_node, False, False)]
+    stack: list[tuple[Any, bool, bool, bool]] = [(tree.root_node, False, False, False)]
     while stack:
-        node, in_class, in_param = stack.pop()
+        node, in_class, in_param, in_compound = stack.pop()
         node_type = getattr(node, "type", "")
         if node_type == "parameter_declaration":
             continue
@@ -2061,27 +2232,31 @@ def _extract_c_cpp_ts_targets(
                 seen_defs.add(name)
                 line = node.start_point[0] + 1
                 definitions.append(_TargetDefinition(path=path, symbol=name, kind=kind, line=line))
-        elif node_type == "function_declarator" and not in_param:
-            parent = getattr(node, "parent", None)
-            parent_type = getattr(parent, "type", "") if parent is not None else ""
-            if parent_type != "function_definition":
-                name, kind = _unwrap_c_declarator_name(node, in_class=in_class)
-                if (
-                    name
-                    and name in words
-                    and name not in _CONTROL_KEYWORDS
-                    and name not in seen_decls
-                ):
-                    seen_decls.add(name)
-                    line = node.start_point[0] + 1
-                    declarations.append(
-                        _TargetDefinition(path=path, symbol=name, kind=kind, line=line)
-                    )
+        elif (
+            is_header
+            and node_type == "function_declarator"
+            and not in_param
+            and not (lang == "cpp" and in_compound)
+            and not _has_function_definition_declarator_ancestor(node)
+        ):
+            name, kind = _unwrap_c_declarator_name(node, in_class=in_class)
+            if (
+                name
+                and name in words
+                and name not in _CONTROL_KEYWORDS
+                and name not in seen_decls
+            ):
+                seen_decls.add(name)
+                line = node.start_point[0] + 1
+                declarations.append(
+                    _TargetDefinition(path=path, symbol=name, kind=kind, line=line)
+                )
 
         next_in_class = in_class or node_type in ("class_specifier", "struct_specifier")
         next_in_param = in_param or node_type == "parameter_list"
+        next_in_compound = in_compound or node_type == "compound_statement"
         for child in reversed(node.children):
-            stack.append((child, next_in_class, next_in_param))
+            stack.append((child, next_in_class, next_in_param, next_in_compound))
 
     found = list(definitions)
     for item in declarations:
@@ -2094,10 +2269,25 @@ def _extract_c_cpp_ts_targets(
 def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
     found = _extract_c_cpp_ts_targets(path, source, words)
     seen = {item.symbol for item in found}
-    is_header = Path(path).suffix.lower() in _C_CPP_HEADER_SUFFIXES
+    is_header = _is_c_cpp_header(path)
+
+    matches = list(_C_CPP_FUNC_DEF_RE.finditer(source))
+    body_spans: list[tuple[int, int]] = []
+    if is_header:
+        for match in matches:
+            if (match.group("term") or "") != "{":
+                continue
+            prefix = match.group("prefix") or ""
+            if "=" in prefix:
+                continue
+            first_tok = prefix.split()[0] if prefix.split() else ""
+            if not first_tok or first_tok in _C_NON_DECL_KEYWORDS:
+                continue
+            open_idx = match.end() - 1
+            body_spans.append((open_idx, _find_matching_brace(source, open_idx)))
 
     proto_candidates: list[_TargetDefinition] = []
-    for match in _C_CPP_FUNC_DEF_RE.finditer(source):
+    for match in matches:
         prefix = match.group("prefix") or ""
         name = match.group("name") or ""
         owner = match.group("owner") or ""
@@ -2116,6 +2306,8 @@ def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_Tar
             seen.add(name)
             found.append(target)
         elif is_header:
+            if any(start < match.start() < end for start, end in body_spans):
+                continue
             proto_candidates.append(target)
 
     for target in proto_candidates:
@@ -2146,10 +2338,34 @@ def _extract_editable_targets(
     words: set[str],
     *,
     max_scan_bytes: int,
-) -> dict[str, list[_TargetDefinition]]:
+    report: CallerEvidenceReport | None = None,
+) -> tuple[dict[str, list[_TargetDefinition]], list[str]]:
     by_symbol: dict[str, list[_TargetDefinition]] = {}
+    impairment_truncations: list[str] = []
     for rel_path in editable_paths:
-        source = _read_editable_text(resolved_root, rel_path, max_bytes=max_scan_bytes)
+        if not _is_supported_editable_code_path(rel_path):
+            continue
+        read_res = _read_editable_text_checked(
+            resolved_root, rel_path, max_bytes=max_scan_bytes
+        )
+        if read_res.status == "too_large":
+            note = _format_scan_limit_note(max_scan_bytes, role="editable")
+            impairment_truncations.append(note)
+            _report_record_skipped_large(report, rel_path, reason=note)
+            _report_add_diagnostic(
+                report,
+                f"editable file exceeded scan limit ({max_scan_bytes} bytes): {rel_path}",
+            )
+            continue
+        if read_res.status == "unreadable":
+            note = "unreadable or binary editable file omitted"
+            impairment_truncations.append(note)
+            _report_add_truncation(report, note)
+            _report_add_diagnostic(
+                report, f"skipped unreadable or binary editable file: {rel_path}"
+            )
+            continue
+        source = read_res.text
         if not source or not any(word in source for word in words):
             continue
         suffix = Path(rel_path).suffix.lower()
@@ -2161,7 +2377,7 @@ def _extract_editable_targets(
             defs = _extract_generic_targets(rel_path, source, words)
         for item in defs:
             by_symbol.setdefault(item.symbol, []).append(item)
-    return by_symbol
+    return by_symbol, impairment_truncations
 
 
 def _is_symbol_not_found_error(exc: CymbalExecutionError) -> bool:
@@ -2253,11 +2469,12 @@ class CymbalCallerFinder:
             candidate_display_by_norm.setdefault(norm, norm)
 
         _report_add_scope(report, "no_federate")
-        targets_by_symbol = _extract_editable_targets(
+        targets_by_symbol, editable_truncations = _extract_editable_targets(
             resolved_root,
             editable_norm_list,
             words,
             max_scan_bytes=self.config.max_scan_bytes,
+            report=report,
         )
         for sym, defs in sorted(targets_by_symbol.items()):
             for target_def in defs:
@@ -2433,6 +2650,8 @@ class CymbalCallerFinder:
         excerpts: list[CallerExcerpt] = []
         evidence_items: list[CallerEvidenceItem] = []
         skipped_stale_line = False
+        skipped_truncations: list[str] = list(editable_truncations)
+        scan_limit_note = _format_scan_limit_note(self.config.max_scan_bytes, role="candidate")
 
         for hit in selected_pool:
             window = read_bounded_window(
@@ -2444,20 +2663,39 @@ class CymbalCallerFinder:
                 max_scan_bytes=self.config.max_scan_bytes,
             )
             if window is None:
+                unreadable_note = "unreadable or binary candidate file omitted"
+                skipped_truncations.append(unreadable_note)
+                _report_add_truncation(report, unreadable_note)
                 _report_add_diagnostic(report, f"skipped unreadable or binary caller: {hit.path}")
                 continue
-            start_line, snippet, center_text, line_exists, truncated_chars = window
             hit_ambiguities = list(hit.ambiguity)
             hit_truncations = list(hit.truncation)
             hit_scopes = [*hit.scope, pool_scope]
 
-            if not line_exists:
-                skipped_stale_line = True
-                _report_add_ambiguity(report, "stale index")
-                _report_add_diagnostic(
-                    report, f"cymbal reported out-of-range line {hit.path}:{hit.line}"
-                )
+            if not window.line_exists:
+                if window.hit_scan_cap:
+                    skipped_truncations.append(scan_limit_note)
+                    _report_record_skipped_large(report, hit.path, reason=scan_limit_note)
+                    _report_add_diagnostic(
+                        report,
+                        f"candidate file exceeded scan limit ({self.config.max_scan_bytes} bytes): "
+                        f"{hit.path}:{hit.line}",
+                    )
+                else:
+                    skipped_stale_line = True
+                    _report_add_ambiguity(report, "stale index")
+                    _report_add_diagnostic(
+                        report, f"cymbal reported out-of-range line {hit.path}:{hit.line}"
+                    )
                 continue
+
+            start_line = window.start_line
+            snippet = window.text
+            center_text = window.call_line_text
+            truncated_chars = window.truncated
+            if window.hit_scan_cap:
+                hit_truncations.append(scan_limit_note)
+                _report_add_truncation(report, scan_limit_note)
 
             if hit.snippet and hit.snippet.strip():
                 expected_text = hit.snippet.strip()
@@ -2567,6 +2805,21 @@ class CymbalCallerFinder:
             selected_items[-1] = replace(
                 selected_items[-1],
                 ambiguity=_unique_ordered((*selected_items[-1].ambiguity, "stale index")),
+            )
+
+        unique_skipped_truncs = _unique_ordered(skipped_truncations)
+        if unique_skipped_truncs:
+            selected_excerpts[-1] = replace(
+                selected_excerpts[-1],
+                limitations=_unique_ordered(
+                    (*selected_excerpts[-1].limitations, *unique_skipped_truncs)
+                ),
+            )
+            selected_items[-1] = replace(
+                selected_items[-1],
+                truncation=_unique_ordered(
+                    (*selected_items[-1].truncation, *unique_skipped_truncs)
+                ),
             )
 
         for item in selected_items:
@@ -2940,6 +3193,17 @@ class FallbackCallerFinder:
         if isinstance(report, CymbalEvidenceReport):
             report.backend_used = BACKEND_CYMBAL
             report.fallback_used = False
+        if report is not None and cymbal_report.skipped_large > 0:
+            if cymbal_report._skipped_large_paths:
+                for large_path in sorted(cymbal_report._skipped_large_paths):
+                    if hasattr(report, "_skipped_large_paths"):
+                        if large_path not in report._skipped_large_paths:
+                            report._skipped_large_paths.add(large_path)
+                            report.skipped_large += 1
+                    elif hasattr(report, "skipped_large"):
+                        report.skipped_large += 1
+            elif hasattr(report, "skipped_large"):
+                report.skipped_large += cymbal_report.skipped_large
         for path, sym in cymbal_report.definitions:
             _report_add_definition(report, path, sym)
         for note in cymbal_report.scope:

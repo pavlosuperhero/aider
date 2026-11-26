@@ -3152,6 +3152,7 @@
   edit_format: diff
   weak_model_name: lm_studio/qwen/qwen3.6-35b-a3b
   use_repo_map: true
+  use_temperature: 0.6
   editor_model_name: lm_studio/qwen/qwen3.6-35b-a3b
   editor_edit_format: editor-diff
   reasoning_tag: think

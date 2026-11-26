@@ -1,3 +1,4 @@
+import copy
 import difflib
 import hashlib
 import importlib.resources
@@ -368,6 +369,30 @@ class Model(ModelSettings):
         else:
             self.get_editor_model(editor_model, editor_edit_format)
 
+    @classmethod
+    def from_settings_only(cls, model):
+        """Instantiate Model from local settings only, without network metadata or env checks."""
+        canonical = MODEL_ALIASES.get(model, model)
+        instance = cls.__new__(cls)
+        for field in fields(ModelSettings):
+            val = field.default
+            if isinstance(val, (dict, list)):
+                val = copy.deepcopy(val)
+            setattr(instance, field.name, val)
+        instance.name = canonical
+        instance.verbose = False
+        instance.max_chat_history_tokens = 1024
+        instance.weak_model = None
+        instance.editor_model = None
+        instance.info = {}
+        instance.missing_keys = []
+        instance.keys_in_environment = True
+        instance.extra_model_settings = next(
+            (ms for ms in MODEL_SETTINGS if ms.name == "aider/extra_params"), None
+        )
+        instance.configure_model_settings(canonical)
+        return instance
+
     def get_model_info(self, model):
         return model_info_manager.get_model_info(model)
 
@@ -375,6 +400,8 @@ class Model(ModelSettings):
         """Helper to copy fields from a ModelSettings instance to self"""
         for field in fields(ModelSettings):
             val = getattr(source, field.name)
+            if isinstance(val, (dict, list)):
+                val = copy.deepcopy(val)
             setattr(self, field.name, val)
 
         # Handle backward compatibility: if remove_reasoning is set but reasoning_tag isn't,
@@ -990,6 +1017,70 @@ class Model(ModelSettings):
 
             os.environ[openai_api_key] = token
 
+    def _resolve_temperature(self, temperature=None):
+        """Resolve the effective completion temperature, or None when disabled."""
+        if self.use_temperature is False:
+            return None
+        if temperature is not None:
+            return temperature
+        if isinstance(self.use_temperature, bool):
+            return 0
+        return float(self.use_temperature)
+
+    def _resolve_litellm_provider(self):
+        """Return (bare_model, provider) via litellm with local model list fallbacks."""
+        try:
+            bare_model, provider, _, _ = litellm.get_llm_provider(self.name)
+            return bare_model, provider
+        except Exception:
+            pass
+
+        info_provider = (self.info or {}).get("litellm_provider")
+        if info_provider:
+            return self.name, info_provider
+        if self.name in ANTHROPIC_MODELS:
+            return self.name, "anthropic"
+        if self.name in OPENAI_MODELS:
+            return self.name, "openai"
+        return None, None
+
+    def effective_completion_params(self, temperature=None):
+        """Return effective completion parameters and top-level keys litellm would drop."""
+        extra_params = copy.deepcopy(self.extra_params) if self.extra_params else {}
+        effective_temp = self._resolve_temperature(temperature)
+        if "temperature" in extra_params:
+            effective_temp = extra_params["temperature"]
+
+        outgoing_keys = set(extra_params.keys())
+        if effective_temp is not None:
+            outgoing_keys.add("temperature")
+        outgoing_keys.discard("extra_body")
+
+        bare_model, provider = self._resolve_litellm_provider()
+        dropped_params = []
+        if provider and bare_model:
+            try:
+                supported = litellm.get_supported_openai_params(
+                    model=bare_model,
+                    custom_llm_provider=provider,
+                )
+            except Exception:
+                supported = None
+            if supported is not None:
+                supported_set = set(supported)
+                dropped_params = sorted(k for k in outgoing_keys if k not in supported_set)
+
+        return {
+            "model": self.name,
+            "temperature": effective_temp,
+            "max_tokens": extra_params.get("max_tokens"),
+            "extra_params": extra_params,
+            "thinking_tokens": self.get_raw_thinking_tokens(),
+            "reasoning_effort": self.get_reasoning_effort(),
+            "provider": provider,
+            "dropped_params": dropped_params,
+        }
+
     def send_completion(self, messages, functions, stream, temperature=None):
         if os.environ.get("AIDER_SANITY_CHECK_TURNS"):
             sanity_check_messages(messages)
@@ -1002,14 +1093,9 @@ class Model(ModelSettings):
             stream=stream,
         )
 
-        if self.use_temperature is not False:
-            if temperature is None:
-                if isinstance(self.use_temperature, bool):
-                    temperature = 0
-                else:
-                    temperature = float(self.use_temperature)
-
-            kwargs["temperature"] = temperature
+        resolved_temperature = self._resolve_temperature(temperature)
+        if resolved_temperature is not None:
+            kwargs["temperature"] = resolved_temperature
 
         if functions is not None:
             function = functions[0]

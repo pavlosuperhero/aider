@@ -54,7 +54,19 @@ _EXTRA_LANG_BY_SUFFIX = {
     ".mts": "typescript",
     ".cts": "typescript",
     ".hh": "cpp",
+    ".ipp": "cpp",
+    ".tpp": "cpp",
 }
+_C_CPP_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx"})
+_C_DECLARATION_BOUNDARY_NODES = frozenset(
+    {
+        "compound_statement",
+        "declaration",
+        "field_declaration",
+        "parameter_declaration",
+        "parameter_list",
+    }
+)
 _LARGE_FILE_LIMITATION = "large candidate file omitted (>128 KiB)"
 _C_NON_DECL_KEYWORDS = frozenset(
     {
@@ -264,7 +276,40 @@ def _is_ambiguity_reason(reason: str) -> bool:
 
 def _is_truncation_reason(reason: str) -> bool:
     lowered = reason.lower()
-    return any(token in lowered for token in ("truncated", "omitted", "capped", "budget"))
+    return any(token in lowered for token in ("truncated", "omitted", "capped", "budget", "limit"))
+
+
+def _is_c_cpp_header(path: str) -> bool:
+    """Return True for C/C++ header file extensions."""
+    return Path(path).suffix.lower() in _C_CPP_HEADER_SUFFIXES
+
+
+def _has_ancestor_type(node, node_type: str) -> bool:
+    """Return True if any ancestor of ``node`` has tree-sitter type ``node_type``."""
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if getattr(cur, "type", "") == node_type:
+            return True
+        cur = getattr(cur, "parent", None)
+    return False
+
+
+def _has_function_definition_declarator_ancestor(node) -> bool:
+    """Return True when ``node`` belongs to a C/C++ ``function_definition`` declarator.
+
+    Walks upward through declarator wrappers (such as ``pointer_declarator`` or
+    ``reference_declarator``) and stops at declaration/body boundaries so block-scoped
+    ``extern`` declarations inside a function body are not mistaken for definitions.
+    """
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        cur_type = getattr(cur, "type", "")
+        if cur_type == "function_definition":
+            return True
+        if cur_type in _C_DECLARATION_BOUNDARY_NODES:
+            return False
+        cur = getattr(cur, "parent", None)
+    return False
 
 
 def _supports_report_arg(finder: CallerFinder) -> bool:
@@ -534,14 +579,14 @@ class CallerEvidenceReport:
         if text and text not in self.sources:
             self.sources.append(text)
 
-    def record_skipped_large(self, path: str = "") -> None:
+    def record_skipped_large(self, path: str = "", *, reason: str | None = None) -> None:
         text = str(path).strip()
         if text:
             if text in self._skipped_large_paths:
                 return
             self._skipped_large_paths.add(text)
         self.skipped_large += 1
-        self.record_truncation(_LARGE_FILE_LIMITATION)
+        self.record_truncation(_LARGE_FILE_LIMITATION if reason is None else reason)
 
     def record_ambiguity(self, reason: str) -> None:
         text = str(reason).strip()
@@ -602,17 +647,21 @@ class CallerEvidenceReport:
         evidence_tuple = tuple(evidence_items)
 
         skipped_large = max(self.skipped_large, self.scope.skipped_large)
-        extra_large = (_LARGE_FILE_LIMITATION,) if skipped_large > 0 else ()
+        base_truncations = (
+            *self.truncation,
+            *(reason for e in evidence_tuple for reason in e.truncation),
+        )
+        has_large_trunc = any(
+            "scan limit" in note.lower() or "large" in note.lower()
+            for note in base_truncations
+        )
+        extra_large = (
+            (_LARGE_FILE_LIMITATION,) if (skipped_large > 0 and not has_large_trunc) else ()
+        )
         ambiguity = _dedupe_str(
             (*self.ambiguity, *(reason for e in evidence_tuple for reason in e.ambiguity))
         )
-        truncation = _dedupe_str(
-            (
-                *self.truncation,
-                *(reason for e in evidence_tuple for reason in e.truncation),
-                *extra_large,
-            )
-        )
+        truncation = _dedupe_str((*base_truncations, *extra_large))
         limitations = _dedupe_str(
             (
                 *self.limitations,
@@ -631,7 +680,10 @@ class CallerEvidenceReport:
         )
 
         if not evidence_tuple:
-            status: EvidenceStatus = "INCOMPLETE" if skipped_large > 0 else "NO_EVIDENCE"
+            has_impairment = (
+                skipped_large > 0 or bool(truncation) or "stale index" in ambiguity
+            )
+            status: EvidenceStatus = "INCOMPLETE" if has_impairment else "NO_EVIDENCE"
         elif ambiguity or truncation or limitations or skipped_large > 0:
             status = "INCOMPLETE"
         else:
@@ -709,6 +761,8 @@ def _read_source_checked(
             return "", False
         with path.open("rb") as stream:
             data = stream.read(max_bytes + 1)
+        if b"\x00" in data:
+            return "", False
         if len(data) > max_bytes:
             return "", True
         return data.decode("utf-8"), False
@@ -821,10 +875,16 @@ class PythonAstCallerFinder:
         target_modules: set[str] = set()
         symbol_def_count: dict[str, int] = {}
 
+        skipped_large = 0
         for name in editable:
             if not self.supports(name):
                 continue
-            source = read_python(resolved_root, name)
+            source, is_large = _read_python_checked(resolved_root, name)
+            if is_large:
+                skipped_large += 1
+                if report is not None and hasattr(report, "record_skipped_large"):
+                    report.record_skipped_large(name)
+                continue
             if not source:
                 continue
             try:
@@ -860,7 +920,6 @@ class PythonAstCallerFinder:
 
         target_symbols = {sym for _, sym in target_funcs} | {m for _, _, m in target_methods}
         excerpts: list[CallerExcerpt] = []
-        skipped_large = 0
 
         for name in sorted(candidates):
             if not self.supports(name):
@@ -1317,11 +1376,17 @@ class TreeSitterCallerFinder:
         ctx = max(0, context_lines)
 
         # Map symbol -> set of editable paths defining it.
+        skipped_large = 0
         targets: dict[str, set[str]] = {}
         for name in editable:
             if not self.supports(name):
                 continue
-            source = read_source(resolved_root, name)
+            source, is_large = _read_source_checked(resolved_root, name)
+            if is_large:
+                skipped_large += 1
+                if report is not None and hasattr(report, "record_skipped_large"):
+                    report.record_skipped_large(name)
+                continue
             if not source or not any(word in source for word in words):
                 continue
             defined = self._extract_definitions(name, source)
@@ -1338,7 +1403,6 @@ class TreeSitterCallerFinder:
             report.record_ambiguity("duplicate symbol definition")
 
         excerpts: list[CallerExcerpt] = []
-        skipped_large = 0
         for name in sorted(candidates):
             if not self.supports(name):
                 continue
@@ -1422,7 +1486,7 @@ class TreeSitterCallerFinder:
         defined: set[str] = set()
         lang = _resolve_lang(path)
         if lang:
-            defined.update(self._extract_ts_definitions(lang, source))
+            defined.update(self._extract_ts_definitions(lang, source, path=path))
         # Augment with regex fallback (handles arrow functions in TS and unsupported languages).
         for pattern in _DEF_REGEXES:
             for match in pattern.finditer(source):
@@ -1431,7 +1495,7 @@ class TreeSitterCallerFinder:
                     defined.add(name)
         return defined
 
-    def _extract_ts_definitions(self, lang: str, source: str) -> set[str]:
+    def _extract_ts_definitions(self, lang: str, source: str, *, path: str = "") -> set[str]:
         scm_path = _get_scm_path(lang)
         if scm_path is None:
             return set()
@@ -1448,9 +1512,26 @@ class TreeSitterCallerFinder:
         except Exception:
             return set()
 
+        is_c_cpp_non_header = (
+            lang in ("c", "cpp") and bool(path) and not _is_c_cpp_header(path)
+        )
+        is_cpp_header = lang == "cpp" and bool(path) and _is_c_cpp_header(path)
         defined: set[str] = set()
         for node, tag in captures:
             if tag.startswith("name.definition."):
+                if is_c_cpp_non_header and tag in (
+                    "name.definition.function",
+                    "name.definition.method",
+                ):
+                    if not _has_function_definition_declarator_ancestor(node):
+                        continue
+                elif (
+                    is_cpp_header
+                    and tag in ("name.definition.function", "name.definition.method")
+                    and not _has_function_definition_declarator_ancestor(node)
+                    and _has_ancestor_type(node, "compound_statement")
+                ):
+                    continue
                 text = node.text.decode("utf-8", errors="ignore")
                 if text:
                     defined.add(text)

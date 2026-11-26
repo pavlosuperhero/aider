@@ -45,7 +45,7 @@ Review the fast summary and verify the provider settings before starting a separ
 bash "$trial/issue5_trials.sh" long "$model" trial-results/issue5-long "$manifest"
 ```
 
-For thinking models such as `qwen/qwen3.6-35b-a3b`, set `TRIAL_THINKING_TOKENS` (for example, `TRIAL_THINKING_TOKENS=4096 bash "$trial/issue5_trials.sh" fast "$model" trial-results/issue5-fast`) to forward `--thinking-tokens` and bound multi-minute runaway reasoning turns. Leave `TRIAL_THINKING_TOKENS` unset to omit `--thinking-tokens`.
+For `lm_studio/qwen/qwen3.6-35b-a3b`, `aider/resources/model-settings.yml` pins `use_temperature: 0.6` and `extra_params.max_tokens: 32768` so Aider does not override LM Studio with greedy `temperature=0`. Do **not** set `TRIAL_THINKING_TOKENS` / `--thinking-tokens` for `lm_studio/qwen/qwen3.6-35b-a3b`: neither LiteLLM's `LMStudioChatConfig` nor LM Studio's `/v1/chat/completions` honors Anthropic `thinking.budget_tokens` (and `heldout.py` fails fast when `--thinking-tokens` is requested for a model whose `accepts_settings` or LiteLLM provider drops or ignores it). To bound reasoning or disable thinking on LM Studio, use `max_tokens` or configure server-side LM Studio model/preset settings (for example, `reasoning_effort: "none"` to toggle thinking off). Reserve `TRIAL_THINKING_TOKENS` (for example, `TRIAL_THINKING_TOKENS=4096`) for models whose `accepts_settings` includes `thinking_tokens` and whose LiteLLM provider retains `thinking`/`reasoning` (such as `claude-3-7-sonnet-20250219` or `claude-sonnet-4-6`). Leave `TRIAL_THINKING_TOKENS` unset to omit `--thinking-tokens`.
 
 ### Resume after an interruption
 
@@ -108,7 +108,7 @@ curl --fail --silent --show-error "$LM_STUDIO_API_BASE/models"
 
 Check that both arms return five rows, usage records include editor calls, and `contract_rejected` stays false in both arms. To exercise format-block telemetry, run `--arms passive,contract` on the historical corpus with `--suite replay --replay-manifest "$manifest"` and a fresh output filename. That calibration schedules 60 attempts. Run two separate `--arms passive` jobs with the same configuration and different output filenames to measure A/A disagreement. Match rows by case, spec and round.
 
-Record the served model revision, quantization, inference settings and timeout. The harness pins `PYTHONHASHSEED=0`, disables automatic file-mention prompts, auto-commits and dirty commits, and uses `--seed` for job order. Verify model sampling seed and thinking limits at the provider before treating them as controlled. The harness records the requested `--thinking-tokens` value when supplied.
+Record the served model revision, quantization, inference settings and timeout. The harness pins `PYTHONHASHSEED=0`, disables automatic file-mention prompts, auto-commits and dirty commits, and uses `--seed` for job order. Verify model sampling seed and server-side thinking/reasoning settings at the provider before treating them as controlled. The harness validates `--thinking-tokens` against `accepts_settings` and LiteLLM provider parameter support before running, records both `requested_thinking_tokens` and `effective_model_params` in run metadata, and parses `Trial model params:` and any `ignored_settings` warnings from `aider.log` into each JSONL row.
 
 ## Fresh paired replay
 

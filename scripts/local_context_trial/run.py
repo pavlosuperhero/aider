@@ -22,6 +22,10 @@ DEFAULT_AUTO_LINT = False
 DEFAULT_PYTHONHASHSEED = "0"
 
 _TRIAL_USAGE_RE = re.compile(r"^Trial usage:\s+(\S+)\s+(.+?)\s*$", re.M)
+_TRIAL_MODEL_PARAMS_PREFIX_RE = re.compile(r"^Trial model params:\s*", re.M)
+_IGNORED_SETTING_RE = re.compile(
+    r"Warning:\s+\S+\s+does\s+not\s+support\s+'([^']+)'\s*,\s*ignoring\.", re.M
+)
 _CONTRACT_BLOCKED_RE = re.compile(r"^Local caller contract check: BLOCKED\b", re.M)
 _USAGE_KV_RE = re.compile(
     r"\b(prompt|input|sent|completion|output|received|total|cached)=(\d+|None)\b"
@@ -401,6 +405,117 @@ def parse_trial_usage(log_text: str) -> dict:
     }
 
 
+def parse_trial_model_params(log_text: str) -> dict | None:
+    """Parse the last Trial model params JSON object emitted by Aider, if present."""
+    decoder = json.JSONDecoder()
+    matches = list(_TRIAL_MODEL_PARAMS_PREFIX_RE.finditer(log_text))
+    for match in reversed(matches):
+        tail = log_text[match.end() :]
+        if not tail.startswith("{"):
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(tail)
+        except json.JSONDecodeError:
+            # Handle 80-column console wrapping inside long JSON lines.
+            joined = "".join(line.rstrip("\r\n") for line in tail.splitlines()[:20])
+            try:
+                parsed, _ = decoder.raw_decode(joined)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def parse_ignored_settings(log_text: str) -> list[str]:
+    """Parse unsupported setting names ignored by Aider's accepts_settings check."""
+    return list(dict.fromkeys(_IGNORED_SETTING_RE.findall(log_text)))
+
+
+def inspect_model_request_contract(
+    model_name: str,
+    thinking_tokens: str | None = None,
+) -> dict:
+    """Inspect Aider + LiteLLM effective request parameters without network calls."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from aider.models import Model
+
+    requested = thinking_tokens.strip() if isinstance(thinking_tokens, str) else thinking_tokens
+    if requested == "":
+        requested = None
+
+    base_model = Model.from_settings_only(model_name)
+    accepts_thinking = bool(
+        base_model.accepts_settings and "thinking_tokens" in base_model.accepts_settings
+    )
+    effective_params = base_model.effective_completion_params()
+    provider = effective_params.get("provider")
+    is_lm_studio = base_model.name.startswith("lm_studio/") or provider == "lm_studio"
+
+    probe_budget = requested if requested is not None else "4096"
+    probe_model = Model.from_settings_only(model_name)
+    parse_error: str | None = None
+    dropped_thinking: list[str] = []
+    probe_params: dict | None = None
+    try:
+        probe_model.set_thinking_tokens(probe_budget)
+    except (TypeError, ValueError) as exc:
+        parse_error = str(exc)
+    else:
+        # Check capability with a non-zero budget even if requested == "0"
+        capability_model = probe_model
+        if probe_model.get_raw_thinking_tokens() is None:
+            capability_model = Model.from_settings_only(model_name)
+            capability_model.set_thinking_tokens("4096")
+        capability_params = capability_model.effective_completion_params()
+        dropped = set(capability_params.get("dropped_params") or ())
+        dropped_thinking = sorted(dropped & {"thinking", "reasoning"})
+        probe_params = probe_model.effective_completion_params()
+
+    thinking_supported = accepts_thinking and parse_error is None and not dropped_thinking
+    if thinking_supported and requested is not None and probe_params is not None:
+        effective_params = probe_params
+
+    unsupported_reason: str | None = None
+    if requested is not None and not thinking_supported:
+        if parse_error is not None:
+            unsupported_reason = f"Invalid --thinking-tokens value {requested!r}: {parse_error}"
+        else:
+            reasons: list[str] = []
+            if not accepts_thinking:
+                reasons.append("'thinking_tokens' is not in accepts_settings")
+            if dropped_thinking:
+                reasons.append(
+                    f"LiteLLM provider {provider!r} drops {', '.join(repr(k) for k in dropped_thinking)}"
+                )
+            elif not provider:
+                reasons.append("LiteLLM provider could not be resolved")
+            detail = " and ".join(reasons) if reasons else "provider does not support thinking budgets"
+            if is_lm_studio:
+                guidance = (
+                    " For lm_studio/* models, bound completion length with max_tokens or "
+                    "configure thinking/reasoning via LM Studio server-side model/preset settings."
+                )
+            else:
+                guidance = (
+                    " Use a model whose accepts_settings includes 'thinking_tokens' and whose "
+                    "LiteLLM provider retains the thinking parameter."
+                )
+            unsupported_reason = (
+                f"Model {base_model.name!r} does not support --thinking-tokens: {detail}.{guidance}"
+            )
+
+    return {
+        "model": base_model.name,
+        "requested_thinking_tokens": requested,
+        "accepts_thinking_tokens": accepts_thinking,
+        "thinking_tokens_supported": thinking_supported,
+        "effective_params": effective_params,
+        "unsupported_reason": unsupported_reason,
+    }
+
+
 def classify_audit_outcome(verdicts: list[str]) -> tuple[str, bool | None]:
     """Return (audit_outcome, audit_passed) from parsed audit verdicts."""
     if not verdicts:
@@ -480,11 +595,23 @@ def collect_run_metadata(
     auto_lint: bool = DEFAULT_AUTO_LINT,
     pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
     thinking_tokens: str | None = None,
+    model_contract: dict | None = None,
     repo_root: Path = ROOT,
     run_id: str | None = None,
 ) -> dict:
     """Build reproducible run provenance metadata."""
     git_state = _git_repo_state(repo_root)
+    contract = (
+        model_contract
+        if model_contract is not None
+        else inspect_model_request_contract(model, thinking_tokens=thinking_tokens)
+    )
+    resolved_controls = dict(controls) if controls is not None else None
+    if resolved_controls is not None:
+        resolved_controls.setdefault(
+            "requested_thinking_tokens", contract["requested_thinking_tokens"]
+        )
+        resolved_controls.setdefault("effective_model_params", contract["effective_params"])
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id or uuid.uuid4().hex[:12],
@@ -507,7 +634,9 @@ def collect_run_metadata(
         "dirty_commits": False,
         "pythonhashseed": pythonhashseed,
         "thinking_tokens": thinking_tokens,
-        "controls": controls,
+        "requested_thinking_tokens": contract["requested_thinking_tokens"],
+        "effective_model_params": contract["effective_params"],
+        "controls": resolved_controls,
     }
 
 
@@ -852,6 +981,8 @@ def run_spec(
     contract_rejected = bool(_CONTRACT_BLOCKED_RE.search(log_text))
     verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
     usage_info = parse_trial_usage(log_text)
+    effective_model_params = parse_trial_model_params(log_text)
+    ignored_settings = parse_ignored_settings(log_text)
     missing_completion = code != 124 and usage_info["editor_calls"] == 0
 
     audit_outcome, audit_passed = classify_audit_outcome(verdicts)
@@ -958,6 +1089,8 @@ def run_spec(
         completion_tokens=usage_info["completion_tokens"],
         calls_by_role=usage_info["calls_by_role"],
         tokens_by_role=usage_info["tokens_by_role"],
+        effective_model_params=effective_model_params,
+        ignored_settings=ignored_settings,
         patch_hidden_passed=patch_hidden_passed,
         strict_accepted=strict_accepted,
         passed=passed,
@@ -1085,6 +1218,12 @@ def main():
     args = parser.parse_args()
     if args.thinking_tokens is not None and not args.thinking_tokens.strip():
         parser.error("--thinking-tokens must be a non-empty string when specified")
+    model_contract = inspect_model_request_contract(MODEL, thinking_tokens=args.thinking_tokens)
+    if args.thinking_tokens is not None and not model_contract["thinking_tokens_supported"]:
+        parser.error(
+            model_contract["unsupported_reason"]
+            or f"--thinking-tokens is not supported for model {MODEL!r}"
+        )
     output = Path(tempfile.mkdtemp(prefix="aider-local-trial-"))
     print(output, flush=True)
     run_meta = collect_run_metadata(
@@ -1098,6 +1237,7 @@ def main():
         auto_lint=args.auto_lint,
         pythonhashseed=DEFAULT_PYTHONHASHSEED,
         thinking_tokens=args.thinking_tokens,
+        model_contract=model_contract,
         controls={
             "backend": args.local_callers_backend,
             "read_range": args.local_callers_read_range,
@@ -1108,6 +1248,8 @@ def main():
             "auto_lint": args.auto_lint,
             "pythonhashseed": DEFAULT_PYTHONHASHSEED,
             "thinking_tokens": args.thinking_tokens,
+            "requested_thinking_tokens": model_contract["requested_thinking_tokens"],
+            "effective_model_params": model_contract["effective_params"],
         },
     )
     write_run_metadata(output / "metadata.json", run_meta)

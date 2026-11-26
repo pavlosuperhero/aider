@@ -918,6 +918,143 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(optin_ns.auto_lint, True)
         self.assertEqual(optin_ns.thinking_tokens, "8192")
 
+    def test_p0_model_request_contract_fail_fast_and_effective_param_logging(self):
+        with (
+            mock.patch("requests.get", side_effect=AssertionError("Unexpected network call")),
+            mock.patch("httpx.Client.send", side_effect=AssertionError("Unexpected network call")),
+        ):
+            lm_contract = run.inspect_model_request_contract(
+                "lm_studio/qwen/qwen3.6-35b-a3b", thinking_tokens="4096"
+            )
+            self.assertEqual(lm_contract["requested_thinking_tokens"], "4096")
+            self.assertIs(lm_contract["accepts_thinking_tokens"], False)
+            self.assertIs(lm_contract["thinking_tokens_supported"], False)
+            self.assertEqual(lm_contract["effective_params"]["temperature"], 0.6)
+            self.assertEqual(lm_contract["effective_params"]["max_tokens"], 32768)
+            self.assertIsNone(lm_contract["effective_params"]["thinking_tokens"])
+            self.assertEqual(lm_contract["effective_params"]["provider"], "lm_studio")
+            self.assertEqual(lm_contract["effective_params"]["dropped_params"], [])
+            self.assertIsNotNone(lm_contract["unsupported_reason"])
+            self.assertIn("accepts_settings", lm_contract["unsupported_reason"])
+            self.assertIn("lm_studio", lm_contract["unsupported_reason"])
+            self.assertIn("max_tokens", lm_contract["unsupported_reason"])
+
+            claude_contract = run.inspect_model_request_contract(
+                "claude-3-7-sonnet-20250219", thinking_tokens="4096"
+            )
+            self.assertEqual(claude_contract["requested_thinking_tokens"], "4096")
+            self.assertIs(claude_contract["accepts_thinking_tokens"], True)
+            self.assertIs(claude_contract["thinking_tokens_supported"], True)
+            self.assertEqual(claude_contract["effective_params"]["thinking_tokens"], 4096)
+            self.assertIsNone(claude_contract["effective_params"]["temperature"])
+            self.assertEqual(claude_contract["effective_params"]["dropped_params"], [])
+            self.assertIsNone(claude_contract["unsupported_reason"])
+
+            meta = run.collect_run_metadata(
+                model="lm_studio/qwen/qwen3.6-35b-a3b",
+                suite="issue5",
+                rounds=1,
+                controls={"thinking_tokens": None},
+            )
+            self.assertIsNone(meta["thinking_tokens"])
+            self.assertIsNone(meta["requested_thinking_tokens"])
+            self.assertEqual(meta["effective_model_params"]["temperature"], 0.6)
+            self.assertEqual(meta["effective_model_params"]["max_tokens"], 32768)
+            self.assertEqual(meta["controls"]["effective_model_params"]["temperature"], 0.6)
+            self.assertIsNone(meta["controls"]["requested_thinking_tokens"])
+
+        # heldout.main fails fast when --thinking-tokens is requested for lm_studio qwen3.6
+        err_buf = io.StringIO()
+        with (
+            mock.patch.object(heldout.run, "run_spec") as mock_run_spec,
+            contextlib.redirect_stderr(err_buf),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                heldout.main(
+                    [
+                        "--model",
+                        "lm_studio/qwen/qwen3.6-35b-a3b",
+                        "--thinking-tokens",
+                        "4096",
+                        "--cases",
+                        "duration",
+                        "--arms",
+                        "baseline",
+                        "--rounds",
+                        "1",
+                    ]
+                )
+        self.assertEqual(ctx.exception.code, 2)
+        mock_run_spec.assert_not_called()
+        self.assertIn("accepts_settings", err_buf.getvalue())
+        self.assertIn("lm_studio", err_buf.getvalue())
+        self.assertIn("max_tokens", err_buf.getvalue())
+
+        # run_spec parses Trial model params and ignored_settings warnings from aider.log
+        case_spec = heldout.CASE_BY_NAME["duration"]
+        expected_params = {
+            "dropped_params": [],
+            "extra_params": {"max_tokens": 32768},
+            "max_tokens": 32768,
+            "model": "lm_studio/qwen/qwen3.6-35b-a3b",
+            "provider": "lm_studio",
+            "reasoning_effort": None,
+            "temperature": 0.6,
+            "thinking_tokens": None,
+        }
+        parsed_res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="baseline",
+            log_content=(
+                "Warning: lm_studio/qwen/qwen3.6-35b-a3b does not support 'thinking_tokens', ignoring.\n"
+                f"Trial model params: {json.dumps(expected_params, sort_keys=True)}\n"
+                "Trial usage: editor 500\n"
+            ),
+        )
+        self.assertEqual(parsed_res["effective_model_params"], expected_params)
+        self.assertEqual(parsed_res["ignored_settings"], ["thinking_tokens"])
+
+        plain_res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="baseline",
+            log_content="Trial usage: editor 500\n",
+        )
+        self.assertIsNone(plain_res["effective_model_params"])
+        self.assertEqual(plain_res["ignored_settings"], [])
+
+        # End-to-end check: aider.main emits an unwrapped Trial model params line and wrapped warning parses cleanly
+        from aider.main import main as aider_main
+
+        stdout_buf = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"AIDER_TRIAL_USAGE": "1", "AIDER_ANALYTICS": "false"}),
+            contextlib.redirect_stdout(stdout_buf),
+        ):
+            aider_main(
+                [
+                    "--model",
+                    "lm_studio/qwen/qwen3.6-35b-a3b",
+                    "--thinking-tokens",
+                    "4096",
+                    "--no-git",
+                    "--no-show-model-warnings",
+                    "--no-check-update",
+                    "--exit",
+                    "--yes-always",
+                ]
+            )
+        aider_out = stdout_buf.getvalue()
+        single_lines = [
+            line for line in aider_out.splitlines() if line.startswith("Trial model params: ")
+        ]
+        self.assertEqual(len(single_lines), 1)
+        self.assertEqual(
+            json.loads(single_lines[0].removeprefix("Trial model params: ")),
+            expected_params,
+        )
+        self.assertEqual(run.parse_trial_model_params(aider_out), expected_params)
+        self.assertEqual(run.parse_ignored_settings(aider_out), ["thinking_tokens"])
+
 
 class TestReportingAndPairedIntervals(unittest.TestCase):
     def test_paired_proportion_diff_ci_properties(self):
@@ -1810,10 +1947,17 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
                 {"suite": "issue5", "cases": 5, "attempts": 10},
             )
 
-            # 2. --plan fast with TRIAL_THINKING_TOKENS=4096
+            # 2. --plan fast with TRIAL_THINKING_TOKENS=4096 succeeds for a thinking-capable model
             budget_env = dict(base_env, TRIAL_THINKING_TOKENS="4096")
             proc_budget = subprocess.run(
-                ["bash", str(launcher), "--plan", "fast", "test-model", str(results_dir)],
+                [
+                    "bash",
+                    str(launcher),
+                    "--plan",
+                    "fast",
+                    "claude-3-7-sonnet-20250219",
+                    str(results_dir),
+                ],
                 capture_output=True,
                 text=True,
                 env=budget_env,
@@ -1824,6 +1968,26 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
                 json.loads(proc_budget.stdout),
                 {"suite": "issue5", "cases": 5, "attempts": 10},
             )
+
+            # 2b. --plan fast with TRIAL_THINKING_TOKENS=4096 fails fast for lm_studio qwen3.6
+            proc_rejected = subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "--plan",
+                    "fast",
+                    "lm_studio/qwen/qwen3.6-35b-a3b",
+                    str(results_dir),
+                ],
+                capture_output=True,
+                text=True,
+                env=budget_env,
+                check=False,
+            )
+            self.assertEqual(proc_rejected.returncode, 2)
+            self.assertIn("accepts_settings", proc_rejected.stderr)
+            self.assertIn("lm_studio", proc_rejected.stderr)
+            self.assertIn("max_tokens", proc_rejected.stderr)
 
             # 3. Verify exact argv forwarding via a lightweight TRIAL_PYTHON shim
             argv_log = tmp_path / "argv.json"
