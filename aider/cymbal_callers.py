@@ -511,7 +511,7 @@ class CymbalEvidenceReport(CallerEvidenceReport):
             has_impairment = (
                 self.skipped_large > 0
                 or bool(unique_truncation)
-                or "stale index" in unique_ambiguity
+                or bool(unique_ambiguity)
             )
             status: EvidenceStatus = "INCOMPLETE" if has_impairment else "NO_EVIDENCE"
         elif (

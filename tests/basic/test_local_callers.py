@@ -1021,3 +1021,26 @@ def test_oversized_editable_file_marks_builtin_result_incomplete(tmp_path):
     assert cpp_report.skipped_large == 1
     assert cpp_res.scope.skipped_large == 1
     assert any("128 KiB" in note for note in cpp_res.truncation)
+
+
+@pytest.mark.parametrize(
+    "ambiguity_note",
+    [
+        "ambiguous symbol binding",
+        "duplicate symbol definition",
+        "ambiguous method receiver",
+        "stale index",
+    ],
+)
+def test_builtin_zero_excerpts_with_ambiguity_is_incomplete(ambiguity_note):
+    report = CallerEvidenceReport()
+    report.record_ambiguity(ambiguity_note)
+
+    res = report.to_result(())
+    assert res.status == "INCOMPLETE"
+    assert res.excerpts == ()
+    assert ambiguity_note in res.ambiguity
+    assert ambiguity_note in res.limitations
+
+    clean = CallerEvidenceReport().to_result(())
+    assert clean.status == "NO_EVIDENCE"

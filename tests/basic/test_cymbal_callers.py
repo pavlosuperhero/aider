@@ -1687,3 +1687,27 @@ def test_c_cpp_target_extraction_declaration_rules_ts_and_regex(monkeypatch):
         assert hpp_by_sym["helper"].line == 3  # definition preferred over line-2 prototype
         assert "block_extern" not in hpp_by_sym
         assert "nested_extern" not in hpp_by_sym
+
+
+@pytest.mark.parametrize(
+    "ambiguity_note",
+    [
+        "ambiguous symbol binding",
+        "duplicate symbol definition",
+        "ambiguous method receiver",
+        "stale index",
+    ],
+)
+def test_cymbal_zero_excerpts_with_ambiguity_is_incomplete(ambiguity_note):
+    report = CymbalEvidenceReport(backend_requested=BACKEND_CYMBAL, backend_used=BACKEND_CYMBAL)
+    report.ambiguity.append(ambiguity_note)
+
+    res = report.to_result(())
+    assert res.status == "INCOMPLETE"
+    assert res.excerpts == ()
+    assert ambiguity_note in res.ambiguity
+
+    clean = CymbalEvidenceReport(
+        backend_requested=BACKEND_CYMBAL, backend_used=BACKEND_CYMBAL
+    ).to_result(())
+    assert clean.status == "NO_EVIDENCE"

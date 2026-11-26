@@ -681,7 +681,7 @@ class CallerEvidenceReport:
 
         if not evidence_tuple:
             has_impairment = (
-                skipped_large > 0 or bool(truncation) or "stale index" in ambiguity
+                skipped_large > 0 or bool(truncation) or bool(ambiguity) or bool(limitations)
             )
             status: EvidenceStatus = "INCOMPLETE" if has_impairment else "NO_EVIDENCE"
         elif ambiguity or truncation or limitations or skipped_large > 0:
