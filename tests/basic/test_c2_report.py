@@ -1000,3 +1000,321 @@ def test_trial_error_row_counts_as_error_and_blocks_gate(tmp_path: Path):
     assert len(catalog_matches) == 1
     assert "ERROR" in catalog_matches[0]["tags"]
     assert catalog_matches[0]["trial_error"] == "ConnectionError: upstream reset"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: 4-axis auditor breakdown, timeout censoring, provenance summary
+# ---------------------------------------------------------------------------
+
+
+def test_four_axis_auditor_breakdown_separates_quality_auth_fa_and_false_abstention(
+    tmp_path: Path,
+):
+    """4 auditor axes stay distinct: patch quality, auth rate, false approval, false abstention."""
+    entries = [
+        _make_manifest_case("caller_01", "direct_caller", "python"),
+        _make_manifest_case("caller_02", "direct_caller", "python"),
+        _make_manifest_case("caller_03", "indirect_caller", "python"),
+        _make_manifest_case("ctrl_01", "control", "rust"),
+    ]
+    manifest_path, _ = _write_mini_manifest(tmp_path / "axes_manifest.json", entries)
+
+    s1_rows = [
+        # Baseline reference rows
+        _make_row("caller_01", "baseline", hidden_passed=False),
+        _make_row("caller_02", "baseline", hidden_passed=False),
+        _make_row("caller_03", "baseline", hidden_passed=False),
+        _make_row("ctrl_01", "baseline", hidden_passed=True),
+        # Audit arm:
+        # 1) Valid patch approved -> true positive, strict_accepted=True
+        dict(
+            _make_row(
+                "caller_01",
+                "audit",
+                hidden_passed=True,
+                audit_outcome="pass",
+                audit_verdicts=["PASS"],
+            ),
+            patch_hidden_passed=True,
+            strict_accepted=True,
+            false_approval=False,
+        ),
+        # 2) Broken patch approved -> FALSE APPROVAL
+        dict(
+            _make_row(
+                "caller_02",
+                "audit",
+                hidden_passed=False,
+                audit_outcome="pass",
+                audit_verdicts=["PASS"],
+            ),
+            patch_hidden_passed=False,
+            strict_accepted=False,
+            false_approval=True,
+        ),
+        # 3) Valid patch blocked by UNKNOWN -> FALSE ABSTENTION (not conflated with patch quality!)
+        dict(
+            _make_row(
+                "caller_03",
+                "audit",
+                hidden_passed=True,
+                audit_outcome="unknown",
+                audit_verdicts=["UNKNOWN"],
+                unknowns=1,
+            ),
+            patch_hidden_passed=True,
+            strict_accepted=False,
+            false_approval=False,
+        ),
+        # 4) Broken patch rejected -> true negative
+        dict(
+            _make_row(
+                "ctrl_01",
+                "audit",
+                hidden_passed=False,
+                audit_outcome="fail",
+                audit_verdicts=["FAIL"],
+            ),
+            patch_hidden_passed=False,
+            strict_accepted=False,
+            false_approval=False,
+        ),
+    ]
+
+    # Pure helper check directly
+    audit_only_rows = [r for r in s1_rows if r["arm"] == "audit"]
+    direct_axes = c2_report.summarize_auditor_axes(audit_only_rows)
+    assert direct_axes["hidden_passed"] == 2
+    assert direct_axes["hidden_pass_rate"] == pytest.approx(0.5)
+    assert direct_axes["audit_pass_count"] == 2
+    assert direct_axes["audit_pass_rate"] == pytest.approx(0.5)
+    assert direct_axes["false_approval_count"] == 1
+    assert direct_axes["false_approval_rate"] == pytest.approx(0.25)
+    assert direct_axes["false_abstention_count"] == 1
+    assert direct_axes["false_abstention_rate"] == pytest.approx(0.5)
+
+    s1_path = _write_jsonl(tmp_path / "axes_s1.jsonl", s1_rows)
+    rep = c2_report.analyze_report(
+        manifest_path,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(s1_path,))],
+        probe_host_cymbal=False,
+    )
+    md = c2_report.render_markdown(rep)
+
+    s1_by_arm = {row["arm"]: row for row in rep["models"][0]["stage1"]["table"]}
+    audit_m = s1_by_arm["audit"]["metrics"]
+    assert audit_m["hidden_passed"] == 2
+    assert audit_m["hidden_pass_rate"] == pytest.approx(0.5)
+    assert audit_m["audit_pass_count"] == 2
+    assert audit_m["audit_pass_rate"] == pytest.approx(0.5)
+    assert audit_m["false_approval_count"] == 1
+    assert audit_m["false_approval_rate"] == pytest.approx(0.25)
+    assert audit_m["false_abstention_count"] == 1
+    assert audit_m["false_abstention_rate"] == pytest.approx(0.5)
+    assert audit_m["strict_accepted"] == 1
+
+    base_m = s1_by_arm["baseline"]["metrics"]
+    assert base_m["audit_pass_count"] == 0
+    assert base_m["audit_pass_rate"] is None
+    assert base_m["false_abstention_count"] == 0
+    assert base_m["false_abstention_rate"] is None
+
+    assert "Auditor Breakdown" in md
+    assert "False Abstentions" in md
+    assert "1/2 (50.0%)" in md
+
+
+def test_timeout_censoring_sensitivity_reports_uncensored_latency(tmp_path: Path):
+    """Right-censored 360s timeouts report uncensored non-timeout mean/p50 alongside ITT stats."""
+    entries = [
+        _make_manifest_case("caller_01", "direct_caller", "python"),
+        _make_manifest_case("caller_02", "indirect_caller", "python"),
+        _make_manifest_case("ctrl_01", "control", "rust"),
+    ]
+    manifest_path, _ = _write_mini_manifest(tmp_path / "timeout_manifest.json", entries)
+
+    passive_rows = [
+        _make_row(
+            "caller_01",
+            "passive",
+            hidden_passed=False,
+            smoke_passed=False,
+            exit_code=124,
+            tokens=None,
+            tokens_measured=False,
+            seconds=360.0,
+        ),
+        _make_row("caller_02", "passive", hidden_passed=True, seconds=40.0),
+        _make_row("ctrl_01", "passive", hidden_passed=True, seconds=60.0),
+    ]
+    baseline_rows = [
+        _make_row("caller_01", "baseline", hidden_passed=False, seconds=20.0),
+        _make_row("caller_02", "baseline", hidden_passed=False, seconds=30.0),
+        _make_row("ctrl_01", "baseline", hidden_passed=True, seconds=40.0),
+    ]
+
+    # Direct pure-helper check
+    direct_to = c2_report.summarize_timeout_latency(passive_rows)
+    assert direct_to["timeout_count"] == 1
+    assert direct_to["timeout_rate"] == pytest.approx(1 / 3)
+    assert direct_to["non_timeout_n"] == 2
+    assert direct_to["non_timeout_seconds_mean"] == pytest.approx(50.0)
+    assert direct_to["non_timeout_seconds_p50"] == pytest.approx(50.0)
+
+    s1_path = _write_jsonl(tmp_path / "timeout_s1.jsonl", baseline_rows + passive_rows)
+    rep = c2_report.analyze_report(
+        manifest_path,
+        [c2_report.ModelRunSpec(label="m1", stage1_paths=(s1_path,))],
+        probe_host_cymbal=False,
+    )
+    md = c2_report.render_markdown(rep)
+
+    s1_by_arm = {row["arm"]: row for row in rep["models"][0]["stage1"]["table"]}
+    pm = s1_by_arm["passive"]["metrics"]
+    assert pm["timeouts"] == 1
+    assert pm["timeout_count"] == 1
+    assert pm["timeout_rate"] == pytest.approx(1 / 3)
+    assert pm["latency_seconds"]["mean"] == pytest.approx((360.0 + 40.0 + 60.0) / 3)
+    assert pm["latency_seconds"]["p50"] == pytest.approx(60.0)
+    assert pm["non_timeout_n"] == 2
+    assert pm["non_timeout_seconds_mean"] == pytest.approx(50.0)
+    assert pm["non_timeout_seconds_p50"] == pytest.approx(50.0)
+
+    assert "Timeout Censoring Sensitivity" in md
+    assert "50.0 / 50.0" in md
+
+
+def test_provenance_extraction_with_rescored_sidecar_and_legacy_fallback(tmp_path: Path):
+    """Provenance merges rows + companion .meta.json (including .rescored.jsonl) and tolerates legacy."""
+    entries = [
+        _make_manifest_case("caller_01", "direct_caller", "python"),
+        _make_manifest_case("caller_02", "indirect_caller", "python"),
+        _make_manifest_case("ctrl_01", "control", "rust"),
+    ]
+    manifest_path, _ = _write_mini_manifest(tmp_path / "prov_manifest.json", entries)
+
+    expected_params = {
+        "model": "lm_studio/qwen/qwen3.6-35b-a3b",
+        "provider": "lm_studio",
+        "temperature": 0.6,
+        "max_tokens": 32768,
+        "thinking_tokens": None,
+        "reasoning_effort": None,
+        "dropped_params": [],
+        "extra_params": {"max_tokens": 32768},
+    }
+    expected_cfg = {
+        "config_file": "/dev/null",
+        "default_model_settings": False,
+        "model_settings_files": ["/repo/aider/resources/model-settings.yml"],
+        "model_metadata_files": [],
+    }
+    expected_provider = {
+        "id": "qwen/qwen3.6-35b-a3b",
+        "quantization": "Q4_K_M",
+        "state": "loaded",
+        "loaded_context_length": 65536,
+        "max_context_length": 262144,
+        "api_base": "http://127.0.0.1:1234/v1",
+    }
+
+    # Companion base .meta.json (for stage1.rescored.jsonl -> stage1.meta.json fallback lookup!)
+    base_sidecar = {
+        "model": "lm_studio/qwen/qwen3.6-35b-a3b",
+        "git_commit": "11223344556677889900",
+        "git_dirty": True,
+        "git_tracked_dirty": False,
+        "git_untracked_count": 2,
+        "python_version": "3.12.13",
+        "seed": 20261123,
+        "map_tokens": 1024,
+        "effective_model_params": expected_params,
+        "config_provenance": expected_cfg,
+        "provider_provenance": expected_provider,
+    }
+    (tmp_path / "stage1.meta.json").write_text(
+        json.dumps({"schema_version": 2, "latest": base_sidecar, "runs": [base_sidecar]}),
+        encoding="utf-8",
+    )
+
+    r1 = _make_row("caller_01", "baseline", hidden_passed=False)
+    r1["effective_model_params"] = dict(expected_params)
+    r1["config_provenance"] = dict(expected_cfg)
+    r1["ignored_settings"] = []
+    r1["metadata"] = {"git_commit": "11223344556677889900", "rescore_source": "repo"}
+
+    r2 = _make_row("caller_02", "baseline", hidden_passed=False)
+    r2["effective_model_params"] = dict(expected_params)
+    r2["config_provenance"] = dict(expected_cfg)
+    r2["ignored_settings"] = ["thinking_tokens"]
+    r2["metadata"] = {"git_commit": "11223344556677889900", "rescore_source": "patch_only"}
+
+    r3 = _make_row("ctrl_01", "baseline", hidden_passed=True)
+    r3["effective_model_params"] = dict(expected_params)
+    r3["config_provenance"] = dict(expected_cfg)
+    r3["ignored_settings"] = []
+    r3["metadata"] = {"git_commit": "11223344556677889900"}
+
+    rescored_path = tmp_path / "stage1.rescored.jsonl"
+    rescored_path.write_text("\n".join(json.dumps(r) for r in (r1, r2, r3)) + "\n", encoding="utf-8")
+
+    # Rescored path discovers base stage1.meta.json
+    loaded_meta = c2_report.load_sidecar_metadata(rescored_path)
+    assert loaded_meta is not None
+    assert loaded_meta["git_commit"] == "11223344556677889900"
+
+    rep = c2_report.analyze_report(
+        manifest_path,
+        [c2_report.ModelRunSpec(label="qwen3.6", stage1_paths=(rescored_path,))],
+        probe_host_cymbal=False,
+    )
+    md = c2_report.render_markdown(rep)
+
+    prov = rep["provenance"]
+    assert prov["git_commit"] == "11223344556677889900"
+    assert prov["git_tracked_dirty"] is False
+    assert prov["effective_model_params"] == expected_params
+    assert prov["effective_model_params_all_matched"] is True
+    assert prov["effective_model_params_matched_rows"] == 3
+    assert prov["ignored_settings_rows"] == 1
+    assert prov["config_provenance"] == expected_cfg
+    assert prov["provider_provenance"] == expected_provider
+    assert prov["rescore_source"] == {"repo": 1, "patch_only": 1, "none": 1}
+
+    assert "## Provenance & Runtime Integrity" in md
+    assert "112233445566" in md
+    assert "Q4_K_M" in md
+    assert "65536" in md
+    assert "repo=1" in md
+    assert "patch_only=1" in md
+    assert "none=1" in md
+
+    # Param drift in one row flips effective_model_params_all_matched -> False
+    r3_drifted = dict(r3, effective_model_params=dict(expected_params, temperature=0.0))
+    drifted_prov = c2_report.extract_run_provenance([r1, r2, r3_drifted], sidecars=[base_sidecar])
+    assert drifted_prov["effective_model_params_all_matched"] is False
+    assert drifted_prov["effective_model_params_matched_rows"] == 2
+    assert drifted_prov["effective_model_params_mismatched_rows"] == 1
+
+    # Legacy JSONL rows lacking provenance & sidecar degrade gracefully
+    legacy_rows = [
+        {"case": "caller_01", "arm": "baseline", "passed": False, "seconds": 10.0},
+        {"case": "caller_01", "arm": "passive", "passed": True, "seconds": 12.0},
+    ]
+    legacy_path = _write_jsonl(tmp_path / "legacy.jsonl", legacy_rows)
+    legacy_rep = c2_report.analyze_report(
+        manifest_path,
+        [c2_report.ModelRunSpec(label="legacy", stage1_paths=(legacy_path,))],
+        probe_host_cymbal=False,
+    )
+    legacy_prov = legacy_rep["provenance"]
+    assert legacy_prov["git_commit"] is None
+    assert legacy_prov["git_tracked_dirty"] is None
+    assert legacy_prov["effective_model_params"] is None
+    assert legacy_prov["effective_model_params_all_matched"] is None
+    assert legacy_prov["ignored_settings_rows"] == 0
+    assert legacy_prov["config_provenance"] is None
+    assert legacy_prov["provider_provenance"] is None
+    assert legacy_prov["rescore_source"] == {"repo": 0, "patch_only": 0, "none": 2}
+    legacy_md = c2_report.render_markdown(legacy_rep)
+    assert "## Provenance & Runtime Integrity" in legacy_md

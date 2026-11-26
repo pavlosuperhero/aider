@@ -33,6 +33,7 @@ from typing import Any, Iterable, Literal, Protocol, Sequence
 import warnings
 
 from aider.local_callers import (
+    BASH_DEF_REGEXES,
     CONTROL_KEYWORDS,
     DEF_REGEXES,
     LARGE_FILE_LIMITATION,
@@ -2013,11 +2014,50 @@ class _EditableReadResult:
     status: Literal["ok", "too_large", "unreadable"]
 
 
-def _is_supported_editable_code_path(rel_path: str) -> bool:
+def _peek_shebang_line(root: Path, rel_path: str) -> str:
+    """Read a bounded first line when an extensionless file begins with ``#!``."""
+    norm = normalize_repo_path(root, rel_path)
+    if norm is None:
+        return ""
+    full_path = root / norm
+    try:
+        with full_path.open("rb") as stream:
+            head = stream.read(256)
+    except OSError:
+        return ""
+    if not head.startswith(b"#!"):
+        return ""
+    first_line = head.split(b"\n", 1)[0]
+    if b"\x00" in first_line:
+        return ""
+    try:
+        return first_line.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _is_supported_editable_code_path(
+    rel_path: str,
+    *,
+    root: Path | None = None,
+    source: str | None = None,
+) -> bool:
     suffix = Path(rel_path).suffix.lower()
     if suffix == ".py" or suffix in _C_CPP_SUFFIXES:
         return True
     lang = resolve_lang(rel_path)
+    if lang:
+        return lang not in _NON_CODE_LANGS
+    if suffix:
+        return False
+    probe = (
+        source
+        if source is not None
+        else (_peek_shebang_line(root, rel_path) if root is not None else "")
+    )
+    if not probe:
+        return False
+    lang = resolve_lang(rel_path, probe)
     return bool(lang and lang not in _NON_CODE_LANGS)
 
 
@@ -2311,7 +2351,7 @@ def _unwrap_c_declarator_name(node: Any, *, in_class: bool = False) -> tuple[str
     return None, "function"
 
 
-def _find_matching_brace(source: str, open_idx: int) -> int:
+def _find_matching_brace(source: str, open_idx: int, *, hash_comments: bool = False) -> int:
     """Return index of the closing ``}`` matching ``source[open_idx] == '{'`` (or len(source))."""
     depth = 0
     i = open_idx
@@ -2326,6 +2366,10 @@ def _find_matching_brace(source: str, open_idx: int) -> int:
             if ch == in_str:
                 in_str = ""
             i += 1
+            continue
+        if hash_comments and ch == "#" and (i == 0 or source[i - 1] in " \t\r\n;(&|"):
+            nl = source.find("\n", i + 1)
+            i = n if nl == -1 else nl + 1
             continue
         if ch == "/" and i + 1 < n:
             nxt = source[i + 1]
@@ -2514,9 +2558,12 @@ def _extract_generic_targets(
 ) -> list[_TargetDefinition]:
     if Path(path).suffix.lower() in _C_CPP_SUFFIXES:
         return _extract_c_cpp_targets(path, source, words)
+    lang = resolve_lang(path, source)
+    is_bash = lang == "bash"
+    patterns = BASH_DEF_REGEXES if is_bash else DEF_REGEXES
     found: list[_TargetDefinition] = []
     seen: set[str] = set()
-    for pattern in DEF_REGEXES:
+    for pattern in patterns:
         for match in pattern.finditer(source):
             name = match.group(1)
             if (
@@ -2526,13 +2573,16 @@ def _extract_generic_targets(
                 and name not in seen
             ):
                 seen.add(name)
-                line = source.count("\n", 0, match.start()) + 1
+                name_start = match.start(1)
+                line = source.count("\n", 0, name_start) + 1
                 end_line = line
                 line_end = source.find("\n", match.end())
                 search_end = len(source) if line_end == -1 else line_end
-                brace_idx = source.find("{", match.start(), search_end)
+                brace_idx = source.find("{", name_start, search_end)
                 if brace_idx != -1:
-                    close_idx = _find_matching_brace(source, brace_idx)
+                    close_idx = _find_matching_brace(
+                        source, brace_idx, hash_comments=is_bash
+                    )
                     end_line = max(line, source.count("\n", 0, close_idx) + 1)
                 found.append(
                     _TargetDefinition(
@@ -2570,7 +2620,7 @@ def _extract_editable_targets(
     all_by_symbol: dict[str, list[_TargetDefinition]] = {}
     impairment_truncations: list[str] = []
     for rel_path in editable_paths:
-        if not _is_supported_editable_code_path(rel_path):
+        if not _is_supported_editable_code_path(rel_path, root=resolved_root):
             continue
         read_res = _read_editable_text_checked(
             resolved_root, rel_path, max_bytes=max_scan_bytes

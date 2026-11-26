@@ -32,6 +32,9 @@ if str(_THIS_DIR) not in sys.path:
 import heldout  # noqa: E402
 import replay_corpus  # noqa: E402
 
+summarize_auditor_axes = heldout.summarize_auditor_axes
+summarize_timeout_latency = heldout.summarize_timeout_latency
+
 STAGE1_ARM_ORDER: tuple[str, ...] = (
     "baseline",
     "passive",
@@ -403,10 +406,23 @@ def load_and_verify_manifest(
     }
 
 
+def resolve_sidecar_path(jsonl_path: Path) -> Path | None:
+    """Resolve the companion ``.meta.json`` path, including ``.rescored.jsonl`` fallback."""
+    direct = jsonl_path.with_suffix(".meta.json")
+    if direct.is_file():
+        return direct
+    if jsonl_path.stem.endswith(".rescored"):
+        base_stem = jsonl_path.stem.removesuffix(".rescored")
+        fallback = jsonl_path.with_name(f"{base_stem}.meta.json")
+        if fallback.is_file():
+            return fallback
+    return None
+
+
 def load_sidecar_metadata(jsonl_path: Path) -> dict[str, Any] | None:
     """Load the ``.meta.json`` sidecar adjacent to ``jsonl_path``, if present."""
-    sidecar = jsonl_path.with_suffix(".meta.json")
-    if not sidecar.is_file():
+    sidecar = resolve_sidecar_path(jsonl_path)
+    if sidecar is None:
         return None
     raw = json.loads(sidecar.read_text(encoding="utf-8"))
     if isinstance(raw, dict):
@@ -533,11 +549,13 @@ def normalize_row(
 
     verdicts = [str(v).upper() for v in (raw.get("audit_verdicts") or [])]
     audit_outcome = str(outcomes["audit_outcome"]).lower()
+    audit_passed = outcomes["audit_passed"]
     audit_ran = bool(raw.get("audit_ran")) or audit_outcome != "not_run" or bool(verdicts)
+    audit_required = heldout._is_audit_required(raw)
 
-    false_approval = bool(audit_outcome == "pass" and hidden_passed is False)
-    if hidden_passed is None and raw.get("false_approval") is not None:
-        false_approval = bool(raw["false_approval"])
+    eval_outcomes = dict(outcomes, hidden_passed=hidden_passed)
+    false_approval = heldout._is_false_approval_row(raw, eval_outcomes)
+    false_abstention = bool(audit_outcome == "unknown" and hidden_passed is True)
 
     unknown_verdicts = max(
         int(raw.get("unknowns") or 0),
@@ -591,6 +609,16 @@ def normalize_row(
         reflections = None
 
     seconds = float(raw["seconds"]) if raw.get("seconds") is not None else None
+    raw_emp = raw.get("effective_model_params")
+    effective_model_params = dict(raw_emp) if isinstance(raw_emp, Mapping) else None
+    raw_cfg = raw.get("config_provenance")
+    config_provenance = dict(raw_cfg) if isinstance(raw_cfg, Mapping) else None
+    raw_prov = raw.get("provider_provenance")
+    provider_provenance = dict(raw_prov) if isinstance(raw_prov, Mapping) else None
+    raw_ign = raw.get("ignored_settings")
+    ignored_settings = (
+        [str(s) for s in raw_ign if s] if isinstance(raw_ign, (list, tuple)) else []
+    )
 
     return {
         "case_id": case_id,
@@ -610,6 +638,8 @@ def normalize_row(
         "trial_error": str(trial_error) if trial_error else None,
         "hidden_passed": hidden_passed,
         "hidden_outcome": hidden_outcome,
+        "patch_hidden_passed": outcomes["patch_hidden_passed"],
+        "strict_accepted": outcomes["strict_accepted"],
         "smoke_passed": smoke_passed,
         "smoke_outcome": smoke_outcome,
         "strict_passed": strict_passed,
@@ -620,9 +650,12 @@ def normalize_row(
         "is_error": is_error,
         "is_out_of_scope": is_out_of_scope,
         "audit_ran": audit_ran,
+        "audit_required": audit_required,
+        "audit_passed": audit_passed,
         "audit_outcome": audit_outcome,
         "audit_verdicts": verdicts,
         "false_approval": false_approval,
+        "false_abstention": false_abstention,
         "unknown_final": unknown_final,
         "unknown_verdicts": unknown_verdicts,
         "audit_errors": audit_errors,
@@ -639,6 +672,10 @@ def normalize_row(
         "reflections": reflections,
         "extra_calls": int(raw["extra_calls"]) if raw.get("extra_calls") is not None else None,
         "seconds": seconds,
+        "effective_model_params": effective_model_params,
+        "config_provenance": config_provenance,
+        "provider_provenance": provider_provenance,
+        "ignored_settings": ignored_settings,
         "row_metadata": raw.get("metadata") if isinstance(raw.get("metadata"), Mapping) else {},
     }
 
@@ -662,26 +699,39 @@ def _mean_summary(values: Sequence[float | None], total_n: int) -> dict[str, Any
 
 
 def compute_arm_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Compute standalone descriptive, safety, token, and latency metrics for an arm."""
+    """Compute standalone descriptive, 4-axis auditor, timeout censoring, token, and latency metrics."""
     n = len(rows)
-    hidden_known = [r for r in rows if r["hidden_passed"] is not None]
-    hidden_n = len(hidden_known)
-    hidden_pass = sum(1 for r in hidden_known if r["hidden_passed"])
+    axes = summarize_auditor_axes(rows)
+    to_lat = summarize_timeout_latency(rows)
+
+    hidden_n = int(axes["hidden_n"])
+    hidden_pass = int(axes["hidden_passed"])
     w_lo, w_hi = wilson_ci(hidden_pass, hidden_n)
 
     smoke_known = [r for r in rows if r["smoke_passed"] is not None]
     smoke_pass = sum(1 for r in smoke_known if r["smoke_passed"])
     strict_pass = sum(1 for r in rows if r["strict_passed"])
+    strict_acc_recorded = [r for r in rows if r.get("strict_accepted") is not None]
+    if strict_acc_recorded:
+        strict_accepted = sum(1 for r in strict_acc_recorded if r["strict_accepted"])
+        strict_accepted_n = len(strict_acc_recorded)
+    else:
+        strict_accepted = sum(
+            1
+            for r in rows
+            if r["strict_passed"] and (not r.get("audit_required") or r.get("audit_passed") is True)
+        )
+        strict_accepted_n = n
     commit_known = [r for r in rows if r["commit_passed"] is not None]
     commit_pass = sum(1 for r in commit_known if r["commit_passed"])
 
-    audit_ran = sum(1 for r in rows if r["audit_ran"])
+    audit_ran = int(axes["audit_ran"])
     audit_outcomes: Counter[str] = Counter(str(r["audit_outcome"]) for r in rows)
-    false_approvals = sum(1 for r in rows if r["false_approval"])
+    false_approvals = int(axes["false_approval_count"])
     unknown_rows = sum(1 for r in rows if r["unknown_final"] or r["unknown_verdicts"] > 0)
     unknown_final_rows = sum(1 for r in rows if r["unknown_final"])
     unknown_verdicts = sum(int(r["unknown_verdicts"]) for r in rows)
-    timeouts = sum(1 for r in rows if r["is_timeout"])
+    timeouts = int(to_lat["timeout_count"])
     errors = sum(1 for r in rows if r["is_error"])
     out_of_scope = sum(1 for r in rows if r["is_out_of_scope"])
     evidence_count = sum(1 for r in rows if r["evidence"])
@@ -710,26 +760,42 @@ def compute_arm_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "n": n,
         "hidden_n": hidden_n,
         "hidden_passed": hidden_pass,
-        "hidden_pass_rate": (hidden_pass / hidden_n) if hidden_n else None,
+        "hidden_pass_rate": axes["hidden_pass_rate"],
         "wilson_ci_low": w_lo,
         "wilson_ci_high": w_hi,
         "smoke_n": len(smoke_known),
         "smoke_passed": smoke_pass,
         "strict_passed": strict_pass,
+        "strict_accepted": strict_accepted,
+        "strict_accepted_n": strict_accepted_n,
         "commit_n": len(commit_known),
         "commit_passed": commit_pass,
         "evidence_attached": evidence_count,
         "audit_ran": audit_ran,
+        "audit_eligible_n": int(axes["audit_eligible_n"]),
+        "audit_pass_count": int(axes["audit_pass_count"]),
+        "audit_pass_rate": axes["audit_pass_rate"],
         "audit_outcomes": dict(sorted(audit_outcomes.items())),
         "false_approval_count": false_approvals,
-        "false_approval_rate": (false_approvals / audit_ran) if audit_ran else None,
+        "false_approval_rate": axes["false_approval_rate"],
         "false_approval_rate_all": (false_approvals / n) if n else None,
+        "false_abstention_count": int(axes["false_abstention_count"]),
+        "false_abstention_eligible_n": int(axes["false_abstention_eligible_n"]),
+        "false_abstention_rate": axes["false_abstention_rate"],
+        "auditor_axes": axes,
         "unknown_row_count": unknown_rows,
         "unknown_final_count": unknown_final_rows,
         "unknown_verdict_count": unknown_verdicts,
         "unknown_rate": (unknown_rows / audit_ran) if audit_ran else None,
         "unknown_final_rate": (unknown_final_rows / audit_ran) if audit_ran else None,
         "timeouts": timeouts,
+        "timeout_count": timeouts,
+        "timeout_rate": to_lat["timeout_rate"],
+        "non_timeout_n": int(to_lat["non_timeout_n"]),
+        "non_timeout_seconds_mean": to_lat["non_timeout_seconds_mean"],
+        "non_timeout_seconds_p50": to_lat["non_timeout_seconds_p50"],
+        "non_timeout_seconds_p95": to_lat["non_timeout_seconds_p95"],
+        "timeout_latency": to_lat,
         "errors": errors,
         "out_of_scope": out_of_scope,
         "first_prompt_tokens": first_prompt,
@@ -1099,6 +1165,8 @@ def build_failure_catalog(
             tags.append("TIMEOUT")
         if r["false_approval"]:
             tags.append("FALSE_APPROVAL")
+        if r.get("false_abstention"):
+            tags.append("FALSE_ABSTENTION")
         if r["unknown_final"] or int(r["unknown_verdicts"]) > 0:
             tags.append("UNKNOWN_VERDICT")
         if r["is_error"]:
@@ -1222,6 +1290,202 @@ def _stratified_analysis(
     return results
 
 
+def _dedupe_mappings(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return distinct mapping dicts preserving first-seen order via canonical JSON keys."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in items:
+        normalized = dict(item)
+        key = json.dumps(normalized, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    return unique
+
+
+def extract_run_provenance(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    sidecars: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Pure provenance extractor merging JSONL rows and optional sidecar ``.meta.json`` dicts."""
+    commits: set[str] = set()
+    dirty_flags: set[bool] = set()
+    tracked_dirty_flags: set[bool] = set()
+    untracked_counts: set[int] = set()
+    sidecar_params: list[dict[str, Any]] = []
+    row_params_all: list[dict[str, Any] | None] = []
+    config_provs: list[dict[str, Any]] = []
+    provider_provs: list[dict[str, Any]] = []
+    ignored_settings_rows = 0
+    ignored_settings_names: set[str] = set()
+    rescore_source: dict[str, int] = {"repo": 0, "patch_only": 0, "none": 0}
+
+    for meta in sidecars:
+        if not isinstance(meta, Mapping):
+            continue
+        if meta.get("git_commit"):
+            commits.add(str(meta["git_commit"]))
+        if meta.get("git_dirty") is not None:
+            dirty_flags.add(bool(meta["git_dirty"]))
+        if meta.get("git_tracked_dirty") is not None:
+            tracked_dirty_flags.add(bool(meta["git_tracked_dirty"]))
+        if meta.get("git_untracked_count") is not None:
+            untracked_counts.add(int(meta["git_untracked_count"]))
+        emp = meta.get("effective_model_params")
+        if not isinstance(emp, Mapping):
+            controls = meta.get("controls")
+            if isinstance(controls, Mapping) and isinstance(
+                controls.get("effective_model_params"), Mapping
+            ):
+                emp = controls["effective_model_params"]
+        if isinstance(emp, Mapping):
+            sidecar_params.append(dict(emp))
+        cfg = meta.get("config_provenance")
+        if isinstance(cfg, Mapping):
+            config_provs.append(dict(cfg))
+        prov = meta.get("provider_provenance")
+        if isinstance(prov, Mapping):
+            provider_provs.append(dict(prov))
+
+    for row in rows:
+        rmeta = row.get("row_metadata")
+        if not isinstance(rmeta, Mapping):
+            raw_meta = row.get("metadata")
+            rmeta = raw_meta if isinstance(raw_meta, Mapping) else {}
+        if rmeta.get("git_commit"):
+            commits.add(str(rmeta["git_commit"]))
+        if rmeta.get("git_dirty") is not None:
+            dirty_flags.add(bool(rmeta["git_dirty"]))
+        if rmeta.get("git_tracked_dirty") is not None:
+            tracked_dirty_flags.add(bool(rmeta["git_tracked_dirty"]))
+        if rmeta.get("git_untracked_count") is not None:
+            untracked_counts.add(int(rmeta["git_untracked_count"]))
+
+        row_emp = row.get("effective_model_params")
+        row_params_all.append(dict(row_emp) if isinstance(row_emp, Mapping) else None)
+
+        row_cfg = row.get("config_provenance")
+        if isinstance(row_cfg, Mapping):
+            config_provs.append(dict(row_cfg))
+        row_prov = row.get("provider_provenance") or rmeta.get("provider_provenance")
+        if isinstance(row_prov, Mapping):
+            provider_provs.append(dict(row_prov))
+
+        ign = row.get("ignored_settings")
+        if isinstance(ign, (list, tuple)) and any(ign):
+            ignored_settings_rows += 1
+            for name in ign:
+                if name:
+                    ignored_settings_names.add(str(name))
+
+        raw_src = rmeta.get("rescore_source") or row.get("rescore_source")
+        src_key = str(raw_src).strip() if raw_src else "none"
+        if not src_key:
+            src_key = "none"
+        rescore_source[src_key] = rescore_source.get(src_key, 0) + 1
+
+    unique_sidecar_params = _dedupe_mappings(sidecar_params)
+    non_null_row_params = [p for p in row_params_all if p is not None]
+    unique_row_params = _dedupe_mappings(non_null_row_params)
+
+    canonical_params: dict[str, Any] | list[dict[str, Any]] | None
+    if unique_sidecar_params:
+        reference_params = unique_sidecar_params[0]
+        canonical_params = (
+            unique_sidecar_params[0]
+            if len(unique_sidecar_params) == 1
+            else unique_sidecar_params
+        )
+    elif unique_row_params:
+        reference_params = unique_row_params[0]
+        canonical_params = (
+            unique_row_params[0] if len(unique_row_params) == 1 else unique_row_params
+        )
+    else:
+        reference_params = None
+        canonical_params = None
+
+    total_rows = len(rows)
+    recorded_rows = len(non_null_row_params)
+    if reference_params is None:
+        matched_rows = 0
+        mismatched_rows = 0
+        all_matched: bool | None = None
+    else:
+        expected_keys = (
+            {json.dumps(p, sort_keys=True) for p in unique_sidecar_params}
+            if unique_sidecar_params
+            else {json.dumps(reference_params, sort_keys=True)}
+        )
+        matched_rows = sum(
+            1
+            for p in row_params_all
+            if p is not None and json.dumps(p, sort_keys=True) in expected_keys
+        )
+        mismatched_rows = sum(
+            1
+            for p in row_params_all
+            if p is not None and json.dumps(p, sort_keys=True) not in expected_keys
+        )
+        if total_rows == 0:
+            all_matched = None
+        elif recorded_rows == 0:
+            all_matched = None
+        else:
+            all_matched = matched_rows == total_rows and mismatched_rows == 0
+
+    unique_commits = sorted(commits)
+    if len(unique_commits) == 1:
+        git_commit: str | None = unique_commits[0]
+    elif unique_commits:
+        git_commit = ", ".join(unique_commits)
+    else:
+        git_commit = None
+
+    if True in tracked_dirty_flags:
+        git_tracked_dirty: bool | None = True
+    elif False in tracked_dirty_flags:
+        git_tracked_dirty = False
+    else:
+        git_tracked_dirty = None
+
+    unique_cfgs = _dedupe_mappings(config_provs)
+    if not unique_cfgs:
+        config_provenance: dict[str, Any] | list[dict[str, Any]] | None = None
+    elif len(unique_cfgs) == 1:
+        config_provenance = unique_cfgs[0]
+    else:
+        config_provenance = unique_cfgs
+
+    unique_provs = _dedupe_mappings(provider_provs)
+    if not unique_provs:
+        provider_provenance: dict[str, Any] | list[dict[str, Any]] | None = None
+    elif len(unique_provs) == 1:
+        provider_provenance = unique_provs[0]
+    else:
+        provider_provenance = unique_provs
+
+    return {
+        "git_commit": git_commit,
+        "git_commits": unique_commits,
+        "git_dirty": sorted(dirty_flags),
+        "git_tracked_dirty": git_tracked_dirty,
+        "git_untracked_counts": sorted(untracked_counts),
+        "effective_model_params": canonical_params,
+        "effective_model_params_recorded_rows": recorded_rows,
+        "effective_model_params_matched_rows": matched_rows,
+        "effective_model_params_mismatched_rows": mismatched_rows,
+        "effective_model_params_all_matched": all_matched,
+        "ignored_settings_rows": ignored_settings_rows,
+        "ignored_settings_names": sorted(ignored_settings_names),
+        "config_provenance": config_provenance,
+        "provider_provenance": provider_provenance,
+        "rescore_source": rescore_source,
+        "total_rows": total_rows,
+    }
+
+
 def _collect_run_provenance(
     label: str,
     paths: Sequence[Path],
@@ -1231,25 +1495,22 @@ def _collect_run_provenance(
 ) -> dict[str, Any]:
     """Summarize exact run provenance from sidecar ``.meta.json`` files and rows."""
     models: set[str] = set()
-    commits: set[str] = set()
-    dirty_flags: set[bool] = set()
     pythons: set[str] = set()
     seeds: set[Any] = set()
     map_tokens_set: set[Any] = set()
     suites: set[str] = set()
     timestamps: set[str] = set()
     sidecar_files: list[str] = []
+    sidecar_dicts: list[Mapping[str, Any]] = []
 
     for path, meta in sidecars:
         if meta is None:
             continue
-        sidecar_files.append(str(path.with_suffix(".meta.json")))
+        sidecar_dicts.append(meta)
+        resolved = resolve_sidecar_path(path)
+        sidecar_files.append(str(resolved if resolved is not None else path.with_suffix(".meta.json")))
         if meta.get("model"):
             models.add(str(meta["model"]))
-        if meta.get("git_commit"):
-            commits.add(str(meta["git_commit"]))
-        if meta.get("git_dirty") is not None:
-            dirty_flags.add(bool(meta["git_dirty"]))
         if meta.get("python_version"):
             pythons.add(str(meta["python_version"]))
         if meta.get("seed") is not None:
@@ -1267,10 +1528,6 @@ def _collect_run_provenance(
         if row.get("map_tokens") is not None:
             map_tokens_set.add(row["map_tokens"])
         rmeta = row.get("row_metadata") or {}
-        if rmeta.get("git_commit"):
-            commits.add(str(rmeta["git_commit"]))
-        if rmeta.get("git_dirty") is not None:
-            dirty_flags.add(bool(rmeta["git_dirty"]))
         if rmeta.get("python_version"):
             pythons.add(str(rmeta["python_version"]))
         if rmeta.get("seed") is not None:
@@ -1278,20 +1535,19 @@ def _collect_run_provenance(
         if rmeta.get("suite"):
             suites.add(str(rmeta["suite"]))
 
+    extracted = extract_run_provenance(rows, sidecars=sidecar_dicts)
     return {
         "label": label,
         "input_files": [str(p) for p in paths],
         "sidecar_files": sidecar_files,
         "models": sorted(models),
-        "git_commits": sorted(commits),
-        "git_dirty": sorted(dirty_flags),
         "python_versions": sorted(pythons),
         "seeds": sorted(seeds, key=str),
         "map_tokens": sorted(map_tokens_set, key=str),
         "suites": sorted(suites),
         "timestamps_utc": sorted(timestamps),
         "cymbal_version": cymbal_version,
-        "total_rows": len(rows),
+        **extracted,
     }
 
 
@@ -1677,6 +1933,99 @@ def _aggregate_shipping_gates(model_reports: Sequence[Mapping[str, Any]]) -> lis
     return summary
 
 
+def _aggregate_report_provenance(model_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate runtime provenance across one or more evaluated model runs."""
+    by_model = {str(rep["label"]): rep["provenance"] for rep in model_reports}
+    if len(model_reports) == 1:
+        p = dict(model_reports[0]["provenance"])
+        p["by_model"] = by_model
+        return p
+
+    commits: set[str] = set()
+    dirty_flags: set[bool] = set()
+    tracked_dirty_flags: set[bool] = set()
+    emp_items: list[dict[str, Any]] = []
+    cfg_items: list[dict[str, Any]] = []
+    prov_items: list[dict[str, Any]] = []
+    all_matched_vals: list[bool] = []
+    recorded_rows = 0
+    matched_rows = 0
+    mismatched_rows = 0
+    ignored_rows = 0
+    ignored_names: set[str] = set()
+    rescore_source: dict[str, int] = {"repo": 0, "patch_only": 0, "none": 0}
+    total_rows = 0
+
+    for rep in model_reports:
+        p = rep["provenance"]
+        commits.update(p.get("git_commits") or ())
+        dirty_flags.update(p.get("git_dirty") or ())
+        if p.get("git_tracked_dirty") is not None:
+            tracked_dirty_flags.add(bool(p["git_tracked_dirty"]))
+        emp = p.get("effective_model_params")
+        if isinstance(emp, Mapping):
+            emp_items.append(dict(emp))
+        elif isinstance(emp, list):
+            emp_items.extend(dict(x) for x in emp if isinstance(x, Mapping))
+        cfg = p.get("config_provenance")
+        if isinstance(cfg, Mapping):
+            cfg_items.append(dict(cfg))
+        elif isinstance(cfg, list):
+            cfg_items.extend(dict(x) for x in cfg if isinstance(x, Mapping))
+        pr = p.get("provider_provenance")
+        if isinstance(pr, Mapping):
+            prov_items.append(dict(pr))
+        elif isinstance(pr, list):
+            prov_items.extend(dict(x) for x in pr if isinstance(x, Mapping))
+        if p.get("effective_model_params_all_matched") is not None:
+            all_matched_vals.append(bool(p["effective_model_params_all_matched"]))
+        recorded_rows += int(p.get("effective_model_params_recorded_rows") or 0)
+        matched_rows += int(p.get("effective_model_params_matched_rows") or 0)
+        mismatched_rows += int(p.get("effective_model_params_mismatched_rows") or 0)
+        ignored_rows += int(p.get("ignored_settings_rows") or 0)
+        ignored_names.update(p.get("ignored_settings_names") or ())
+        for k, v in (p.get("rescore_source") or {}).items():
+            rescore_source[k] = rescore_source.get(k, 0) + int(v)
+        total_rows += int(p.get("total_rows") or 0)
+
+    unique_commits = sorted(commits)
+    unique_emps = _dedupe_mappings(emp_items)
+    unique_cfgs = _dedupe_mappings(cfg_items)
+    unique_provs = _dedupe_mappings(prov_items)
+    return {
+        "git_commit": (
+            unique_commits[0]
+            if len(unique_commits) == 1
+            else (", ".join(unique_commits) if unique_commits else None)
+        ),
+        "git_commits": unique_commits,
+        "git_dirty": sorted(dirty_flags),
+        "git_tracked_dirty": (
+            True
+            if True in tracked_dirty_flags
+            else (False if False in tracked_dirty_flags else None)
+        ),
+        "effective_model_params": (
+            unique_emps[0] if len(unique_emps) == 1 else (unique_emps or None)
+        ),
+        "effective_model_params_recorded_rows": recorded_rows,
+        "effective_model_params_matched_rows": matched_rows,
+        "effective_model_params_mismatched_rows": mismatched_rows,
+        "effective_model_params_all_matched": (
+            all(all_matched_vals) if all_matched_vals else None
+        ),
+        "ignored_settings_rows": ignored_rows,
+        "ignored_settings_names": sorted(ignored_names),
+        "config_provenance": unique_cfgs[0] if len(unique_cfgs) == 1 else (unique_cfgs or None),
+        "provider_provenance": (
+            unique_provs[0] if len(unique_provs) == 1 else (unique_provs or None)
+        ),
+        "rescore_source": rescore_source,
+        "total_rows": total_rows,
+        "by_model": by_model,
+    }
+
+
 def analyze_report(
     manifest_path: str | Path,
     runs: Sequence[ModelRunSpec],
@@ -1702,6 +2051,7 @@ def analyze_report(
         entry for rep in model_reports for entry in rep["failure_catalog"]
     ]
     overall_gates = _aggregate_shipping_gates(model_reports)
+    report_provenance = _aggregate_report_provenance(model_reports)
     return {
         "schema_version": "c2-report-1.0",
         "methodological_grounding": {
@@ -1716,6 +2066,7 @@ def analyze_report(
             ),
         },
         "manifest": {k: v for k, v in manifest_info.items() if k != "cases_by_id"},
+        "provenance": report_provenance,
         "control_margin": control_margin,
         "models": model_reports,
         "failure_catalog": all_failures,
@@ -1889,6 +2240,151 @@ def _render_stratified_table(
     lines.append("")
 
 
+def _fmt_effective_params_summary(prov: Mapping[str, Any]) -> str:
+    emp = prov.get("effective_model_params")
+    if emp is None:
+        return "n/a"
+    if isinstance(emp, list):
+        base = f"{len(emp)} distinct param sets"
+    else:
+        bits = []
+        if emp.get("temperature") is not None:
+            bits.append(f"temp={emp['temperature']}")
+        if emp.get("max_tokens") is not None:
+            bits.append(f"max_tok={emp['max_tokens']}")
+        if emp.get("thinking_tokens") is not None:
+            bits.append(f"thinking={emp['thinking_tokens']}")
+        if emp.get("reasoning_effort") is not None:
+            bits.append(f"reasoning={emp['reasoning_effort']}")
+        base = ", ".join(bits) if bits else "recorded"
+    matched = int(prov.get("effective_model_params_matched_rows") or 0)
+    total = int(prov.get("total_rows") or 0)
+    all_ok = prov.get("effective_model_params_all_matched")
+    if all_ok is True:
+        status = f"100% match ({matched}/{total})"
+    elif all_ok is False:
+        status = f"MISMATCH ({matched}/{total})"
+    else:
+        status = "row-level unrecorded"
+    return f"{base} [{status}]"
+
+
+def _fmt_config_provenance(cfg: Any) -> str:
+    if cfg is None:
+        return "n/a"
+    if isinstance(cfg, list):
+        return f"{len(cfg)} distinct configs"
+    if isinstance(cfg, Mapping):
+        bits = []
+        if "config_file" in cfg:
+            bits.append(f"config={cfg['config_file']}")
+        if "default_model_settings" in cfg:
+            bits.append(f"default_settings={cfg['default_model_settings']}")
+        msf = cfg.get("model_settings_files")
+        if isinstance(msf, list):
+            bits.append(f"settings_files={len(msf)}")
+        return ", ".join(bits) if bits else "recorded"
+    return str(cfg)
+
+
+def _fmt_provider_provenance(provider: Any) -> str:
+    if provider is None:
+        return "n/a"
+    if isinstance(provider, list):
+        return f"{len(provider)} providers"
+    if isinstance(provider, Mapping):
+        bits = []
+        if provider.get("quantization"):
+            bits.append(f"quant={provider['quantization']}")
+        if provider.get("loaded_context_length") is not None:
+            bits.append(f"loaded_ctx={provider['loaded_context_length']}")
+        if provider.get("max_context_length") is not None:
+            bits.append(f"max_ctx={provider['max_context_length']}")
+        if provider.get("state"):
+            bits.append(f"state={provider['state']}")
+        return ", ".join(bits) if bits else "recorded"
+    return str(provider)
+
+
+def _fmt_rescore_source(rescore_src: Mapping[str, Any] | None) -> str:
+    if not rescore_src:
+        return "repo=0, patch_only=0, none=0"
+    ordered = ["repo", "patch_only", "none"] + sorted(
+        k for k in rescore_src if k not in ("repo", "patch_only", "none")
+    )
+    return ", ".join(f"{k}={int(rescore_src.get(k, 0))}" for k in ordered)
+
+
+def _render_auditor_axes_table(
+    lines: list[str],
+    title: str,
+    table_rows: Sequence[Mapping[str, Any]],
+    *,
+    label_key: str,
+) -> None:
+    if not any(int(r["metrics"].get("audit_eligible_n") or 0) > 0 for r in table_rows):
+        return
+    lines.append(f"#### {title}")
+    lines.append("")
+    lines.append(
+        "| Arm | Hidden Pass (Patch Quality) | Audit Pass (Auth Rate) | "
+        "False Approvals | False Abstentions (UNKNOWN on Valid) | Strict Accepted |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for row in table_rows:
+        m = row["metrics"]
+        hidden_str = _fmt_rate(int(m["hidden_passed"]), int(m["hidden_n"]))
+        audit_elig = int(m.get("audit_eligible_n") or 0)
+        audit_pass_str = (
+            _fmt_rate(int(m["audit_pass_count"]), audit_elig) if audit_elig else "n/a"
+        )
+        fa_str = _fmt_audit_rate(int(m["false_approval_count"]), int(m["audit_ran"]))
+        fab_elig = int(m.get("false_abstention_eligible_n") or 0)
+        fab_str = (
+            _fmt_rate(int(m["false_abstention_count"]), fab_elig) if fab_elig else "n/a"
+        )
+        strict_str = _fmt_rate(int(m["strict_accepted"]), int(m["strict_accepted_n"]))
+        lines.append(
+            f"| `{row[label_key]}` | {hidden_str} | {audit_pass_str} | "
+            f"{fa_str} | {fab_str} | {strict_str} |"
+        )
+    lines.append("")
+
+
+def _render_timeout_censoring_table(
+    lines: list[str],
+    title: str,
+    table_rows: Sequence[Mapping[str, Any]],
+    *,
+    label_key: str,
+) -> None:
+    if not any(int(r["metrics"].get("timeout_count") or 0) > 0 for r in table_rows):
+        return
+    lines.append(f"#### {title}")
+    lines.append("")
+    lines.append(
+        "| Arm / Factor | Timeouts (Rate) | ITT Latency Mean / p50 (s) | "
+        "Non-Timeout n | Non-Timeout Mean / p50 (s) |"
+    )
+    lines.append("| --- | --- | ---: | ---: | ---: |")
+    for row in table_rows:
+        m = row["metrics"]
+        to_str = _fmt_rate(int(m["timeout_count"]), int(m["n"]))
+        itt_str = (
+            f"{_fmt_num(m['latency_seconds']['mean'], 1)} / "
+            f"{_fmt_num(m['latency_seconds']['p50'], 1)}"
+        )
+        nt_str = (
+            f"{_fmt_num(m['non_timeout_seconds_mean'], 1)} / "
+            f"{_fmt_num(m['non_timeout_seconds_p50'], 1)}"
+        )
+        lines.append(
+            f"| `{row[label_key]}` | {to_str} | {itt_str} | "
+            f"{int(m['non_timeout_n'])} | {nt_str} |"
+        )
+    lines.append("")
+
+
 def render_markdown(report: Mapping[str, Any]) -> str:
     """Render the complete Issue #5 Section C2 stratified statistical report as Markdown."""
     manifest = report["manifest"]
@@ -1953,6 +2449,31 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         lines.append(
             f"| `{prov['label']}` | `{model_str}` | `{commit_str}` | `{py_str}` | "
             f"`{seed_str}` | `{map_str}` | `{prov['cymbal_version']}` | {prov['total_rows']} |"
+        )
+    lines.append("")
+
+    # 2b. Provenance & Runtime Integrity
+    lines.append("## Provenance & Runtime Integrity")
+    lines.append("")
+    lines.append(
+        "| Run Label | Git Commit & Tracked Dirty | Effective Model Params | "
+        "Ignored Settings Rows | Config Provenance | Provider Provenance | Rescore Source |"
+    )
+    lines.append("| --- | --- | --- | ---: | --- | --- | --- |")
+    for mrep in report["models"]:
+        prov = mrep["provenance"]
+        commit_short = ", ".join(c[:12] for c in prov.get("git_commits") or ()) or "n/a"
+        td = prov.get("git_tracked_dirty")
+        td_str = "n/a" if td is None else f"tracked_dirty={td}"
+        ign_rows = int(prov.get("ignored_settings_rows") or 0)
+        ign_names = prov.get("ignored_settings_names") or []
+        ign_str = f"{ign_rows} ({', '.join(ign_names)})" if ign_rows and ign_names else str(ign_rows)
+        lines.append(
+            f"| `{prov['label']}` | `{commit_short}` ({td_str}) | "
+            f"`{_fmt_effective_params_summary(prov)}` | {ign_str} | "
+            f"`{_fmt_config_provenance(prov.get('config_provenance'))}` | "
+            f"`{_fmt_provider_provenance(prov.get('provider_provenance'))}` | "
+            f"`{_fmt_rescore_source(prov.get('rescore_source'))}` |"
         )
     lines.append("")
 
@@ -2024,6 +2545,18 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 )
             lines.append("")
             _append_pairing_notes(lines, s1["table"], label_key="arm")
+            _render_auditor_axes_table(
+                lines,
+                "Stage 1 — 4-Axis Auditor Breakdown",
+                s1["table"],
+                label_key="arm",
+            )
+            _render_timeout_censoring_table(
+                lines,
+                "Stage 1 — Timeout Censoring Sensitivity (ITT vs. Non-Timed-Out Latency)",
+                s1["table"],
+                label_key="arm",
+            )
 
             _render_stratified_table(
                 lines,
@@ -2091,6 +2624,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 )
             lines.append("")
             _append_pairing_notes(lines, s2["table"], label_key="display_label")
+            _render_timeout_censoring_table(
+                lines,
+                "Stage 2 — Timeout Censoring Sensitivity (ITT vs. Non-Timed-Out Latency)",
+                s2["table"],
+                label_key="display_label",
+            )
 
             has_s2_ref = any(r["is_reference"] for r in s2["table"])
             s2_arms_order = (["passive"] if has_s2_ref else []) + s2["factors"]

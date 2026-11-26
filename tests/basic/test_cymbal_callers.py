@@ -2106,3 +2106,168 @@ def test_fallback_caller_finder_auto_mode_authoritative_cymbal_vs_error_fallback
     assert [e.path for e in res_fallback.excerpts] == ["consumer.py"]
     assert spy_fallback.calls == 1
     assert any("cymbal fallback (timeout)" in d for d in res_fallback.diagnostics)
+
+
+def test_cymbal_extracts_bash_targets_and_extensionless_shebang_scripts(tmp_path):
+    from aider import cymbal_callers as cc
+
+    # 1. .bash file with POSIX, `function`, and hyphenated Bash definitions + sibling caller.
+    bash_dir = tmp_path / "lib" / "bats-core"
+    bash_dir.mkdir(parents=True)
+    (bash_dir / "semaphore.bash").write_text(
+        "bats_semaphore_setup() {\n"
+        "  # don't clobber caller traps\n"
+        "  export BATS_SEMAPHORE_DIR=/tmp/sem\n"
+        "}\n"
+        "\n"
+        "function bats_semaphore_release_wrapper {\n"
+        "  local status=$?\n"
+        "  return \"$status\"\n"
+        "}\n"
+        "\n"
+        "function bats-helper() {\n"
+        "  echo helper\n"
+        "}\n"
+        "\n"
+        "bats_semaphore_run() {\n"
+        "  bats_semaphore_release_wrapper \"$@\"\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # 2. Extensionless Bash script identified via #!/usr/bin/env bash shebang.
+    libexec = tmp_path / "libexec"
+    libexec.mkdir()
+    (libexec / "rbenv-init").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        "\n"
+        "rbenv() {\n"
+        "  command rbenv \"$@\"\n"
+        "}\n"
+        "\n"
+        "function detect_shell() {\n"
+        "  echo bash\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    completions = tmp_path / "completions"
+    completions.mkdir()
+    (completions / "rbenv.bash").write_text(
+        "_rbenv() {\n"
+        "  rbenv commands\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # 3. Non-code assets (binary image, markdown, extensionless plain text) must be ignored.
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00" + (b"x" * 1024))
+    (tmp_path / "README.md").write_text("# Docs\nrbenv() {\n  echo nope\n}\n", encoding="utf-8")
+    (tmp_path / "README").write_text("Plain readme without shebang\n", encoding="utf-8")
+
+    # Direct extraction covers all Bash definition forms including hyphenated names.
+    sem_src = (bash_dir / "semaphore.bash").read_text(encoding="utf-8")
+    bash_defs = cc._extract_generic_targets("lib/bats-core/semaphore.bash", sem_src, None)
+    by_name = {d.symbol: d for d in bash_defs}
+    assert set(by_name) == {
+        "bats_semaphore_setup",
+        "bats_semaphore_release_wrapper",
+        "bats-helper",
+        "bats_semaphore_run",
+    }
+    assert by_name["bats_semaphore_setup"].line == 1
+    assert by_name["bats_semaphore_setup"].end_line == 4
+    assert by_name["bats_semaphore_release_wrapper"].line == 6
+    assert by_name["bats_semaphore_release_wrapper"].end_line == 9
+
+    # Supported path check recognizes .bash and extensionless shebangs, rejects non-code assets.
+    assert cc._is_supported_editable_code_path("lib/bats-core/semaphore.bash", root=tmp_path)
+    assert cc._is_supported_editable_code_path("libexec/rbenv-init", root=tmp_path)
+    assert not cc._is_supported_editable_code_path("logo.png", root=tmp_path)
+    assert not cc._is_supported_editable_code_path("README.md", root=tmp_path)
+    assert not cc._is_supported_editable_code_path("README", root=tmp_path)
+
+    # End-to-end Cymbal lookup on .bash file under a vague prompt finds the sibling caller.
+    sem_runner = FakeCymbalRunner(
+        refs={
+            "bats_semaphore_release_wrapper": {
+                "definitions": [
+                    {
+                        "file": "lib/bats-core/semaphore.bash",
+                        "line": 6,
+                        "name": "bats_semaphore_release_wrapper",
+                    }
+                ],
+                "references": [
+                    {
+                        "file": "lib/bats-core/semaphore.bash",
+                        "line": 16,
+                        "kind": "call",
+                        "snippet": '  bats_semaphore_release_wrapper "$@"',
+                    }
+                ],
+            }
+        },
+        impact={"bats_semaphore_release_wrapper": {"direct_callers": []}},
+    )
+    sem_res = find_callers_with_backend(
+        tmp_path,
+        "fix premature trap exit status expansion",
+        ["lib/bats-core/semaphore.bash"],
+        [],
+        backend=BACKEND_CYMBAL,
+        runner=sem_runner,
+    )
+    assert ("lib/bats-core/semaphore.bash", "bats_semaphore_release_wrapper") in sem_res.definitions
+    assert len(sem_res.excerpts) == 1
+    assert sem_res.excerpts[0].path == "lib/bats-core/semaphore.bash"
+    assert sem_res.excerpts[0].line == 16
+    assert sem_res.excerpts[0].symbol == "bats_semaphore_release_wrapper"
+
+    # End-to-end Cymbal lookup on extensionless shebang script + non-code assets stays clean.
+    rbenv_runner = FakeCymbalRunner(
+        refs={
+            "rbenv": {
+                "definitions": [{"file": "libexec/rbenv-init", "line": 4, "name": "rbenv"}],
+                "references": [
+                    {
+                        "file": "completions/rbenv.bash",
+                        "line": 2,
+                        "kind": "call",
+                        "snippet": "  rbenv commands",
+                    }
+                ],
+            },
+            "detect_shell": {
+                "definitions": [{"file": "libexec/rbenv-init", "line": 8, "name": "detect_shell"}],
+                "references": [],
+            },
+        },
+        impact={"rbenv": {"direct_callers": []}, "detect_shell": {"direct_callers": []}},
+    )
+    rbenv_res = find_callers_with_backend(
+        tmp_path,
+        "fix rbenv profile output",
+        ["libexec/rbenv-init", "logo.png", "README.md", "README"],
+        ["completions/rbenv.bash"],
+        backend=BACKEND_CYMBAL,
+        runner=rbenv_runner,
+    )
+    assert rbenv_res.status == "COMPLETE_WITHIN_SCOPE"
+    assert rbenv_res.definitions == (("libexec/rbenv-init", "rbenv"),)
+    assert [e.path for e in rbenv_res.excerpts] == ["completions/rbenv.bash"]
+    assert "unreadable or binary editable file omitted" not in rbenv_res.truncation
+
+    # Vague prompt on extensionless shebang script seeds both Bash definitions via Tier 3 fallback.
+    rbenv_vague = find_callers_with_backend(
+        tmp_path,
+        "fix auto detection",
+        ["libexec/rbenv-init", "logo.png", "README.md", "README"],
+        ["completions/rbenv.bash"],
+        backend=BACKEND_CYMBAL,
+        runner=rbenv_runner,
+    )
+    assert ("libexec/rbenv-init", "rbenv") in rbenv_vague.definitions
+    assert ("libexec/rbenv-init", "detect_shell") in rbenv_vague.definitions
+    assert [e.path for e in rbenv_vague.excerpts] == ["completions/rbenv.bash"]
+    assert "unreadable or binary editable file omitted" not in rbenv_vague.truncation

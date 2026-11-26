@@ -4,13 +4,50 @@
 
 | Task | Status | Observed result or remaining work | PR |
 | --- | --- | --- | --- |
-| 1 | In progress | Baseline reproduced (`13/13` synthetic, `2/2` Requests, `5/5` Issue 5). The 30-replay frozen corpus manifest and preregistration are outstanding. | — |
+| 1 | Verified locally | Baseline reproduced (`13/13` synthetic, `2/2` Requests, `5/5` Issue 5). 30-case historical replay manifest frozen and validated (`c00e46d1fb3b00895c02846625e69446ce40b3274de19091f9017c9779d0a429`); fresh unseen external manifest still required before default-on shipping. | — |
 | 2 | Verified locally | Scoped evidence API and tests verified (`test_local_callers.py`). | — |
 | 3 | Verified locally | Cymbal adapter unit/fake-runner tests AND live pinned `cymbal v0.18.0` smoke test pass (`test_cymbal_callers.py`: `refs`, `impact`, clean/dirty `changed`, `show`, `build_caller_finder('cymbal').lookup`). | — |
 | 4 | Verified locally | Bounded source reader, validated live `cymbal v0.18.0` `show`, and tests verified (`test_read_range.py`). | — |
 | 5 | Verified locally | Project facts behind `FactRepository` port: `--facts` defaults to `.aider.facts.jsonl` (or `--facts-file`) with deterministic `chat_id` hash (`chat_history_file` + worktree), `--facts-db PATH|sqlite://URL` uses SQLite/FTS5 with `chat_id`, source-hash revalidation, `/fact`, and tests verified (`test_project_facts.py`). | — |
 | 6 | Verified locally | CLI flags, `/read-range`, `/fact`, automatic call-site ranges, strict verifier evidence, and integration tests verified (`test_local_context_integration.py`, `test_caller_audit.py`). | — |
-| 7 | In progress | Trial runner, `--suite issue5` (`5/5` fixtures), `--preset issue5-economy`, prompt/completion token telemetry, `--suite replay --replay-manifest PATH`, and initial 106-attempt Qwen 3.6 35B-A3B trials completed. 30-task frozen unseen replay corpus, 8B-model evaluation, and default-on shipping decision remain outstanding. | — |
+| 7 | In progress | Phase 1 root-cause TDD fixes (`57d664e`) and Phase 2A zero-LLM retrieval/tooling audit verified on `feat/issue-5-b1-d1`; legacy `a4b0a3a` diagnostic archive (`92/150` rows) preserved and rescored. Phase 2B held-out auditor calibration, Phase 2C fast/A-A pilot, Phase 3 fresh controlled factorial, 8B evaluation, and default-on shipping decision remain outstanding. | — |
+
+### Convergence progress on `feat/issue-5-b1-d1`
+
+#### Verified commit progression
+
+- **`955617d`**: C/C++ prototype filtering, builtin `>128 KiB` skip → `INCOMPLETE`, Cymbal C/C++ targets, auditor prompt calibration, and `TRIAL_THINKING_TOKENS`.
+- **`f03e940`**: Qwen3.6 `use_temperature: 0.6`, fail-fast `--thinking-tokens` validation (LM Studio `/v1/chat/completions` ignores Anthropic `thinking.budget_tokens` and LiteLLM drops `thinking`/`reasoning_effort` for `lm_studio/*`), Cymbal scan-cap/unreadable/stale skips → `INCOMPLETE`, and C/C++ non-header declaration alignment.
+- **`66e0df0`**: Zero-excerpt search ambiguity → `INCOMPLETE` in both `builtin` and `cymbal`.
+- **`a4b0a3a`**: Hermetic `--config /dev/null --model-settings-file`, pre-attempt #1 `aider --exit` preflight gate, `config_provenance`, and LM Studio `/api/v0/models` `provider_provenance`.
+- **`e67a2a7`**: Fixed `only_target_modified` to non-empty subset of `targets`, pre-verification `git diff`/`git status` capture, per-row `TrialParameterDriftError` gate, offline `rescore.py`, 5-example class-mixed few-shot auditor calibration (`UNKNOWN`/`PASS`/`FAIL` interleaved), and `Audit response tail:` logging on `PASS`/`FAIL`/`UNKNOWN`.
+- **`57d664e`**: Phase 1 root-cause TDD fixes — same-file caller discovery (cross-file ranked first), vague-prompt target seeding (`select_target_definitions`: exact → subtoken → bounded exported fallback), Bash function & command call extraction + shebang detection, Rust homonymous trait-method ambiguity guard (`ambiguous trait method receiver` → `INCOMPLETE`), zero private `_...` imports from `local_callers` in `cymbal_callers`, explicit `FallbackCallerFinder` `auto`-mode contract, and `--no-default-model-settings` true hermetic provenance.
+- **Working-tree Phase 2A zero-LLM tooling**: held-out `scripts/local_context_trial/auditor_calibration.py` (`--plan`, `--dry-run`, `--model`, `0 false-PASS` safety gate), upgraded `c2_report.py` & `heldout.py` (4-axis auditor breakdown: `hidden_passed`, `audit_pass`, `false_approval`, `false_abstention`; timeout-censored / uncensored latency; provenance summary block), and Cymbal Bash target extraction parity.
+
+#### Immutable legacy diagnostic archive (`a4b0a3a`, 92/150 Stage 1 rows)
+
+- **Location & policy:** Stored in `trial-results/issue5-long-a4b0a3a/` (`stage1.jsonl`, `stage1.rescored.jsonl`, `stage1.meta.json`); preserved as an immutable diagnostic archive (**NO-GO** to mix with post-`e67a2a7`/`57d664e` runs).
+- **Verified manifest SHA:** `c00e46d1fb3b00895c02846625e69446ce40b3274de19091f9017c9779d0a429` (`Validation OK`).
+- **Offline rescore (`repo=92, patch_only=0, changed=2`, flipping jobs 11 & 39 on `js_dotenv_quiet_from_env`):**
+  - `baseline`: `9/18`
+  - `passive`: `11/20`
+  - `contract`: `10/17`
+  - `audit`: `9/19` (`2` false approvals, `strict 0/19`)
+  - `contract+audit`: `12/18` (`1` false approval, `strict 1/18`)
+  - Timeouts: `6/92`.
+  - Non-baseline caller evidence: `29/74 (39.2%)`; of the `28` caller-dependent misses, `25/28` were `Definitions: none` vague-prompt misses and `3/28` were Bash call syntax misses.
+
+#### Phase 2A deterministic retrieval & environment audit (`57d664e`, 0 LLM calls)
+
+- **`retrieval_benchmark.py` (10 Section B cases, `cymbal v0.18.0`):** `b10_negative_control` achieved `P=1.000 / R=1.000 / F1=1.000 / Wrong Target=0.000` on both `builtin` and `cymbal`; `cymbal` wins `large_file` (`+1.000` F1) and `transitive` (`+0.500` Recall); `builtin` wins `aliases` and `same_name`.
+- **30-case frozen replay corpus (vague prompts, clean base repos):** `builtin` evidence jumped from `39.2%` (`a4b0a3a`) to **`26/30 (87%)`** — `10/10` on `direct_caller`, `7/10` on `indirect_caller`, and `9/10` on `control`. Notable verified fixes: `py_pathspec_gitignore_cr_trim` now reports `COMPLETE_WITHIN_SCOPE`; Job 23 (`c_yajl`) finds both `src/yajl_tree.c:313` and same-file `src/yajl_parser.c:287`; Job 58 (`rust_semver`) flags `src/error.rs:86` as `INCOMPLETE` (`ambiguous trait method receiver`).
+- **Runtime dependency audit:** Python `3.12.13`, `cymbal v0.18.0` (exact pin match), `tree-sitter-language-pack 0.13.0` (exact pin match), `litellm 1.110.0`. Observed `.venv` drift vs `common-constraints.txt`: `tree-sitter` (`0.26.1` vs `0.25.2`), `pytest` (`9.2.0` vs `9.0.2`), and `pydantic` (`2.14.3` vs `2.12.5`).
+
+#### Phase 2B & Phase 3 convergence gates
+
+- **Phase 2B (held-out auditor calibration):** Run `auditor_calibration.py --model lm_studio/qwen/qwen3.6-35b-a3b`. Gate: `0 false-PASS` and `deterministic_gate_violations == 0`.
+- **Phase 2C (short diagnostic & A/A pilot):** Run `issue5_trials.sh fast` plus an A/A baseline stochasticity pilot before sizing Phase 3 rounds.
+- **Phase 3 (fresh controlled factorial):** Run fresh Stage 1 + Stage 2 factorial on clean `HEAD` into a new `out_dir`. Keep `--local-callers-audit` strictly opt-in until `0 false-PASS` holds on both held-out calibration and frozen replay.
 
 ### Implementation verified on `feat/caller-context-cymbal-readrange-facts`
 

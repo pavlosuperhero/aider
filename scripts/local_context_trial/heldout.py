@@ -22,6 +22,7 @@ Analysis:
 
 import argparse
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 import json
 import math
 import os
@@ -690,8 +691,8 @@ def _extract_row_outcomes(row: dict) -> dict:
         else:
             audit_outcome = "not_run"
 
-    if "audit_passed" in row:
-        audit_passed = row["audit_passed"]
+    if row.get("audit_passed") is not None:
+        audit_passed = bool(row["audit_passed"])
     elif audit_outcome == "not_run":
         audit_passed = None
     else:
@@ -730,6 +731,151 @@ def _extract_row_outcomes(row: dict) -> dict:
         "prompt_tokens": row.get("prompt_tokens"),
         "completion_tokens": row.get("completion_tokens"),
         "editor_calls": row.get("editor_calls"),
+    }
+
+
+def is_timeout_row(row: Mapping[str, object]) -> bool:
+    """Return True iff a trial row was right-censored by a timeout (exit=124 or timeout outcome)."""
+    if row.get("is_timeout") is not None:
+        return bool(row["is_timeout"])
+    return (
+        row.get("exit") == 124
+        or row.get("commit_outcome") == "timeout"
+        or row.get("hidden_outcome") == "timeout"
+        or row.get("smoke_outcome") == "timeout"
+    )
+
+
+def _is_audit_required(row: Mapping[str, object]) -> bool:
+    """Return True iff the row's arm/flags require auditor authorization."""
+    if row.get("audit_required") is not None:
+        return bool(row["audit_required"])
+    raw_flags = row.get("arm_flags")
+    lc_enabled = row.get("local_callers_enabled")
+    if isinstance(raw_flags, (list, tuple)):
+        lc = bool(lc_enabled) if lc_enabled is not None else ("--local-callers" in raw_flags)
+        return lc and "--local-callers-audit" in raw_flags
+    base_arm = normalize_arm(str(row.get("arm") or ""))
+    return base_arm in ("audit", "contract+audit") and lc_enabled is not False
+
+
+def _is_false_approval_row(
+    row: Mapping[str, object],
+    outcomes: Mapping[str, object],
+) -> bool:
+    """Return True iff the auditor authorized a patch that failed hidden/smoke/scope checks."""
+    audit_passed = outcomes["audit_passed"]
+    hidden_passed = outcomes["hidden_passed"]
+    smoke_passed = outcomes["smoke_passed"]
+    patch_hidden = outcomes["patch_hidden_passed"]
+    raw_fa = row.get("false_approval")
+    if audit_passed is True:
+        if raw_fa is True:
+            return True
+        if patch_hidden is not None:
+            verified = (hidden_passed is not False) and (smoke_passed is not False)
+            return not (bool(patch_hidden) and verified)
+        if hidden_passed is not None:
+            verified = bool(hidden_passed) and (smoke_passed is not False)
+            patch_ok = (row.get("only_target_modified") is not False) and bool(hidden_passed)
+            return not (patch_ok and verified)
+        return bool(raw_fa)
+    return bool(raw_fa) if audit_passed is None else False
+
+
+def summarize_auditor_axes(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Compute the 4 orthogonal auditor axes without conflating patch quality and strict acceptance.
+
+    Axes:
+      1. ``hidden_passed`` / ``hidden_pass_rate``: underlying patch correctness.
+      2. ``audit_pass_count`` / ``audit_pass_rate``: authorization rate over audit-eligible rows.
+      3. ``false_approval_count`` / ``false_approval_rate``: bad patches authorized by audit.
+      4. ``false_abstention_count`` / ``false_abstention_rate``: valid patches blocked by UNKNOWN.
+    """
+    n = len(rows)
+    hidden_n = 0
+    hidden_passed_count = 0
+    audit_ran_count = 0
+    audit_eligible_n = 0
+    audit_pass_count = 0
+    false_approval_count = 0
+    false_abstention_count = 0
+    false_abstention_eligible_n = 0
+
+    for row in rows:
+        outcomes = _extract_row_outcomes(dict(row))
+        hidden_passed = outcomes["hidden_passed"]
+        audit_outcome = str(outcomes["audit_outcome"]).lower()
+        audit_passed = outcomes["audit_passed"]
+        audit_ran = (
+            bool(row.get("audit_ran"))
+            or audit_outcome != "not_run"
+            or bool(row.get("audit_verdicts"))
+        )
+        audit_required = _is_audit_required(row)
+        audit_eligible = audit_ran or audit_required
+
+        if hidden_passed is not None:
+            hidden_n += 1
+            if hidden_passed:
+                hidden_passed_count += 1
+        if audit_ran:
+            audit_ran_count += 1
+        if audit_eligible:
+            audit_eligible_n += 1
+        if audit_passed is True:
+            audit_pass_count += 1
+        if _is_false_approval_row(row, outcomes):
+            false_approval_count += 1
+        if hidden_passed is True and audit_eligible:
+            false_abstention_eligible_n += 1
+            if audit_outcome == "unknown":
+                false_abstention_count += 1
+
+    fa_denom = audit_ran_count if audit_ran_count else audit_eligible_n
+    return {
+        "n": n,
+        "hidden_n": hidden_n,
+        "hidden_passed": hidden_passed_count,
+        "hidden_pass_rate": (hidden_passed_count / hidden_n) if hidden_n else None,
+        "audit_ran": audit_ran_count,
+        "audit_eligible_n": audit_eligible_n,
+        "audit_pass_count": audit_pass_count,
+        "audit_pass_rate": (audit_pass_count / audit_eligible_n) if audit_eligible_n else None,
+        "false_approval_count": false_approval_count,
+        "false_approval_rate": (false_approval_count / fa_denom) if fa_denom else None,
+        "false_abstention_count": false_abstention_count,
+        "false_abstention_eligible_n": false_abstention_eligible_n,
+        "false_abstention_rate": (
+            (false_abstention_count / false_abstention_eligible_n)
+            if false_abstention_eligible_n
+            else None
+        ),
+    }
+
+
+def summarize_timeout_latency(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Compute timeout rate and uncensored (non-timed-out) latency stats alongside ITT latency."""
+    n = len(rows)
+    timeout_count = 0
+    non_timeout_seconds: list[float] = []
+    for row in rows:
+        if is_timeout_row(row):
+            timeout_count += 1
+        elif row.get("seconds") is not None:
+            non_timeout_seconds.append(float(row["seconds"]))
+
+    non_timeout_n = len(non_timeout_seconds)
+    return {
+        "n": n,
+        "timeout_count": timeout_count,
+        "timeout_rate": (timeout_count / n) if n else None,
+        "non_timeout_n": non_timeout_n,
+        "non_timeout_seconds_mean": (
+            (sum(non_timeout_seconds) / non_timeout_n) if non_timeout_n else None
+        ),
+        "non_timeout_seconds_p50": _percentile(non_timeout_seconds, 50.0),
+        "non_timeout_seconds_p95": _percentile(non_timeout_seconds, 95.0),
     }
 
 
@@ -956,6 +1102,7 @@ def build_summary(rows: list[dict]) -> dict:
     )
 
     present_arms: set[str] = set()
+    rows_by_arm: dict[str, list[dict]] = defaultdict(list)
     present_langs: set[str] = set()
     present_kinds: set[str] = set()
     present_specs: set[str] = set()
@@ -978,6 +1125,7 @@ def build_summary(rows: list[dict]) -> dict:
         outcomes = _extract_row_outcomes(r)
 
         present_arms.add(arm)
+        rows_by_arm[arm].append(r)
         present_langs.add(lang)
         present_kinds.add(kind)
         present_specs.add(spec)
@@ -1166,6 +1314,8 @@ def build_summary(rows: list[dict]) -> dict:
     arm_outcomes: dict[str, dict] = {}
     for arm in arms:
         stat = arm_stats[arm]
+        axes = summarize_auditor_axes(rows_by_arm[arm])
+        to_lat = summarize_timeout_latency(rows_by_arm[arm])
         n = int(stat["n"])
         passed_n = int(stat["passed"])
         measured_n = int(stat["tokens_measured_n"])
@@ -1184,20 +1334,35 @@ def build_summary(rows: list[dict]) -> dict:
             "strict_accept_recorded": int(stat["strict_accept_recorded"]),
             "hidden_passed": int(stat["hidden_passed"]),
             "hidden_recorded": int(stat["hidden_recorded"]),
+            "hidden_pass_rate": axes["hidden_pass_rate"],
             "smoke_passed": int(stat["smoke_passed"]),
             "smoke_recorded": int(stat["smoke_recorded"]),
             "commit_passed": int(stat["commit_passed"]),
             "commit_recorded": int(stat["commit_recorded"]),
             "commit_outcomes": dict(stat["commit_outcomes"]),
             "audit_ran": int(stat["audit_ran"]),
+            "audit_eligible_n": int(axes["audit_eligible_n"]),
             "audit_passed": int(stat["audit_passed"]),
+            "audit_pass_count": int(axes["audit_pass_count"]),
+            "audit_pass_rate": axes["audit_pass_rate"],
             "audit_failed": int(stat["audit_failed"]),
             "audit_outcomes": dict(stat["audit_outcomes"]),
             "evidence": int(stat["evidence"]),
             "contract_rejected": int(stat["contract_rejected"]),
             "unknowns": int(stat["unknowns"]),
             "errors": int(stat["errors"]),
-            "false_approval": int(stat["false_approval"]),
+            "false_approval": int(axes["false_approval_count"]),
+            "false_approval_count": int(axes["false_approval_count"]),
+            "false_approval_rate": axes["false_approval_rate"],
+            "false_abstention_count": int(axes["false_abstention_count"]),
+            "false_abstention_eligible_n": int(axes["false_abstention_eligible_n"]),
+            "false_abstention_rate": axes["false_abstention_rate"],
+            "timeout_count": int(to_lat["timeout_count"]),
+            "timeout_rate": to_lat["timeout_rate"],
+            "non_timeout_n": int(to_lat["non_timeout_n"]),
+            "non_timeout_seconds_mean": to_lat["non_timeout_seconds_mean"],
+            "non_timeout_seconds_p50": to_lat["non_timeout_seconds_p50"],
+            "non_timeout_seconds_p95": to_lat["non_timeout_seconds_p95"],
             "extra_calls": int(stat["extra_calls"]),
             "seconds_total": stat["seconds"],
             "mean_seconds": (stat["seconds"] / n) if n else 0.0,
@@ -1446,6 +1611,22 @@ def summarize(rows: list[dict]) -> dict:
             f" {_format_opt_pct(stat['delta_seconds_pct'], is_ref=is_ref):>7}"
         )
 
+    if any(summary["arm_outcomes"][arm]["timeout_count"] > 0 for arm in arms):
+        print("\nTimeout censoring sensitivity (uncensored non-timeout latency):")
+        for arm in arms:
+            stat = summary["arm_outcomes"][arm]
+            to_rate = (
+                f"{stat['timeout_rate'] * 100.0:.1f}%"
+                if stat["timeout_rate"] is not None
+                else "n/a"
+            )
+            print(
+                f"  {arm:{arm_w}} timeouts={stat['timeout_count']}/{stat['n']} ({to_rate})"
+                f" non_timeout_n={stat['non_timeout_n']}"
+                f" non_timeout_mean_s={_format_opt_num(stat['non_timeout_seconds_mean'])}"
+                f" non_timeout_p50_s={_format_opt_num(stat['non_timeout_seconds_p50'])}"
+            )
+
     print("\nArm telemetry:")
     for arm in arms:
         stat = summary["arm_outcomes"][arm]
@@ -1475,6 +1656,17 @@ def summarize(rows: list[dict]) -> dict:
             if stat["audit_ran"]
             else f"0 (fail={stat['audit_failed']})"
         )
+        timeout_str = f" timeouts={stat['timeout_count']}"
+        if stat["timeout_count"] > 0:
+            timeout_str += (
+                f" (non_timeout_s={_format_opt_num(stat['non_timeout_seconds_mean'])}/"
+                f"{_format_opt_num(stat['non_timeout_seconds_p50'])},"
+                f" n={stat['non_timeout_n']})"
+            )
+        auditor_axis_detail = (
+            f" false_approvals={stat['false_approval']}"
+            f" false_abstentions={stat['false_abstention_count']}"
+        )
         token_detail = (
             f" extra_calls={stat['extra_calls']} tokens={stat['tokens_total']}"
             f" (mean={stat['mean_tokens']:.1f}"
@@ -1484,10 +1676,11 @@ def summarize(rows: list[dict]) -> dict:
                 else ""
             )
             + ")"
-            f" false_approvals={stat['false_approval']} unknowns={stat['unknowns']}"
-            f" errors={stat['errors']}"
+            + auditor_axis_detail
+            + f" unknowns={stat['unknowns']} errors={stat['errors']}"
             if stat["instrumented"] == n
             else f" tokens_measured={stat['tokens_measured_n']}/{n} detailed telemetry incomplete"
+            + auditor_axis_detail
         )
         print(
             f"  {arm:15} pass={stat['passed']}/{n}"
@@ -1499,6 +1692,7 @@ def summarize(rows: list[dict]) -> dict:
             f" evidence={stat['evidence']}/{n}"
             f" contract_rej={stat['contract_rejected']}"
             f" mean_s={stat['mean_seconds']:.1f}"
+            + timeout_str
             + token_detail
         )
     return summary

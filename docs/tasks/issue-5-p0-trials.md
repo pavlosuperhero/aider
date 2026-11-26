@@ -108,7 +108,7 @@ curl --fail --silent --show-error "$LM_STUDIO_API_BASE/models"
 
 Check that both arms return five rows, usage records include editor calls, and `contract_rejected` stays false in both arms. To exercise format-block telemetry, run `--arms passive,contract` on the historical corpus with `--suite replay --replay-manifest "$manifest"` and a fresh output filename. That calibration schedules 60 attempts. Run two separate `--arms passive` jobs with the same configuration and different output filenames to measure A/A disagreement. Match rows by case, spec and round.
 
-Record the served model revision, quantization, inference settings and timeout. The harness pins `PYTHONHASHSEED=0`, disables automatic file-mention prompts, auto-commits and dirty commits, and uses `--seed` for job order. Verify model sampling seed and server-side thinking/reasoning settings at the provider before treating them as controlled. The harness validates `--thinking-tokens` against `accepts_settings` and LiteLLM provider parameter support before running, records both `requested_thinking_tokens` and `effective_model_params` in run metadata, and parses `Trial model params:` and any `ignored_settings` warnings from `aider.log` into each JSONL row.
+Record the served model revision, quantization, inference settings and timeout. The harness pins `PYTHONHASHSEED=0`, disables automatic file-mention prompts, auto-commits and dirty commits, isolates configuration with `--config /dev/null --model-settings-file --no-default-model-settings`, runs a pre-attempt #1 `aider --exit` preflight gate, and uses `--seed` for job order. Verify model sampling seed and server-side thinking/reasoning settings at the provider before treating them as controlled. The harness validates `--thinking-tokens` against `accepts_settings` and LiteLLM provider parameter support before running, enforces a per-row `TrialParameterDriftError` gate, records `config_provenance`, LM Studio `/api/v0/models` `provider_provenance`, `requested_thinking_tokens`, and `effective_model_params` in run metadata, and parses `Trial model params:`, `Audit response tail:` (on `PASS`/`FAIL`/`UNKNOWN`), and any `ignored_settings` warnings from `aider.log` into each JSONL row. `heldout.py --summarize` and `c2_report.py` report a 4-axis auditor breakdown (`hidden_passed`, `audit_pass`, `false_approval`, `false_abstention`), uncensored latency alongside timeout censoring, and a provenance summary block.
 
 ## Fresh paired replay
 
@@ -138,10 +138,46 @@ Empty-store Facts runs measure overhead and control regressions. Use seeded conv
 
 Report `patch_hidden_passed`, `strict_accepted`, and `committed` individually with false approvals, UNKNOWN/ERROR, timeouts, reflections, input/output tokens and p50/p95 latency. Pair by case, spec and round, and report wins/losses and confidence intervals by category and language. Rows describe the final candidate in a turn that can include reflections. First-proposal acceptance requires evidence about the first editor call. Exercise real auto-commit behavior in the offline tests. Keep the features opt-in pending the issue’s behavioral gates.
 
+## Branch `feat/issue-5-b1-d1` status, archive & convergence gates
+
+### Verified commit progression
+
+- **`955617d`**: C/C++ prototype filtering, builtin `>128 KiB` skip → `INCOMPLETE`, Cymbal C/C++ targets, auditor prompt calibration, `TRIAL_THINKING_TOKENS`.
+- **`f03e940`**: Qwen3.6 `use_temperature: 0.6`, fail-fast `--thinking-tokens` validation (LM Studio `/v1/chat/completions` ignores Anthropic `thinking.budget_tokens` and LiteLLM drops `thinking`/`reasoning_effort` for `lm_studio/*`), Cymbal scan-cap/unreadable/stale skips → `INCOMPLETE`, C/C++ non-header declaration alignment.
+- **`66e0df0`**: Zero-excerpt search ambiguity → `INCOMPLETE` in builtin and Cymbal.
+- **`a4b0a3a`**: Hermetic `--config /dev/null --model-settings-file`, pre-attempt #1 `aider --exit` preflight gate, `config_provenance`, and LM Studio `/api/v0/models` `provider_provenance`.
+- **`e67a2a7`**: Fixed `only_target_modified` to non-empty subset of `targets`, pre-verification `git diff`/`git status` capture, per-row `TrialParameterDriftError` gate, offline `rescore.py`, 5-example class-mixed few-shot auditor calibration (`UNKNOWN`/`PASS`/`FAIL` interleaved), and `Audit response tail:` logging on `PASS`/`FAIL`/`UNKNOWN`.
+- **`57d664e`**: Phase 1 root-cause TDD fixes — same-file caller discovery (cross-file ranked first), vague-prompt target seeding (`select_target_definitions`: exact → subtoken → bounded exported fallback), Bash function & command call extraction + shebang detection, Rust homonymous trait-method ambiguity guard (`ambiguous trait method receiver` → `INCOMPLETE`), zero private `_...` imports from `local_callers` in `cymbal_callers`, explicit `FallbackCallerFinder` `auto`-mode contract, and `--no-default-model-settings` true hermetic provenance.
+- **Working-tree Phase 2A zero-LLM tooling**: held-out `scripts/local_context_trial/auditor_calibration.py` (`--plan`, `--dry-run`, `--model`, `0 false-PASS` safety gate), upgraded `c2_report.py` & `heldout.py` (4-axis auditor breakdown: `hidden_passed`, `audit_pass`, `false_approval`, `false_abstention`; timeout censoring / uncensored latency; provenance summary block), and Cymbal Bash target extraction parity.
+
+### Immutable legacy diagnostic archive (`a4b0a3a`, 92/150 Stage 1 rows)
+
+- Stored in `trial-results/issue5-long-a4b0a3a/` (`stage1.jsonl`, `stage1.rescored.jsonl`, `stage1.meta.json`); preserved as an immutable diagnostic archive (**NO-GO** to mix with post-`e67a2a7`/`57d664e` runs).
+- Verified manifest SHA: `c00e46d1fb3b00895c02846625e69446ce40b3274de19091f9017c9779d0a429` (`Validation OK`).
+- Offline rescore (`repo=92, patch_only=0, changed=2`, flipping jobs 11 & 39 on `js_dotenv_quiet_from_env`): `baseline 9/18`, `passive 11/20`, `contract 10/17`, `audit 9/19` (`2` false approvals, `strict 0/19`), `contract+audit 12/18` (`1` false approval, `strict 1/18`); `6/92` timeouts; non-baseline evidence `29/74 (39.2%)` (`25/28` caller-dependent misses were `Definitions: none` vague-prompt misses, `3/28` were Bash call syntax).
+
+### Phase 2A deterministic retrieval & environment audit (`57d664e`, 0 LLM calls)
+
+- **`retrieval_benchmark.py` (10 Section B cases, `cymbal v0.18.0`):** `b10_negative_control` scored `P=1.000 / R=1.000 / F1=1.000 / Wrong Target=0.000` on both `builtin` and `cymbal`; `cymbal` wins `large_file` (`+1.000` F1) and `transitive` (`+0.500` Recall); `builtin` wins `aliases` and `same_name`.
+- **30-case frozen replay corpus (vague prompts, clean base repos):** `builtin` evidence jumped from `39.2%` (`a4b0a3a`) to **`26/30 (87%)`** (`10/10` on `direct_caller`, `7/10` on `indirect_caller`, `9/10` on `control`; `py_pathspec_gitignore_cr_trim` now `COMPLETE_WITHIN_SCOPE`; Job 23 `c_yajl` finds both `src/yajl_tree.c:313` and same-file `src/yajl_parser.c:287`; Job 58 `rust_semver` flags `src/error.rs:86` as `INCOMPLETE` `ambiguous trait method receiver`).
+- **Runtime dependency audit:** Python `3.12.13`, `cymbal v0.18.0` (exact pin match), `tree-sitter-language-pack 0.13.0` (exact pin match), `litellm 1.110.0`. Note `.venv` drift vs `common-constraints.txt` for `tree-sitter` (`0.26.1` vs `0.25.2`), `pytest` (`9.2.0` vs `9.0.2`), and `pydantic` (`2.14.3` vs `2.12.5`).
+
+### Phase 2B & Phase 3 convergence gates
+
+1. **Phase 2B — Held-out auditor calibration:**
+   ```bash
+   .venv/bin/python scripts/local_context_trial/auditor_calibration.py --plan
+   .venv/bin/python scripts/local_context_trial/auditor_calibration.py --dry-run
+   .venv/bin/python scripts/local_context_trial/auditor_calibration.py --model lm_studio/qwen/qwen3.6-35b-a3b
+   ```
+   **Gate:** `0 false-PASS` and `deterministic_gate_violations == 0`.
+2. **Phase 2C — Short diagnostic & A/A stochasticity pilot:** Run `bash scripts/local_context_trial/issue5_trials.sh fast "$model" <fresh_out_dir>` plus an A/A baseline stochasticity pilot before sizing Phase 3 rounds.
+3. **Phase 3 — Fresh controlled Stage 1 + Stage 2 factorial:** Run on clean `HEAD` into a new `out_dir` (never append into `trial-results/issue5-long-a4b0a3a/`). Keep `--local-callers-audit` strictly opt-in until `0 false-PASS` holds on both held-out calibration and frozen replay.
+
 ## Priority status
 
 | Priority | Verified or prepared | Still open |
 | --- | --- | --- |
-| P0 | Edit-before-mention regression, focused hook and strict-audit cases, evidence/error distinction, fixture checks, harness classification and checkpoint recovery. Ordinary auto-commit waits for configured automatic tests and a failed candidate stays in the working tree. Replay pins Python hash seed and disables automatic file additions, lint and both commit modes. | Complete the remaining veto and commit policy cases, first-editor-call acceptance metrics, deduplication when evidence changes, cross-platform CI, C/C++ header lint behavior, provider seed and thinking limits. |
-| P1 | Historical retrieval benchmark and opt-in documentation exist. The long profile has separate ablations and a persistent artifact directory per stage. | Expanded language and caller-resolution coverage, independently labeled auditor evaluation, targeted ReadRange and seeded Facts efficacy runs, versioned release and reproducible artifact archival. |
-| P2 | Frozen historical corpus and resumable 240-attempt calibration profile. | New unseen corpus, at least three paired rounds with A/A controls, independent acceptance and safety gates, and the release decision. |
+| P0 | Edit-before-mention regression, focused hook and strict-audit cases, evidence/error distinction (`>128 KiB`, zero-excerpt ambiguity, Cymbal inspection skips, Rust homonymous trait-method guard), fixture checks, harness classification, checkpoint recovery, hermetic `--config /dev/null --model-settings-file --no-default-model-settings`, preflight gate, per-row `TrialParameterDriftError` gate, fail-fast `--thinking-tokens` validation, pre-verification diff capture, `only_target_modified` subset fix, and offline `rescore.py`. | Remaining veto and commit policy cases, first-editor-call acceptance metrics, deduplication when evidence changes, cross-platform CI, C/C++ header lint behavior, `.venv` constraint drift reconciliation (`tree-sitter`, `pytest`, `pydantic`), and provider-side seed/thinking controls. |
+| P1 | Phase 1 retrieval fixes (same-file callers, vague-prompt target seeding, Bash calls/shebang + Cymbal Bash parity, C/C++ declarations/prototypes), Phase 2A 0-LLM audit (`retrieval_benchmark.py`, `26/30 (87%)` frozen replay evidence), held-out `auditor_calibration.py`, 4-axis `c2_report.py`/`heldout.py` reporting, and immutable `a4b0a3a` archive. | Phase 2B live `auditor_calibration.py` run (`0 false-PASS` gate), targeted ReadRange and seeded Facts efficacy runs, versioned release and reproducible artifact archival. |
+| P2 | Frozen 30-case historical corpus (`c00e46d1...`), resumable 240-attempt calibration profile, and immutable `a4b0a3a` diagnostic archive (`92/150` rows). | Phase 2C fast + A/A pilot, Phase 3 fresh controlled Stage 1 + Stage 2 factorial on clean `HEAD`, new unseen external corpus, 8B model sweep, independent acceptance/safety gates, and opt-in vs default-on release decision. |

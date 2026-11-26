@@ -755,7 +755,14 @@ def test_local_caller_stays_out_of_oracle_query(project, model, monkeypatch, ena
     assert ("result = greet() + 73" in message) == enabled
     for phrase in ("Check how the caller", "custom hint"):
         assert (phrase in message) == (expected == phrase)
+    vague_message = coder.get_oracle_message("unrelated task")
+    assert retrieve.call_args.args[0] == "unrelated task"
+    assert ("result = greet() + 73" in vague_message) == enabled
+    if not enabled:
+        assert vague_message == "fix greet\nOracle reference"
+    (root / "other.py").write_text("result = 73\n")
     assert coder.get_oracle_message("unrelated task") == "fix greet\nOracle reference"
+    assert retrieve.call_args.args[0] == "unrelated task"
     assert coder.get_inchat_relative_files() == ["greeting.py"]
     retrieve.return_value = None
     assert coder.get_oracle_message("fix greet") is None

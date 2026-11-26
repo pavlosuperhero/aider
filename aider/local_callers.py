@@ -176,6 +176,7 @@ _BASH_DEF_REGEXES = (
     ),
     re.compile(r"(?:^|[;\n])\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\(\s*\)\s*[\{(]"),
 )
+BASH_DEF_REGEXES = _BASH_DEF_REGEXES
 _BASH_DEF_LINE_RE = re.compile(
     r"^\s*(?:function\s+[A-Za-z_][A-Za-z0-9_-]*(?:\s*\(\s*\))?"
     r"|[A-Za-z_][A-Za-z0-9_-]*\s*\(\s*\))\s*(?:[\{(]|$)"

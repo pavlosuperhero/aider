@@ -1377,6 +1377,157 @@ class TestReportingAndPairedIntervals(unittest.TestCase):
         self.assertIn("audit=3/3", output)
         self.assertIn("tokens=+310.0", output)
 
+    def test_summarize_reports_four_auditor_axes_false_abstentions_and_timeout_censoring(self):
+        rows = [
+            # 1) Valid patch approved
+            {
+                "schema_version": 2,
+                "round": 0,
+                "spec": "vague",
+                "kind": "caller",
+                "language": "python",
+                "case": "duration",
+                "arm": "audit",
+                "exit": 0,
+                "evidence": True,
+                "audit_ran": True,
+                "audit_outcome": "pass",
+                "audit_passed": True,
+                "audit_failed": False,
+                "commit_outcome": "applied",
+                "commit_passed": False,
+                "hidden_outcome": "pass",
+                "hidden_passed": True,
+                "patch_hidden_passed": True,
+                "smoke_passed": True,
+                "strict_accepted": True,
+                "passed": True,
+                "false_approval": False,
+                "unknowns": 0,
+                "errors": 0,
+                "tokens": 1000,
+                "tokens_measured": True,
+                "seconds": 40.0,
+            },
+            # 2) Broken patch falsely approved -> false approval
+            {
+                "schema_version": 2,
+                "round": 0,
+                "spec": "vague",
+                "kind": "caller",
+                "language": "python",
+                "case": "names",
+                "arm": "audit",
+                "exit": 0,
+                "evidence": True,
+                "audit_ran": True,
+                "audit_outcome": "pass",
+                "audit_passed": True,
+                "audit_failed": False,
+                "commit_outcome": "applied",
+                "commit_passed": False,
+                "hidden_outcome": "fail",
+                "hidden_passed": False,
+                "patch_hidden_passed": False,
+                "smoke_passed": True,
+                "strict_accepted": False,
+                "passed": False,
+                "false_approval": True,
+                "unknowns": 0,
+                "errors": 0,
+                "tokens": 1100,
+                "tokens_measured": True,
+                "seconds": 60.0,
+            },
+            # 3) Valid patch blocked by UNKNOWN -> false abstention
+            {
+                "schema_version": 2,
+                "round": 0,
+                "spec": "vague",
+                "kind": "caller",
+                "language": "python",
+                "case": "lookup",
+                "arm": "audit",
+                "exit": 0,
+                "evidence": True,
+                "audit_ran": True,
+                "audit_outcome": "unknown",
+                "audit_passed": False,
+                "audit_failed": False,
+                "commit_outcome": "applied",
+                "commit_passed": False,
+                "hidden_outcome": "pass",
+                "hidden_passed": True,
+                "patch_hidden_passed": True,
+                "smoke_passed": True,
+                "strict_accepted": False,
+                "passed": True,
+                "false_approval": False,
+                "unknowns": 1,
+                "errors": 0,
+                "tokens": 1200,
+                "tokens_measured": True,
+                "seconds": 50.0,
+            },
+            # 4) Timed-out attempt at 360s (exit=124) -> right-censored latency
+            {
+                "schema_version": 2,
+                "round": 0,
+                "spec": "vague",
+                "kind": "caller",
+                "language": "python",
+                "case": "config",
+                "arm": "audit",
+                "exit": 124,
+                "evidence": True,
+                "audit_ran": False,
+                "audit_outcome": "not_run",
+                "audit_passed": None,
+                "audit_failed": False,
+                "commit_outcome": "timeout",
+                "commit_passed": False,
+                "hidden_outcome": "timeout",
+                "hidden_passed": False,
+                "patch_hidden_passed": False,
+                "smoke_passed": False,
+                "strict_accepted": False,
+                "passed": False,
+                "false_approval": False,
+                "unknowns": 0,
+                "errors": 0,
+                "tokens": None,
+                "tokens_measured": False,
+                "seconds": 360.0,
+            },
+        ]
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            summary = heldout.summarize(rows)
+        output = buf.getvalue()
+
+        arm = summary["arm_outcomes"]["audit"]
+        self.assertEqual(arm["hidden_passed"], 2)
+        self.assertAlmostEqual(arm["hidden_pass_rate"], 0.5)
+        self.assertEqual(arm["audit_pass_count"], 2)
+        self.assertAlmostEqual(arm["audit_pass_rate"], 0.5)
+        self.assertEqual(arm["false_approval"], 1)
+        self.assertEqual(arm["false_approval_count"], 1)
+        self.assertEqual(arm["false_abstention_count"], 1)
+        self.assertAlmostEqual(arm["false_abstention_rate"], 0.5)
+        self.assertEqual(arm["strict_accepted"], 1)
+
+        self.assertEqual(arm["timeout_count"], 1)
+        self.assertAlmostEqual(arm["timeout_rate"], 0.25)
+        self.assertEqual(arm["non_timeout_n"], 3)
+        self.assertAlmostEqual(arm["non_timeout_seconds_mean"], 50.0)
+        self.assertAlmostEqual(arm["non_timeout_seconds_p50"], 50.0)
+
+        self.assertIn("false_approvals=1", output)
+        self.assertIn("false_abstentions=1", output)
+        self.assertIn("timeouts=1", output)
+        self.assertIn("50.0", output)
+
     def test_load_results_and_metadata_sidecar_isolation(self):
         with tempfile.TemporaryDirectory(prefix="aider-meta-test-") as tmp:
             root = Path(tmp)
