@@ -2691,9 +2691,10 @@ class Coder:
                 patch, task=self._local_caller_task, io=self.io
             )
             self._last_audited_diff = patch
-            if verdict.status == "UNKNOWN" and verdict.raw_response:
+            tail = getattr(self.local_caller_auditor, "last_response_tail", "")
+            if verdict.status in ("PASS", "FAIL", "UNKNOWN") and tail:
                 if self.verbose or os.getenv("AIDER_TRIAL_USAGE"):
-                    self.io.tool_output(f"Audit response tail: {verdict.raw_response[-200:]!r}")
+                    self.io.tool_output(f"Audit response tail: {tail}")
             if not verdict.passed and not self.caller_advisory:
                 self.io.tool_warning(
                     "Edits remain uncommitted. Review the working tree with "

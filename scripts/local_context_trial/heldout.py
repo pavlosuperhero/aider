@@ -2045,7 +2045,10 @@ def _run_jobs(args, jobs, out, run_meta, rows):
                 metadata=row_meta,
                 auto_lint=args.auto_lint,
                 thinking_tokens=args.thinking_tokens,
+                expected_model_params=run_meta.get("effective_model_params"),
             )
+        except run.TrialParameterDriftError:
+            raise
         except Exception as exc:
             result = _build_error_row(
                 case_spec=case_spec,

@@ -17,6 +17,7 @@ if str(TRIAL_DIR) not in sys.path:
     sys.path.insert(0, str(TRIAL_DIR))
 
 import heldout  # noqa: E402
+import rescore  # noqa: E402
 import run  # noqa: E402
 
 
@@ -2147,6 +2148,450 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
             argv_set = json.loads(argv_log.read_text(encoding="utf-8"))
             idx = argv_set.index("--thinking-tokens")
             self.assertEqual(argv_set[idx + 1], "4096")
+
+
+class TestHarnessFixesAndRescore(unittest.TestCase):
+    def _run_spec_with_fake_aider(
+        self,
+        *,
+        case_spec: run.CaseSpec,
+        arm: str = "passive",
+        log_content: str = "Trial usage: editor 500\n",
+        edit_fn=None,
+        exit_code: int = 0,
+        expected_model_params: dict | None = None,
+        output: Path | None = None,
+    ) -> dict:
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and any(
+                "runpy.run_module('aider'" in str(part) for part in cmd
+            ):
+                stdout = kwargs.get("stdout")
+                if stdout is not None:
+                    stdout.write(log_content)
+                if edit_fn is not None:
+                    edit_fn(Path(kwargs["cwd"]))
+                return subprocess.CompletedProcess(cmd, exit_code)
+            return real_run(cmd, *args, **kwargs)
+
+        def invoke(out_dir: Path) -> dict:
+            with mock.patch.object(run.subprocess, "run", side_effect=fake_run):
+                return run.run_spec(
+                    output=out_dir,
+                    case_spec=case_spec,
+                    arm=arm,
+                    round_id=0,
+                    map_tokens=512,
+                    spec="vague",
+                    metadata={"schema_version": 2, "run_id": "harnessfix"},
+                    expected_model_params=expected_model_params,
+                )
+
+        if output is not None:
+            return invoke(output)
+        with tempfile.TemporaryDirectory(prefix="aider-harness-fix-") as tmp:
+            return invoke(Path(tmp))
+
+    def _multi_target_case(self) -> run.CaseSpec:
+        return run.CaseSpec(
+            name="multi_target_case",
+            files={
+                "api.py": "def compute(x):\n    return x\n",
+                "helper.py": "def helper_val():\n    return 1\n",
+                "extra.py": "EXTRA = 0\n",
+                "smoke.py": "from api import compute\nassert compute(1) >= 1\n",
+            },
+            editable_file="api.py",
+            additional_editable=("helper.py",),
+            language="python",
+            task="Update compute to return x * 2.",
+            explicit="compute(3) must return 6.",
+            test_cmd=f"{sys.executable} smoke.py",
+            hidden_cmd=[sys.executable, "-c", "from api import compute; assert compute(3) == 6"],
+            kind="caller",
+        )
+
+    def test_p0_multi_target_only_target_modified_non_empty_subset(self):
+        # Pure domain helper unit checks
+        self.assertTrue(
+            run.is_only_target_modified(
+                ["api.py", ""],
+                [" M api.py"],
+                ("api.py", "helper.py"),
+            )
+        )
+        self.assertFalse(run.is_only_target_modified([], [], ("api.py", "helper.py")))
+        self.assertFalse(run.is_only_target_modified([""], [], ("api.py", "helper.py")))
+        self.assertFalse(
+            run.is_only_target_modified(
+                ["api.py", "extra.py"],
+                [" M api.py", " M extra.py"],
+                ("api.py", "helper.py"),
+            )
+        )
+        self.assertFalse(
+            run.is_only_target_modified(
+                ["api.py"],
+                [" M api.py", "?? stray.py"],
+                ("api.py", "helper.py"),
+            )
+        )
+
+        case_spec = self._multi_target_case()
+
+        # (a) Editing 1 of 2 targets cleanly -> only_target_modified=True, applied, passed, strict_accepted
+        def edit_one_target(repo: Path):
+            (repo / "api.py").write_text("def compute(x):\n    return x * 2\n")
+
+        res_one = self._run_spec_with_fake_aider(case_spec=case_spec, edit_fn=edit_one_target)
+        self.assertIs(res_one["only_target_modified"], True)
+        self.assertEqual(res_one["commit_outcome"], "applied")
+        self.assertIs(res_one["commit_passed"], False)
+        self.assertIs(res_one["patch_hidden_passed"], True)
+        self.assertIs(res_one["passed"], True)
+        self.assertIs(res_one["strict_accepted"], True)
+        self.assertIs(res_one["false_approval"], False)
+
+        # (b) Editing 0 targets -> only_target_modified=False, no_change, passed=False
+        res_zero = self._run_spec_with_fake_aider(case_spec=case_spec, edit_fn=None)
+        self.assertIs(res_zero["only_target_modified"], False)
+        self.assertEqual(res_zero["commit_outcome"], "no_change")
+        self.assertIs(res_zero["commit_passed"], False)
+        self.assertIs(res_zero["passed"], False)
+
+        # (c1) Editing 1 target + 1 out-of-scope tracked file -> False, out_of_scope
+        def edit_target_and_tracked(repo: Path):
+            edit_one_target(repo)
+            (repo / "extra.py").write_text("EXTRA = 1\n")
+
+        res_tracked = self._run_spec_with_fake_aider(
+            case_spec=case_spec, edit_fn=edit_target_and_tracked
+        )
+        self.assertIs(res_tracked["only_target_modified"], False)
+        self.assertEqual(res_tracked["commit_outcome"], "out_of_scope")
+        self.assertIs(res_tracked["hidden_passed"], True)
+        self.assertIs(res_tracked["passed"], False)
+
+        # (c2) Editing 1 target + 1 untracked file -> False, out_of_scope
+        def edit_target_and_untracked(repo: Path):
+            edit_one_target(repo)
+            (repo / "stray.txt").write_text("stray\n")
+
+        res_untracked = self._run_spec_with_fake_aider(
+            case_spec=case_spec, edit_fn=edit_target_and_untracked
+        )
+        self.assertIs(res_untracked["only_target_modified"], False)
+        self.assertEqual(res_untracked["commit_outcome"], "out_of_scope")
+        self.assertIs(res_untracked["hidden_passed"], True)
+        self.assertIs(res_untracked["passed"], False)
+
+    def test_p1_patch_and_scope_captured_before_verification_side_effects(self):
+        polluting_case = run.CaseSpec(
+            name="polluting_hidden",
+            files={
+                "api.py": "def compute(x):\n    return x\n",
+                "smoke.py": "from api import compute\nassert compute(1) >= 1\n",
+            },
+            editable_file="api.py",
+            language="python",
+            task="Update compute to return x * 2.",
+            explicit="compute(3) must return 6.",
+            test_cmd=f"{sys.executable} smoke.py",
+            hidden_cmd=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "from api import compute; "
+                    "Path('hidden_side_effect.tmp').write_text('generated during hidden test'); "
+                    "assert compute(3) == 6"
+                ),
+            ],
+            kind="caller",
+        )
+
+        def fix_api(repo: Path):
+            (repo / "api.py").write_text("def compute(x):\n    return x * 2\n")
+
+        with tempfile.TemporaryDirectory(prefix="aider-p1-order-") as tmp:
+            out_dir = Path(tmp)
+            res = self._run_spec_with_fake_aider(
+                case_spec=polluting_case,
+                edit_fn=fix_api,
+                output=out_dir,
+            )
+            attempt_dir = out_dir / "0-vague-polluting_hidden-passive"
+            self.assertTrue((attempt_dir / "repo" / "hidden_side_effect.tmp").exists())
+            patch_disk = (attempt_dir / "patch.diff").read_text(encoding="utf-8")
+            self.assertIn("diff --git a/api.py b/api.py", patch_disk)
+            self.assertNotIn("hidden_side_effect.tmp", patch_disk)
+            self.assertEqual(res["patch"], patch_disk)
+            self.assertIs(res["only_target_modified"], True)
+            self.assertEqual(res["commit_outcome"], "applied")
+            self.assertIs(res["hidden_passed"], True)
+            self.assertIs(res["passed"], True)
+
+    def test_p2_per_row_runtime_parameter_drift_aborts_sweep(self):
+        case_spec = heldout.CASE_BY_NAME["duration"]
+        expected_params = {
+            "dropped_params": [],
+            "extra_params": {"max_tokens": 32768},
+            "max_tokens": 32768,
+            "model": "lm_studio/qwen/qwen3.6-35b-a3b",
+            "provider": "lm_studio",
+            "reasoning_effort": None,
+            "temperature": 0.6,
+            "thinking_tokens": None,
+        }
+        drifted_params = dict(expected_params, temperature=0)
+
+        # 1. Matching params pass cleanly
+        ok = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            log_content=(
+                f"Trial model params: {json.dumps(expected_params, sort_keys=True)}\n"
+                "Trial usage: editor 500\n"
+            ),
+            expected_model_params=expected_params,
+        )
+        self.assertEqual(ok["effective_model_params"], expected_params)
+
+        # 2. Drifted temperature raises TrialParameterDriftError
+        with self.assertRaises(run.TrialParameterDriftError) as ctx_drift:
+            self._run_spec_with_fake_aider(
+                case_spec=case_spec,
+                log_content=(
+                    f"Trial model params: {json.dumps(drifted_params, sort_keys=True)}\n"
+                    "Trial usage: editor 500\n"
+                ),
+                expected_model_params=expected_params,
+            )
+        self.assertIn("temperature: expected 0.6, actual 0", str(ctx_drift.exception))
+
+        # 3. Non-empty ignored_settings raises TrialParameterDriftError even when params match
+        with self.assertRaises(run.TrialParameterDriftError) as ctx_ign:
+            self._run_spec_with_fake_aider(
+                case_spec=case_spec,
+                log_content=(
+                    "Warning: lm_studio/qwen/qwen3.6-35b-a3b does not support 'thinking_tokens', ignoring.\n"
+                    f"Trial model params: {json.dumps(expected_params, sort_keys=True)}\n"
+                    "Trial usage: editor 500\n"
+                ),
+                expected_model_params=expected_params,
+            )
+        self.assertIn("thinking_tokens", str(ctx_ign.exception))
+
+        # 4. Non-zero exit without Trial model params or ignored_settings does NOT falsely raise drift
+        crashed = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            log_content="Connection reset before model start\n",
+            exit_code=1,
+            expected_model_params=expected_params,
+        )
+        self.assertEqual(crashed["exit"], 1)
+        self.assertEqual(crashed["commit_outcome"], "error")
+
+        # 5. heldout.main() aborts immediately on TrialParameterDriftError without writing an error row
+        with tempfile.TemporaryDirectory(prefix="aider-p2-drift-abort-") as tmp:
+            out_path = Path(tmp) / "results.jsonl"
+            calls: list[str] = []
+
+            def fake_run_spec(**kwargs):
+                calls.append(kwargs["case_spec"].name)
+                self.assertEqual(kwargs["expected_model_params"]["temperature"], 0.6)
+                raise run.TrialParameterDriftError(
+                    "Runtime Aider model parameters drifted from trial metadata: "
+                    "temperature: expected 0.6, actual 0"
+                )
+
+            with (
+                mock.patch.object(
+                    heldout.run,
+                    "run_subprocess_preflight",
+                    return_value={
+                        "effective_model_params": expected_params,
+                        "config_provenance": None,
+                        "ignored_settings": [],
+                    },
+                ),
+                mock.patch.object(heldout.run, "run_spec", side_effect=fake_run_spec),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(run.TrialParameterDriftError):
+                    heldout.main(
+                        [
+                            "--model",
+                            "lm_studio/qwen/qwen3.6-35b-a3b",
+                            "--cases",
+                            "duration,names",
+                            "--arms",
+                            "baseline",
+                            "--specs",
+                            "vague",
+                            "--rounds",
+                            "1",
+                            "--seed",
+                            "1",
+                            "--out",
+                            str(out_path),
+                        ]
+                    )
+
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(out_path.exists())
+
+    def test_rescore_flips_false_out_of_scope_and_keeps_real_oos_false(self):
+        with tempfile.TemporaryDirectory(prefix="aider-rescore-test-") as tmp:
+            root = Path(tmp)
+            workdir = root / "aider-heldout-work"
+            workdir.mkdir()
+
+            def make_attempt(folder_name: str, mutate_fn) -> tuple[Path, str]:
+                attempt_dir = workdir / folder_name
+                repo = attempt_dir / "repo"
+                repo.mkdir(parents=True)
+                run.write_fixture_files(
+                    repo,
+                    {
+                        "src/a.py": "def fn():\n    return 1\n",
+                        "src/b.py": "def other():\n    return 2\n",
+                        "src/unrelated.py": "X = 0\n",
+                    },
+                )
+                run.init_git_repo(repo)
+                mutate_fn(repo)
+                diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=repo, text=True)
+                return repo, diff
+
+            # Row 0: clean edit to 1 of 2 targets, falsely recorded as out_of_scope / passed=False
+            _, diff_clean = make_attempt(
+                "0-vague-be-builtin-rr-off-facts-off-multi_case-passive",
+                lambda repo: (repo / "src/a.py").write_text("def fn():\n    return 2\n"),
+            )
+            # Row 1: genuine out-of-scope (edits target + untracked file)
+            _, diff_untracked = make_attempt(
+                "0-vague-be-builtin-rr-off-facts-off-multi_case-audit",
+                lambda repo: (
+                    (repo / "src/a.py").write_text("def fn():\n    return 2\n"),
+                    (repo / "stray.py").write_text("# stray\n"),
+                ),
+            )
+            # Row 2: patch-only fallback (no preserved repo directory), clean 1-of-2 target diff
+            base_row = {
+                "schema_version": 2,
+                "round": 0,
+                "spec": "vague",
+                "case": "multi_case",
+                "local_callers_backend": "builtin",
+                "local_callers_read_range": False,
+                "local_callers_enabled": True,
+                "project_facts": False,
+                "facts_db": None,
+                "facts_file": None,
+                "exit": 0,
+                "trial_error": None,
+                "editor_calls": 1,
+                "commits_added": 0,
+                "smoke_passed": True,
+                "hidden_passed": True,
+                "audit_passed": None,
+                "only_target_modified": False,
+                "commit_outcome": "out_of_scope",
+                "commit_passed": False,
+                "patch_hidden_passed": False,
+                "strict_accepted": False,
+                "passed": False,
+                "false_approval": False,
+                "workdir": str(workdir),
+                "metadata": {"run_id": "rescore-unit"},
+            }
+            row_clean = dict(
+                base_row,
+                arm="passive",
+                arm_flags=run.resolve_arm_flags("passive", backend="builtin", read_range=False, facts=False),
+                patch=diff_clean,
+            )
+            row_oos = dict(
+                base_row,
+                arm="audit",
+                arm_flags=run.resolve_arm_flags("audit", backend="builtin", read_range=False, facts=False),
+                audit_passed=True,
+                false_approval=True,
+                patch=diff_untracked,
+            )
+            row_patch_only = dict(
+                base_row,
+                arm="baseline",
+                local_callers_enabled=False,
+                arm_flags=run.resolve_arm_flags("baseline", backend="builtin", read_range=False, facts=False),
+                workdir=str(root / "missing-workdir"),
+                patch=diff_clean,
+            )
+
+            in_jsonl = root / "stage1.jsonl"
+            out_jsonl = root / "stage1.rescored.jsonl"
+            original_text = "\n".join(json.dumps(r) for r in (row_clean, row_oos, row_patch_only)) + "\n"
+            in_jsonl.write_text(original_text, encoding="utf-8")
+
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {
+                                "case_id": "multi_case",
+                                "editable_files": ["src/a.py", "src/b.py"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                summary = rescore.main(
+                    [str(in_jsonl), "--manifest", str(manifest), "--out", str(out_jsonl)]
+                )
+
+            # Input file untouched
+            self.assertEqual(in_jsonl.read_text(encoding="utf-8"), original_text)
+            self.assertEqual(summary["rescore_source"], {"repo": 2, "patch_only": 1})
+            self.assertEqual(summary["changed_count"], 2)
+
+            rescored_rows = heldout.load_results(out_jsonl)
+            self.assertEqual(len(rescored_rows), 3)
+
+            # Row 0 flipped cleanly from False/out_of_scope -> True/applied
+            r0 = rescored_rows[0]
+            self.assertIs(r0["only_target_modified"], True)
+            self.assertEqual(r0["commit_outcome"], "applied")
+            self.assertIs(r0["commit_passed"], False)
+            self.assertIs(r0["patch_hidden_passed"], True)
+            self.assertIs(r0["strict_accepted"], True)
+            self.assertIs(r0["passed"], True)
+            self.assertEqual(r0["metadata"]["rescore_source"], "repo")
+
+            # Row 1 stayed False/out_of_scope because untracked stray.py exists in repo/
+            r1 = rescored_rows[1]
+            self.assertIs(r1["only_target_modified"], False)
+            self.assertEqual(r1["commit_outcome"], "out_of_scope")
+            self.assertIs(r1["passed"], False)
+            self.assertIs(r1["false_approval"], True)
+            self.assertEqual(r1["metadata"]["rescore_source"], "repo")
+
+            # Row 2 used patch_only fallback and flipped cleanly
+            r2 = rescored_rows[2]
+            self.assertIs(r2["only_target_modified"], True)
+            self.assertEqual(r2["commit_outcome"], "applied")
+            self.assertIs(r2["passed"], True)
+            self.assertEqual(r2["metadata"]["rescore_source"], "patch_only")
+
+            # In-place mutation is rejected
+            with self.assertRaises(ValueError):
+                rescore.rescore_jsonl(in_jsonl, in_jsonl, {"multi_case": ("src/a.py", "src/b.py")})
 
 
 if __name__ == "__main__":

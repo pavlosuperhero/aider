@@ -12,6 +12,7 @@ from aider.caller_audit import (
     AuditVerdict,
     CallerContractHook,
     IsolatedCallerAuditor,
+    format_audit_response_tail,
     parse_audit_verdict,
 )
 from aider.coders import Coder
@@ -1049,3 +1050,221 @@ def test_empty_excerpt_incomplete_reported_as_incomplete_not_no_evidence(project
     )
     assert not any("Local caller audit: UNKNOWN - NO_EVIDENCE" in line for line in outputs)
     audit_complete.assert_not_called()
+
+
+def test_auditor_system_prompt_has_mixed_class_few_shot_calibration_examples():
+    import re
+    from aider.caller_audit import _AUDITOR_SYSTEM_PROMPT
+
+    marker = "Calibration examples"
+    assert marker in _AUDITOR_SYSTEM_PROMPT
+    examples_block = _AUDITOR_SYSTEM_PROMPT.split(marker, 1)[1]
+
+    # Every example follows the 4-part structured format.
+    assert examples_block.count("CALLER_EXPECTS:") == 5
+    assert examples_block.count("TRACE_REALISTIC:") == 5
+    assert examples_block.count("MISMATCH_CHECK:") == 5
+
+    verdict_classes = re.findall(r"^VERDICT:\s*(PASS|FAIL|UNKNOWN)\b", examples_block, re.M)
+    assert verdict_classes == ["UNKNOWN", "PASS", "UNKNOWN", "FAIL", "UNKNOWN"]
+    # Classes are interleaved rather than grouped consecutively.
+    assert all(a != b for a, b in zip(verdict_classes, verdict_classes[1:]))
+
+    lower = examples_block.lower()
+    # Covers opaque consumer, coarse errno == 0 check, homonymous symbol collision,
+    # concrete FAIL, and verified PASS.
+    assert "opaque" in lower and "hash" in lower and "===" in examples_block
+    assert "errno == 0" in lower and "einval" in lower and "erange" in lower
+    assert "version::fmt" in lower and "error::fmt" in lower
+    assert "homonymous" in lower
+    assert "format_price(1050)" in examples_block
+    assert "deadline_ms" in examples_block
+    # Prompt overhead stays modest.
+    assert len(_AUDITOR_SYSTEM_PROMPT) < 8000
+
+
+def test_format_audit_response_tail_handles_whitespace_bounds_and_empty_inputs():
+    assert format_audit_response_tail(None) == ""
+    assert format_audit_response_tail("") == ""
+    assert format_audit_response_tail("   \n\t  ") == ""
+    assert format_audit_response_tail("VERDICT: PASS", max_chars=0) == ""
+    assert format_audit_response_tail("VERDICT: PASS", max_chars=-10) == ""
+
+    multiline = (
+        "CALLER_EXPECTS: exact decimal\n\n"
+        "  TRACE_REALISTIC: 1050 -> '10.50'\n"
+        "VERDICT: PASS\n"
+    )
+    formatted = format_audit_response_tail(multiline)
+    assert "\n" not in formatted
+    assert formatted == (
+        "CALLER_EXPECTS: exact decimal TRACE_REALISTIC: 1050 -> '10.50' VERDICT: PASS"
+    )
+
+    long_text = "A" * 200 + " MISMATCH_CHECK: ok VERDICT: PASS"
+    clipped = format_audit_response_tail(long_text, max_chars=40)
+    assert len(clipped) == 40
+    assert clipped.startswith("...")
+    assert clipped.endswith("MISMATCH_CHECK: ok VERDICT: PASS")
+
+    assert format_audit_response_tail("abcdef", max_chars=6) == "abcdef"
+    assert format_audit_response_tail("abcdef", max_chars=3) == "def"
+
+
+def test_auditor_last_response_tail_tracks_only_llm_responses_and_resets():
+    responses = iter(
+        [
+            "CALLER_EXPECTS: plain string\nMISMATCH_CHECK: ok\nVERDICT: PASS",
+            "CALLER_EXPECTS: no prefix\nMISMATCH_CHECK: '$' added\nVERDICT: FAIL: currency prefix",
+            "CALLER_EXPECTS: opaque hash\nMISMATCH_CHECK: unspecified\nVERDICT: UNKNOWN: opaque",
+        ]
+    )
+    auditor = IsolatedCallerAuditor(lambda msgs: next(responses), max_audits=3)
+    assert auditor.last_response_tail == ""
+
+    # Pre-call deterministic NO_EVIDENCE gate leaves tail empty.
+    auditor.begin_turn(())
+    assert auditor.audit("+x = 1").status == "UNKNOWN"
+    assert auditor.last_response_tail == ""
+
+    # Pre-call deterministic INCOMPLETE gate leaves tail empty.
+    auditor.begin_turn((), caller_evidence_status="INCOMPLETE")
+    assert auditor.audit("+x = 1").status == "UNKNOWN"
+    assert auditor.last_response_tail == ""
+
+    # LLM PASS, FAIL, and UNKNOWN each populate last_response_tail.
+    auditor.begin_turn([SAMPLE_EXCERPT])
+    assert auditor.audit("+a = 1").status == "PASS"
+    assert "CALLER_EXPECTS: plain string" in auditor.last_response_tail
+    assert "VERDICT: PASS" in auditor.last_response_tail
+
+    assert auditor.audit("+a = 2").status == "FAIL"
+    assert "MISMATCH_CHECK: '$' added" in auditor.last_response_tail
+    assert "VERDICT: FAIL: currency prefix" in auditor.last_response_tail
+
+    assert auditor.audit("+a = 3").status == "UNKNOWN"
+    assert "VERDICT: UNKNOWN: opaque" in auditor.last_response_tail
+
+    # Budget-exhausted deterministic gate clears prior tail.
+    assert auditor.audit("+a = 4").status == "UNKNOWN"
+    assert auditor.last_response_tail == ""
+
+    # Incomplete excerpt flag clears tail and does not call LLM.
+    incomplete_excerpt = FakeExcerpt(
+        path="pkg/consumer.py",
+        start_line=12,
+        symbol="format_price",
+        code="raw = format_price(1050)\n",
+        incomplete=True,
+    )
+    auditor.begin_turn([incomplete_excerpt])
+    assert auditor.audit("+a = 5").status == "UNKNOWN"
+    assert auditor.last_response_tail == ""
+
+    # begin_turn resets last_response_tail after an LLM response.
+    auditor_reset = IsolatedCallerAuditor(lambda msgs: "MISMATCH_CHECK: ok\nVERDICT: PASS")
+    auditor_reset.begin_turn([SAMPLE_EXCERPT])
+    assert auditor_reset.audit("+a = 1").status == "PASS"
+    assert auditor_reset.last_response_tail != ""
+    auditor_reset.begin_turn([SAMPLE_EXCERPT])
+    assert auditor_reset.last_response_tail == ""
+
+
+@pytest.mark.parametrize(
+    "reply, expected_status_line, expected_tail_snippet",
+    [
+        (
+            "CALLER_EXPECTS: exact decimal\nMISMATCH_CHECK: matches\nVERDICT: PASS",
+            "Local caller audit: PASS",
+            "MISMATCH_CHECK: matches VERDICT: PASS",
+        ),
+        (
+            "CALLER_EXPECTS: no '$'\nMISMATCH_CHECK: prefix breaks assert\nVERDICT: FAIL: bad '$'",
+            "Local caller audit: FAIL - bad '$'",
+            "MISMATCH_CHECK: prefix breaks assert VERDICT: FAIL: bad '$'",
+        ),
+        (
+            "CALLER_EXPECTS: opaque consumer\nMISMATCH_CHECK: unspecified\nVERDICT: UNKNOWN: opaque",
+            "Local caller audit: UNKNOWN - opaque",
+            "MISMATCH_CHECK: unspecified VERDICT: UNKNOWN: opaque",
+        ),
+    ],
+)
+def test_coder_finish_audit_logs_response_tail_for_all_llm_verdicts_under_trial_usage(
+    project, monkeypatch, reply, expected_status_line, expected_tail_snippet
+):
+    monkeypatch.setenv("AIDER_TRIAL_USAGE", "1")
+    _patch_local_callers(monkeypatch)
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    outputs = []
+    coder.io.tool_output = lambda *a, **kw: outputs.append(" ".join(str(x) for x in a))
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", lambda msgs: reply)
+    fake_send(coder, [EDIT_BLOCK, "No further edits."])
+
+    coder.run("update format_price")
+
+    assert expected_status_line in outputs
+    tail_lines = [line for line in outputs if line.startswith("Audit response tail: ")]
+    assert len(tail_lines) == 1
+    assert expected_tail_snippet in tail_lines[0]
+    assert "\n" not in tail_lines[0]
+
+
+def test_coder_finish_audit_tail_omitted_on_no_evidence_and_when_quiet(project, monkeypatch):
+    # 1. Deterministic NO_EVIDENCE UNKNOWN must NOT emit Audit response tail even with AIDER_TRIAL_USAGE=1.
+    monkeypatch.setenv("AIDER_TRIAL_USAGE", "1")
+    _patch_local_callers(monkeypatch, excerpts=())
+    coder_no_ev = make_coder(local_callers=True, local_callers_audit=True)
+    no_ev_outputs = []
+    coder_no_ev.io.tool_output = lambda *a, **kw: no_ev_outputs.append(
+        " ".join(str(x) for x in a)
+    )
+    audit_fn = Mock(return_value="VERDICT: PASS")
+    monkeypatch.setattr(coder_no_ev.local_caller_auditor, "_complete_fn", audit_fn)
+    fake_send(coder_no_ev, [EDIT_BLOCK])
+
+    coder_no_ev.run("update format_price")
+
+    assert "Local caller audit: UNKNOWN - NO_EVIDENCE" in no_ev_outputs
+    assert not any(line.startswith("Audit response tail:") for line in no_ev_outputs)
+    audit_fn.assert_not_called()
+
+    # 2. Quiet mode (verbose=False and AIDER_TRIAL_USAGE unset) omits Audit response tail,
+    # while verbose=True emits it on PASS.
+    monkeypatch.delenv("AIDER_TRIAL_USAGE", raising=False)
+    _patch_local_callers(monkeypatch, excerpts=(SAMPLE_EXCERPT,))
+
+    quiet_coder = make_coder(local_callers=True, local_callers_audit=True, verbose=False)
+    quiet_outputs = []
+    quiet_coder.io.tool_output = lambda *a, **kw: quiet_outputs.append(
+        " ".join(str(x) for x in a)
+    )
+    monkeypatch.setattr(
+        quiet_coder.local_caller_auditor,
+        "_complete_fn",
+        lambda msgs: "MISMATCH_CHECK: ok\nVERDICT: PASS",
+    )
+    fake_send(quiet_coder, [FIX_EDIT_BLOCK])
+    quiet_coder.run("restore format_price")
+
+    assert "Local caller audit: PASS" in quiet_outputs
+    assert not any(line.startswith("Audit response tail:") for line in quiet_outputs)
+
+    verbose_coder = make_coder(local_callers=True, local_callers_audit=True, verbose=True)
+    verbose_outputs = []
+    verbose_coder.io.tool_output = lambda *a, **kw: verbose_outputs.append(
+        " ".join(str(x) for x in a)
+    )
+    monkeypatch.setattr(
+        verbose_coder.local_caller_auditor,
+        "_complete_fn",
+        lambda msgs: "MISMATCH_CHECK: ok\nVERDICT: PASS",
+    )
+    fake_send(verbose_coder, [EDIT_BLOCK])
+    verbose_coder.run("update format_price")
+
+    assert "Local caller audit: PASS" in verbose_outputs
+    assert any(
+        line.startswith("Audit response tail: ") and "MISMATCH_CHECK: ok VERDICT: PASS" in line
+        for line in verbose_outputs
+    )

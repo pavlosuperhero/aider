@@ -1,6 +1,7 @@
 """Run paired Aider trials in fresh repositories. Hidden assertions run after Aider exits."""
 
 import argparse
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -540,6 +541,10 @@ def inspect_model_request_contract(
     }
 
 
+class TrialParameterDriftError(RuntimeError):
+    """Raised when a trial subprocess's runtime model parameters drift from run metadata."""
+
+
 def compare_effective_model_params(
     expected: dict,
     actual: dict | None,
@@ -734,6 +739,84 @@ def classify_commit_outcome(
     if not changed_lines and not has_change:
         return "no_change", False
     return "out_of_scope", False
+
+
+def is_only_target_modified(
+    changed_paths: Iterable[str],
+    changed_status_lines: Iterable[str],
+    targets: Iterable[str],
+) -> bool:
+    """Return True iff a non-empty subset of targets changed with no untracked files.
+
+    Preconditions:
+        changed_paths contains repo-relative tracked paths changed since base_rev.
+        changed_status_lines contains entries from `git status --porcelain -z`.
+        targets contains repo-relative editable target paths for the case.
+    Postconditions:
+        Empty strings in changed_paths or targets are ignored; any untracked (`?? `)
+        status entry causes False to be returned.
+    """
+    changed_set = {path for path in changed_paths if path}
+    target_set = {path for path in targets if path}
+    return (
+        bool(changed_set)
+        and changed_set.issubset(target_set)
+        and not any(line.startswith("?? ") for line in changed_status_lines)
+    )
+
+
+def score_attempt_outcomes(
+    *,
+    exit_code: int,
+    missing_completion: bool,
+    changed_status_lines: list[str],
+    changed_paths: Iterable[str],
+    targets: Iterable[str],
+    gitdiff: str,
+    commits_added: int,
+    smoke_passed: bool,
+    hidden_passed: bool,
+    local_callers_enabled: bool,
+    arm_flags: Iterable[str],
+    audit_passed: bool | None,
+) -> dict:
+    """Compute derived attempt scoring outcomes from captured git and verification state.
+
+    Pure domain helper shared by live `run_spec()` and offline `rescore.py` so both
+    scoring paths stay identical.
+    """
+    only_target_modified = is_only_target_modified(
+        changed_paths,
+        changed_status_lines,
+        targets,
+    )
+    commit_outcome, commit_passed = classify_commit_outcome(
+        exit_code,
+        changed_status_lines,
+        gitdiff,
+        only_target_modified,
+        commits_added,
+    )
+    if missing_completion:
+        commit_outcome, commit_passed = "error", False
+
+    verified = bool(smoke_passed) and bool(hidden_passed)
+    patch_hidden_passed = only_target_modified and bool(hidden_passed)
+    passed = exit_code == 0 and not missing_completion and patch_hidden_passed and verified
+    arm_flags_tuple = tuple(arm_flags)
+    audit_required = bool(local_callers_enabled) and "--local-callers-audit" in arm_flags_tuple
+    strict_accepted = passed and (not audit_required or audit_passed is True)
+    false_approval = audit_passed is True and not (patch_hidden_passed and verified)
+
+    return {
+        "only_target_modified": only_target_modified,
+        "commit_outcome": commit_outcome,
+        "commit_passed": commit_passed,
+        "patch_hidden_passed": patch_hidden_passed,
+        "passed": passed,
+        "strict_accepted": strict_accepted,
+        "false_approval": false_approval,
+    }
 
 
 def _git_repo_state(repo_root: Path = ROOT) -> dict[str, object]:
@@ -1043,6 +1126,7 @@ def run_spec(
     auto_lint: bool = DEFAULT_AUTO_LINT,
     thinking_tokens: str | None = None,
     pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
+    expected_model_params: dict | None = None,
 ) -> dict:
     """Run a single Aider trial for case_spec under the requested arm and controls."""
     if spec not in ("vague", "explicit"):
@@ -1188,12 +1272,22 @@ def run_spec(
     effective_model_params = parse_trial_model_params(log_text)
     config_provenance = parse_trial_config_provenance(log_text)
     ignored_settings = parse_ignored_settings(log_text)
+    if expected_model_params is not None and (
+        effective_model_params is not None or ignored_settings or code == 0
+    ):
+        mismatches = compare_effective_model_params(
+            expected_model_params,
+            effective_model_params,
+            ignored_settings,
+        )
+        if mismatches:
+            raise TrialParameterDriftError(
+                "Runtime Aider model parameters drifted from trial metadata: "
+                + "; ".join(mismatches)
+            )
     missing_completion = code != 124 and usage_info["editor_calls"] == 0
 
     audit_outcome, audit_passed = classify_audit_outcome(verdicts)
-    verification = run_verification_details(repo, case_spec)
-    verified = verification["verified"]
-    diagnostic = verification["diagnostic"]
 
     commits_added = int(
         subprocess.check_output(
@@ -1202,7 +1296,6 @@ def run_spec(
     )
     gitdiff = subprocess.check_output(["git", "diff", base_rev], cwd=repo, text=True)
     (folder / "patch.diff").write_text(gitdiff)
-    (folder / "verification.txt").write_bytes(diagnostic)
     changed = subprocess.check_output(
         ["git", "status", "--porcelain", "--no-renames", "-z", "--untracked-files=all"],
         cwd=repo,
@@ -1211,21 +1304,26 @@ def run_spec(
     changed_lines = changed.split("\0")[:-1]
     changed_paths = subprocess.check_output(
         ["git", "diff", "--name-only", "--no-renames", "-z", base_rev], cwd=repo, text=True
-    )
-    only_target_modified = set(changed_paths.split("\0")[:-1]) == set(targets) and not any(
-        line.startswith("?? ") for line in changed_lines
-    )
-    commit_outcome, commit_passed = classify_commit_outcome(
-        code, changed_lines, gitdiff, only_target_modified, commits_added
-    )
+    ).split("\0")[:-1]
 
-    if missing_completion:
-        commit_outcome, commit_passed = "error", False
+    verification = run_verification_details(repo, case_spec)
+    diagnostic = verification["diagnostic"]
+    (folder / "verification.txt").write_bytes(diagnostic)
 
-    patch_hidden_passed = only_target_modified and verification["hidden_passed"]
-    passed = code == 0 and not missing_completion and patch_hidden_passed and verified
-    audit_required = local_callers_enabled and "--local-callers-audit" in arm_flags
-    strict_accepted = passed and (not audit_required or audit_passed is True)
+    outcomes = score_attempt_outcomes(
+        exit_code=code,
+        missing_completion=missing_completion,
+        changed_status_lines=changed_lines,
+        changed_paths=changed_paths,
+        targets=targets,
+        gitdiff=gitdiff,
+        commits_added=commits_added,
+        smoke_passed=verification["smoke_passed"],
+        hidden_passed=verification["hidden_passed"],
+        local_callers_enabled=local_callers_enabled,
+        arm_flags=arm_flags,
+        audit_passed=audit_passed,
+    )
 
     if metadata is not None:
         row_metadata = dict(metadata)
@@ -1273,10 +1371,10 @@ def run_spec(
         audit_failed="FAIL" in verdicts,
         unknowns=verdicts.count("UNKNOWN"),
         errors=verdicts.count("ERROR"),
-        false_approval=audit_passed is True and not (patch_hidden_passed and verified),
-        commit_outcome=commit_outcome,
-        commit_passed=commit_passed,
-        only_target_modified=only_target_modified,
+        false_approval=outcomes["false_approval"],
+        commit_outcome=outcomes["commit_outcome"],
+        commit_passed=outcomes["commit_passed"],
+        only_target_modified=outcomes["only_target_modified"],
         commits_added=commits_added,
         committed=commits_added > 0,
         smoke_outcome=verification["smoke_outcome"],
@@ -1297,9 +1395,9 @@ def run_spec(
         effective_model_params=effective_model_params,
         config_provenance=config_provenance,
         ignored_settings=ignored_settings,
-        patch_hidden_passed=patch_hidden_passed,
-        strict_accepted=strict_accepted,
-        passed=passed,
+        patch_hidden_passed=outcomes["patch_hidden_passed"],
+        strict_accepted=outcomes["strict_accepted"],
+        passed=outcomes["passed"],
         seconds=round(time.monotonic() - start, 1),
         patch=gitdiff,
         workdir=str(output),
@@ -1325,6 +1423,7 @@ def run_case(
     auto_lint: bool = DEFAULT_AUTO_LINT,
     thinking_tokens: str | None = None,
     pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
+    expected_model_params: dict | None = None,
 ):
     """Backwards-compatible wrapper for legacy tuple cases."""
     name, api, consumer, task, smoke, hidden = case
@@ -1364,6 +1463,7 @@ def run_case(
         auto_lint=auto_lint,
         thinking_tokens=thinking_tokens,
         pythonhashseed=pythonhashseed,
+        expected_model_params=expected_model_params,
     )
     result["explicit_behavior"] = specify_behavior
     return result
@@ -1500,6 +1600,7 @@ def main():
                     metadata=row_meta,
                     auto_lint=args.auto_lint,
                     thinking_tokens=args.thinking_tokens,
+                    expected_model_params=run_meta.get("effective_model_params"),
                 )
                 print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)
                 with (output / "results.jsonl").open("a") as stream:

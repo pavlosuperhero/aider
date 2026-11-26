@@ -52,8 +52,9 @@ like `< 0` without constraining the exact sentinel);
 do not exercise the changed edge case;
   (c) the attached caller excerpts do not inspect the return value, error \
 condition, or relevant arguments of the changed symbol (for example, a bare \
-call with no arguments, a header declaration/prototype only, or a call site \
-that omits how the changed behavior is consumed).
+call with no arguments, a header declaration/prototype only, a call site \
+that omits how the changed behavior is consumed, or a call to an unrelated \
+homonymous method/symbol).
 - Abstain with `VERDICT: UNKNOWN: <reason>` instead of guessing that an \
 arbitrary default satisfies unshown callers to emit `PASS`.
 
@@ -89,7 +90,44 @@ inspect the affected return value, error condition, or relevant arguments output
 VERDICT: UNKNOWN: <reason>
 ONLY if you proved a concrete input where a caller variable or caller result \
 is wrong output:
-VERDICT: FAIL: <input -> actual return -> wrong caller variable/result -> required fix>"""
+VERDICT: FAIL: <input -> actual return -> wrong caller variable/result -> required fix>
+
+Calibration examples (follow the exact 4-part structure):
+
+Example 1 (opaque consumer, unspecified formatting):
+Scenario: Task "serialize map entries"; callers only do `hash(serialize(obj))` or `serialize(a) === serialize(b)`; diff quotes object keys as `"k":v` instead of `k:v`.
+CALLER_EXPECTS: Callers only hash or `===`-compare `serialize(...)`; neither the task nor callers assert key-quoting syntax.
+TRACE_REALISTIC: `serialize({id: 7})` -> `'{"id":7}'`; edge `serialize({})` -> `'{}'`; `hash(...)` and `===` accept any deterministic quoting.
+MISMATCH_CHECK: Key-quoting format is unspecified by the task and unobserved by opaque consumers; evidence is insufficient for PASS.
+VERDICT: UNKNOWN: opaque callers only hash or compare output and do not constrain key quoting
+
+Example 2 (direct verified caller contract):
+Scenario: Task "format cents as plain decimal"; caller does `raw = format_price(1050); assert raw == "10.50"`; diff returns `f"{cents / 100:.2f}"`.
+CALLER_EXPECTS: Caller binds `raw` and explicitly asserts plain decimal string `"10.50"` with no currency prefix.
+TRACE_REALISTIC: `format_price(1050)` -> `"10.50"` (satisfies `raw == "10.50"`); edge `format_price(0)` -> `"0.00"`.
+MISMATCH_CHECK: Task and caller explicitly verify the exact string format; normal and edge traces match.
+VERDICT: PASS
+
+Example 3 (coarse error check, unspecified sentinel):
+Scenario: Task "reject non-digit input in parse_int"; caller only checks `if (errno == 0) use(val);`; diff sets `errno = EINVAL; return 0;` on non-digit input.
+CALLER_EXPECTS: Caller only checks `errno == 0` (any non-zero `errno` skips `use(val)`) and never inspects whether `errno` is `EINVAL` vs `ERANGE` or checks the return sentinel.
+TRACE_REALISTIC: `parse_int("42")` -> `42` (`errno == 0`, calls `use(42)`); edge `parse_int("12x")` -> `0` (`errno = EINVAL`, skips `use`).
+MISMATCH_CHECK: Exact error code (`EINVAL` vs `ERANGE`) and sentinel are unspecified by the task and unchecked by the coarse `errno == 0` check; evidence is insufficient for PASS.
+VERDICT: UNKNOWN: coarse `errno == 0` check does not verify unspecified error code or return sentinel
+
+Example 4 (concrete caller breakage):
+Scenario: Task "return request timeout"; caller computes `deadline_ms = now_ms + get_timeout()`; diff changes `get_timeout()` from `5000` (ms) to `5` (seconds).
+CALLER_EXPECTS: Caller adds `get_timeout()` directly to `now_ms`, requiring milliseconds.
+TRACE_REALISTIC: `get_timeout()` -> `5`; `deadline_ms = 10000 + 5 = 10005` (5 ms instead of 5000 ms).
+MISMATCH_CHECK: Unit mismatch — `now_ms + get_timeout()` expects milliseconds, not seconds.
+VERDICT: FAIL: default call -> returns 5 -> deadline_ms is 10005 instead of 15000 -> return milliseconds (5000)
+
+Example 5 (unrelated homonymous symbol):
+Scenario: Diff modifies `Version::fmt(&self, f)`; the only attached caller invokes `Error::fmt(&err, f)` on an unrelated `Error` type.
+CALLER_EXPECTS: Attached snippet calls `Error::fmt`, not the modified `Version::fmt`; no caller observes `Version::fmt` formatting flags.
+TRACE_REALISTIC: `Version::fmt` width/alignment formatting is never exercised by the attached `Error::fmt` call site.
+MISMATCH_CHECK: Homonymous trait method on a different type provides no contract evidence for `Version::fmt`; evidence is insufficient for PASS.
+VERDICT: UNKNOWN: attached caller invokes unrelated `Error::fmt`, not modified `Version::fmt`"""
 
 
 class CallerExcerptLike(Protocol):
@@ -338,6 +376,20 @@ def _excerpt_references(excerpts: Iterable[CallerExcerptLike]) -> list[str]:
     return refs
 
 
+def format_audit_response_tail(raw_text: str | None, max_chars: int = 400) -> str:
+    """Return a bounded single-line tail of an auditor LLM response for diagnostics."""
+    if not raw_text or max_chars <= 0:
+        return ""
+    normalized = " ".join(str(raw_text).split())
+    if not normalized:
+        return ""
+    if len(normalized) <= max_chars:
+        return normalized
+    if max_chars <= 3:
+        return normalized[-max_chars:]
+    return "..." + normalized[-(max_chars - 3) :]
+
+
 def parse_audit_verdict(raw: str | None) -> AuditVerdict:
     """Require one final, unambiguous verdict line."""
     raw = raw or ""
@@ -539,6 +591,7 @@ class IsolatedCallerAuditor:
         self._evidence_status: str | None = None
         self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.audits_run: int = 0
+        self.last_response_tail: str = ""
 
     def begin_turn(
         self,
@@ -559,6 +612,7 @@ class IsolatedCallerAuditor:
             read_ranges=read_ranges,
         )
         self.audits_run = 0
+        self.last_response_tail = ""
 
     def set_supplementary_evidence(
         self,
@@ -619,6 +673,7 @@ class IsolatedCallerAuditor:
     ) -> AuditVerdict:
         # Supplementary evidence (facts/read-ranges) NEVER substitutes for missing
         # or incomplete caller excerpts.
+        self.last_response_tail = ""
         if self._search_error:
             verdict = AuditVerdict("ERROR", "SEARCH_ERROR")
         elif not self._excerpts:
@@ -641,7 +696,9 @@ class IsolatedCallerAuditor:
             self.audits_run += 1
             messages = self.build_messages(diff_text, task=task)
             try:
-                verdict = parse_audit_verdict(self._complete_fn(messages))
+                raw_response = self._complete_fn(messages)
+                self.last_response_tail = format_audit_response_tail(raw_response)
+                verdict = parse_audit_verdict(raw_response)
             except Exception as exc:
                 verdict = AuditVerdict("ERROR", str(exc)[:_MAX_REASON_CHARS])
         if io is not None:
