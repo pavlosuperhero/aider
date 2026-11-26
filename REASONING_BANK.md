@@ -61,3 +61,11 @@ Use a short heading and record the trigger, decision or failed approach, observe
   - Section B `retrieval_benchmark.py`: `negative_control` `1.000 P / 1.000 R / 0.0 tok` on both `builtin` and `cymbal`.
   - Focused pytest suite: `257 passed, 3 subtests passed`, `flake8` and `git diff --check` clean.
 - **Applicability limits:** Applies to static lexical target discovery without an edit diff; if future retrieval runs post-edit (when modified symbol names are known from the diff), target seeding can rely directly on edited symbols instead of prompt tokens. Live edit-outcome impact remains unmeasured until Phase 2B/3 model evaluations complete.
+
+### 2026-11-26 — Phase 2B Live Qwen3.6 Auditor Calibration (`safety_gate_passed: false`, 1/10 false-PASS)
+
+- **Trigger / scope:** Live held-out auditor safety calibration (`scripts/local_context_trial/auditor_calibration.py --model lm_studio/qwen/qwen3.6-35b-a3b`) against the 5-example class-mixed few-shot prompt (`prompt_sha256=48d49781...`, `temperature=0.6`, `max_tokens=32768`).
+- **Observed outcome:** `9/10` exact matches (`90%`), `pass_retention=2/2`, `fail_recall=2/2`, `deterministic_gate_violations=0/2`, `false_abstentions=0`, **`false_approvals=1`** on `neg_coarse_status_check` (`coarse_status_check` → `VERDICT: PASS` instead of `UNKNOWN`).
+- **Observed failure mechanism:** In its response tail, Qwen3.6 explicitly argued that *"the caller's coarse `!= 0` check is sufficient to verify the error condition contract"* even though the diff introduced an unverified failure sentinel (`*out_port = -1`) and return-code convention not checked by `rc != 0`.
+- **Decision & verification:** Keep `--local-callers-audit` strictly opt-in (NO-GO for default-on) and tighten coarse-status / out-parameter abstention before re-running the 10-case held-out gate (`0 false-PASS` required prior to any 240-attempt sweep).
+- **Applicability limits:** Measured on `lm_studio/qwen/qwen3.6-35b-a3b` at `temperature=0.6` (`prompt_sha256=48d49781...`); re-verify on any prompt update or model change.

@@ -49,7 +49,11 @@
 
 #### Phase 2B & Phase 3 convergence gates
 
-- **Phase 2B (held-out auditor calibration):** Run `auditor_calibration.py --model lm_studio/qwen/qwen3.6-35b-a3b`. Gate: `0 false-PASS` and `deterministic_gate_violations == 0`.
+- **Phase 2B (held-out auditor calibration — EXECUTED on live `lm_studio/qwen/qwen3.6-35b-a3b`, `prompt_sha256=48d49781...`, `temperature=0.6`, `max_tokens=32768`):**
+  - **Result:** **`9/10` exact matches (`90%`)**, `pass_retention=2/2 (100%)`, `fail_recall=2/2 (100%)`, `deterministic_gate_violations=0/2`, `false_abstentions=0`, **`false_approvals=1` (`neg_coarse_status_check`)** → **`safety_gate_passed: false`**.
+  - **Passed negative categories (`5/6`):** `opaque_consumer`, `declaration_or_smoke_only`, `unrelated_homonym`, `deterministic_incomplete` (`0` LLM calls), `deterministic_no_evidence` (`0` LLM calls).
+  - **Observed failure (`neg_coarse_status_check`):** Qwen3.6 rationalized that the caller's coarse `rc != 0` check verified the diff's unverified failure sentinel (`*out_port = -1`) and emitted `VERDICT: PASS`.
+  - **Decision:** Keep `--local-callers-audit` strictly opt-in (**NO-GO** for default-on) until coarse-status / out-param abstention reaches `0 false-PASS` on held-out calibration.
 - **Phase 2C (short diagnostic & A/A pilot):** Run `issue5_trials.sh fast` plus an A/A baseline stochasticity pilot before sizing Phase 3 rounds.
 - **Phase 3 (fresh controlled factorial):** Run fresh Stage 1 + Stage 2 factorial on clean `HEAD` into a new `out_dir`. Keep `--local-callers-audit` strictly opt-in until `0 false-PASS` holds on both held-out calibration and frozen replay.
 
