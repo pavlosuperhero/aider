@@ -199,6 +199,7 @@ class Coder:
                 commands=from_coder.commands.clone(),
                 total_cost=from_coder.total_cost,
                 ignore_mentions=from_coder.ignore_mentions,
+                auto_add_file_mentions=from_coder.auto_add_file_mentions,
                 total_tokens_sent=from_coder.total_tokens_sent,
                 total_tokens_received=from_coder.total_tokens_received,
                 file_watcher=from_coder.file_watcher,
@@ -404,6 +405,7 @@ class Coder:
         chat_history_file=None,
         facts_store=None,
         read_only_ranges=None,
+        auto_add_file_mentions=True,
     ):
         if local_callers_mode not in ("passive", "contract"):
             raise ValueError(
@@ -441,6 +443,7 @@ class Coder:
         self.facts_store = facts_store
         self.read_only_ranges = list(read_only_ranges or ())
         self._local_caller_excerpts = ()
+        self._local_caller_search_error = False
         self._turn_supplementary_evidence = ()
         self._turn_facts_context = ""
         self._turn_auto_ranges = ()
@@ -467,6 +470,7 @@ class Coder:
                 and self.allows_edits
             ),
             advisory=self.caller_advisory,
+            edit_format=self.edit_format,
         )
         if self.local_caller_contract_hook.enabled:
             self.response_hooks += (self.local_caller_contract_hook,)
@@ -495,6 +499,7 @@ class Coder:
 
         self.auto_copy_context = auto_copy_context
         self.auto_accept_architect = auto_accept_architect
+        self.auto_add_file_mentions = auto_add_file_mentions
 
         self.ignore_mentions = ignore_mentions
         if not self.ignore_mentions:
@@ -1466,10 +1471,13 @@ class Coder:
         if getattr(self, "local_caller_auditor", None) is not None:
             self.local_caller_auditor.set_supplementary_evidence(combined)
 
-    def _reset_local_caller_state(self, excerpts, task="", supplementary_evidence=()):
+    def _reset_local_caller_state(
+        self, excerpts, task="", supplementary_evidence=(), *, search_error=False
+    ):
         from aider.caller_audit import normalize_supplementary_evidence
 
         self._local_caller_excerpts = tuple(excerpts or ())
+        self._local_caller_search_error = search_error
         self._local_caller_task = task or ""
         self._turn_supplementary_evidence = normalize_supplementary_evidence(
             supplementary_evidence
@@ -1477,11 +1485,13 @@ class Coder:
         self.local_caller_contract_hook.begin_turn(
             self._local_caller_excerpts,
             supplementary_evidence=self._turn_supplementary_evidence,
+            search_error=search_error,
         )
         if self.local_caller_auditor is not None:
             self.local_caller_auditor.begin_turn(
                 self._local_caller_excerpts,
                 supplementary_evidence=self._turn_supplementary_evidence,
+                search_error=search_error,
             )
 
     def handoff_local_caller_turn_state(self, target_coder) -> str:
@@ -1501,6 +1511,7 @@ class Coder:
             excerpts,
             task=task,
             supplementary_evidence=supplementary,
+            search_error=self._local_caller_search_error,
         )
         target_coder._preserve_local_caller_state = True
 
@@ -1638,6 +1649,7 @@ class Coder:
 
             excerpts = ()
             used_cymbal = False
+            search_error = False
             try:
                 excerpts, description, diagnostics, used_cymbal = self._find_local_callers(task)
             except Exception as err:
@@ -1646,8 +1658,10 @@ class Coder:
                 if not isinstance(err, CymbalError):
                     raise
                 self.io.tool_error(f"Local callers ({self.local_callers_backend}) failed: {err}")
-                description = f"NO_EVIDENCE (cymbal error: {err})"
+                self._last_caller_result = None
+                description = f"SEARCH_ERROR ({err})"
                 diagnostics = ()
+                search_error = True
 
             for diag in diagnostics:
                 self.io.tool_warning(f"Local callers diagnostic: {diag}")
@@ -1661,6 +1675,7 @@ class Coder:
                 excerpts,
                 task=task,
                 supplementary_evidence=supplementary,
+                search_error=search_error,
             )
             self.io.tool_output("Local caller evidence: " + description)
             if excerpts:
@@ -2490,12 +2505,7 @@ class Coder:
             # Resolve model requests before file mentions, edit parsing or shell suggestions.
             if self.handle_response_hooks(content):
                 return
-            add_rel_files_message = self.check_for_file_mentions(content)
-            if add_rel_files_message:
-                if self.reflected_message:
-                    self.reflected_message += "\n\n" + add_rel_files_message
-                else:
-                    self.reflected_message = add_rel_files_message
+            if not self.allows_edits and self._reflect_on_file_mentions(content):
                 return
 
             try:
@@ -2517,7 +2527,10 @@ class Coder:
         auditing = self.local_caller_auditor is not None
         if auditing:
             self.shell_commands = []
-        edited = self.apply_updates()
+        shell_command_count = len(self.shell_commands)
+        edited = self._apply_updates()
+        if edited is None:
+            return
 
         if edited:
             self.aider_edited_files.update(edited)
@@ -2532,6 +2545,11 @@ class Coder:
             self.move_back_cur_messages(saved_message)
 
         if self.reflected_message:
+            return
+
+        if self.allows_edits and not edited and self._reflect_on_file_mentions(content):
+            # A new response will follow. Drop commands from the superseded reply.
+            del self.shell_commands[shell_command_count:]
             return
 
         if edited and self.auto_lint:
@@ -2576,6 +2594,15 @@ class Coder:
             and not self.dry_run
         ):
             self._finish_local_caller_audit()
+
+        # A completed edit does not need a second model call just to add context.
+        if (
+            self.allows_edits
+            and edited
+            and not self.reflected_message
+            and not self._audit_originals
+        ):
+            self.check_for_file_mentions(content)
 
     def _share_shell_output(self):
         shared_output = self.run_shell_commands()
@@ -2756,7 +2783,20 @@ class Coder:
 
         return mentioned_rel_fnames
 
+    def _reflect_on_file_mentions(self, content):
+        message = self.check_for_file_mentions(content)
+        if not message:
+            return False
+        if self.reflected_message:
+            self.reflected_message += "\n\n" + message
+        else:
+            self.reflected_message = message
+        return True
+
     def check_for_file_mentions(self, content):
+        if not self.auto_add_file_mentions:
+            return
+
         has_edit_block = "<<<<<<< SEARCH" in content or bool(
             re.search(
                 r"^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
@@ -3339,13 +3379,17 @@ class Coder:
         return res
 
     def apply_updates(self):
+        return self._apply_updates() or set()
+
+    def _apply_updates(self):
+        """Apply a response's edits, or return None when a policy blocks the response."""
         edited = set()
         shell_commands_before = list(self.shell_commands)
         try:
             edits = self.get_edits()
             edits = self.apply_edits_dry_run(edits)
             if self.edit_hooks and self.handle_edit_hooks(edits, shell_commands_before):
-                return edited
+                return None
             contract = self.local_caller_contract_hook
             if (
                 edits
@@ -3355,10 +3399,11 @@ class Coder:
                 and not contract.advisory
             ):
                 contract.blocked = True
+                self.shell_commands = shell_commands_before
                 self.io.tool_warning(
-                    "Local caller contract check: UNKNOWN (unverified edit format)"
+                    "Local caller contract check: BLOCKED (unverified edit format)"
                 )
-                return edited
+                return None
             if self.local_caller_auditor is not None:
                 paths = self._caller_audit_paths(edits)
                 for path in paths & self._unreviewed_paths.keys():
@@ -3368,10 +3413,12 @@ class Coder:
                         and self.repo.is_dirty(path)
                         and self._audit_file_text(path) != self._unreviewed_paths[path]
                     ):
+                        self.shell_commands = shell_commands_before
                         self.io.tool_warning(
-                            f"Review and commit or discard the previous unverified edit to {path} first."
+                            f"Review and commit or discard the previous unverified edit to {path}"
+                            " first."
                         )
-                        return edited
+                        return None
                     del self._unreviewed_paths[path]
             edits = self.prepare_to_edit(edits)
             edited = set(edit[0] for edit in edits)

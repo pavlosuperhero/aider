@@ -24,6 +24,7 @@ import argparse
 from collections import defaultdict
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shlex
@@ -32,7 +33,10 @@ import sys
 import tempfile
 import time
 
+from filelock import FileLock, Timeout
+
 sys.path.insert(0, str(Path(__file__).parent))
+import checkpoint  # noqa: E402
 import run  # noqa: E402
 
 ARM_ORDER = run.VALID_ARMS
@@ -534,7 +538,7 @@ def load_results(path: Path) -> list[dict]:
 
 
 def check_fixtures(cases: list[run.CaseSpec]) -> int:
-    """Verify every fixture passes smoke and fails hidden without invoking any LLM."""
+    """Verify each fixture's expected smoke outcome and a failing hidden check."""
     failures = 0
     with tempfile.TemporaryDirectory(prefix="aider-fixture-check-") as tmp:
         root = Path(tmp)
@@ -566,7 +570,11 @@ def check_fixtures(cases: list[run.CaseSpec]) -> int:
                 text=True,
                 timeout=15,
             )
-            smoke_ok = smoke_proc.returncode == 0
+            smoke_setup_err = any(marker in smoke_proc.stderr for marker in FIXTURE_SETUP_ERRORS)
+            smoke_ok = (
+                (smoke_proc.returncode == 0) == case.smoke_passes_on_base
+                and not smoke_setup_err
+            )
             setup_err = any(marker in hidden_proc.stderr for marker in FIXTURE_SETUP_ERRORS)
             hidden_fails = hidden_proc.returncode != 0 and not setup_err
             ok = smoke_ok and hidden_fails
@@ -579,7 +587,12 @@ def check_fixtures(cases: list[run.CaseSpec]) -> int:
                 failures += 1
                 if not smoke_ok:
                     smoke_msg = smoke_proc.stderr.strip() or smoke_proc.stdout.strip()
-                    print(f"  smoke failed: {smoke_msg}")
+                    if smoke_setup_err:
+                        print(f"  smoke hit setup/syntax error: {smoke_msg}")
+                    elif case.smoke_passes_on_base:
+                        print(f"  smoke failed: {smoke_msg}")
+                    else:
+                        print("  smoke unexpectedly PASSED on starting code")
                 if hidden_proc.returncode == 0:
                     print("  hidden unexpectedly PASSED on starting code")
                 elif setup_err:
@@ -705,6 +718,8 @@ def _extract_row_outcomes(row: dict) -> dict:
         "audit_passed": audit_passed,
         "commit_outcome": commit_outcome,
         "commit_passed": commit_passed,
+        "patch_hidden_passed": row.get("patch_hidden_passed"),
+        "strict_accepted": row.get("strict_accepted"),
         "hidden_outcome": hidden_outcome,
         "hidden_passed": hidden_passed,
         "smoke_passed": smoke_passed,
@@ -900,6 +915,10 @@ def build_summary(rows: list[dict]) -> dict:
         lambda: {
             "n": 0,
             "passed": 0,
+            "patch_hidden_passed": 0,
+            "patch_hidden_recorded": 0,
+            "strict_accepted": 0,
+            "strict_accept_recorded": 0,
             "hidden_passed": 0,
             "hidden_recorded": 0,
             "smoke_passed": 0,
@@ -1005,6 +1024,12 @@ def build_summary(rows: list[dict]) -> dict:
         stat = arm_stats[arm]
         stat["n"] += 1
         stat["passed"] += int(passed)
+        if outcomes["patch_hidden_passed"] is not None:
+            stat["patch_hidden_recorded"] += 1
+            stat["patch_hidden_passed"] += int(outcomes["patch_hidden_passed"])
+        if outcomes["strict_accepted"] is not None:
+            stat["strict_accept_recorded"] += 1
+            stat["strict_accepted"] += int(outcomes["strict_accepted"])
         if outcomes["hidden_passed"] is not None:
             stat["hidden_recorded"] += 1
             stat["hidden_passed"] += int(outcomes["hidden_passed"])
@@ -1153,6 +1178,10 @@ def build_summary(rows: list[dict]) -> dict:
         arm_outcomes[arm] = {
             "n": n,
             "passed": passed_n,
+            "patch_hidden_passed": int(stat["patch_hidden_passed"]),
+            "patch_hidden_recorded": int(stat["patch_hidden_recorded"]),
+            "strict_accepted": int(stat["strict_accepted"]),
+            "strict_accept_recorded": int(stat["strict_accept_recorded"]),
             "hidden_passed": int(stat["hidden_passed"]),
             "hidden_recorded": int(stat["hidden_recorded"]),
             "smoke_passed": int(stat["smoke_passed"]),
@@ -1421,6 +1450,16 @@ def summarize(rows: list[dict]) -> dict:
     for arm in arms:
         stat = summary["arm_outcomes"][arm]
         n = stat["n"]
+        patch_hidden_str = (
+            f"{stat['patch_hidden_passed']}/{stat['patch_hidden_recorded']}"
+            if stat["patch_hidden_recorded"]
+            else "n/a"
+        )
+        strict_accept_str = (
+            f"{stat['strict_accepted']}/{stat['strict_accept_recorded']}"
+            if stat["strict_accept_recorded"]
+            else "n/a"
+        )
         hidden_str = (
             f"{stat['hidden_passed']}/{stat['hidden_recorded']}"
             if stat["hidden_recorded"]
@@ -1452,6 +1491,8 @@ def summarize(rows: list[dict]) -> dict:
         )
         print(
             f"  {arm:15} pass={stat['passed']}/{n}"
+            f" patch_hidden={patch_hidden_str}"
+            f" strict_accepted={strict_accept_str}"
             f" hidden={hidden_str}"
             f" commit={commit_str}"
             f" audit={audit_str}"
@@ -1608,6 +1649,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default=str(Path(__file__).with_name("heldout_results.jsonl")))
     parser.add_argument("--summarize", action="store_true", help="only summarize --out")
     parser.add_argument(
+        "--checkpoint", action="store_true", help="save every attempt and resume the same --out"
+    )
+    parser.add_argument("--plan", action="store_true", help="print attempt count without inference")
+    parser.add_argument(
         "--check-fixtures",
         action="store_true",
         help="verify every fixture passes smoke and fails hidden without calling any LLM",
@@ -1689,6 +1734,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="local_callers_override",
         help="optional override for --local-callers / --no-local-callers",
     )
+    parser.add_argument(
+        "--auto-lint",
+        action=argparse.BooleanOptionalAction,
+        default=run.DEFAULT_AUTO_LINT,
+        help="enable/disable Aider automatic linting after edits (default: False)",
+    )
+    parser.add_argument(
+        "--thinking-tokens",
+        default=None,
+        help="optional thinking token budget passed via Aider --thinking-tokens",
+    )
     return parser
 
 
@@ -1699,6 +1755,8 @@ def resolve_suite_cases(
     """Resolve trial cases for the selected suite without running hidden commands."""
     if args.replay_manifest is not None and args.suite != "replay":
         parser.error("--replay-manifest is only valid with --suite replay")
+    if args.thinking_tokens is not None and not args.thinking_tokens.strip():
+        parser.error("--thinking-tokens must be a non-empty string when specified")
 
     if args.suite == "requests":
         if args.cases or args.languages:
@@ -1796,6 +1854,7 @@ def _build_error_row(
         "commit_passed": False,
         "only_target_modified": False,
         "commits_added": 0,
+        "committed": False,
         "smoke_outcome": "error",
         "smoke_passed": False,
         "hidden_outcome": "error",
@@ -1811,6 +1870,8 @@ def _build_error_row(
         "completion_tokens": None,
         "calls_by_role": {},
         "tokens_by_role": {},
+        "patch_hidden_passed": False,
+        "strict_accepted": False,
         "passed": False,
         "seconds": round(elapsed_seconds, 1),
         "patch": "",
@@ -1825,6 +1886,8 @@ def main(argv: list[str] | None = None):
 
     if args.replay_manifest is not None and args.suite != "replay":
         parser.error("--replay-manifest is only valid with --suite replay")
+    if args.thinking_tokens is not None and not args.thinking_tokens.strip():
+        parser.error("--thinking-tokens must be a non-empty string when specified")
 
     out = Path(args.out)
     if args.summarize:
@@ -1849,6 +1912,11 @@ def main(argv: list[str] | None = None):
         for backend, read_range, facts in control_grid
     ]
     random.Random(args.seed).shuffle(jobs)
+    if not jobs:
+        parser.error("select at least one trial attempt")
+    if args.plan:
+        print(json.dumps({"suite": args.suite, "cases": len(selected_cases), "attempts": len(jobs)}))
+        return
 
     run_meta = run.collect_run_metadata(
         model=args.model,
@@ -1859,6 +1927,9 @@ def main(argv: list[str] | None = None):
         arms=arms,
         specs=specs,
         cases=[case.name for case in selected_cases],
+        auto_lint=args.auto_lint,
+        pythonhashseed=run.DEFAULT_PYTHONHASHSEED,
+        thinking_tokens=args.thinking_tokens,
         controls={
             "backends": [b for b in dict.fromkeys(b for b, _, _ in control_grid)],
             "read_ranges": [rr for rr in dict.fromkeys(rr for _, rr, _ in control_grid)],
@@ -1867,9 +1938,41 @@ def main(argv: list[str] | None = None):
             "facts_file": args.facts_file,
             "local_callers": args.local_callers_override,
             "preset": args.preset,
+            "auto_lint": args.auto_lint,
+            "pythonhashseed": run.DEFAULT_PYTHONHASHSEED,
+            "thinking_tokens": args.thinking_tokens,
         },
     )
-    run.write_run_metadata(out.with_suffix(".meta.json"), run_meta)
+    if args.checkpoint:
+        out = out.resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if args.suite == "replay":
+            import replay_corpus
+
+            manifest_path = args.replay_manifest or os.environ[replay_corpus.MANIFEST_ENV_VAR]
+            manifest, _ = replay_corpus.load_manifest(manifest_path)
+            run_meta["replay_manifest_sha256"] = manifest.preregistration.manifest_sha256
+        signature = checkpoint.fingerprint(run_meta, selected_cases, run.ROOT)
+        try:
+            with FileLock(str(out.with_suffix(".lock")), timeout=0):
+                saved, rows = checkpoint.open_run(out, run_meta, signature, len(jobs))
+                print(f"Checkpoint {len(rows)}/{len(jobs)} attempts complete", flush=True)
+                if len(rows) < len(jobs):
+                    _run_jobs(args, jobs, out, saved, rows)
+                else:
+                    summarize(rows)
+        except (Timeout, OSError, ValueError, KeyError) as exc:
+            parser.error(f"cannot open checkpoint {out}: {exc}")
+        return
+
+    sidecar = out.with_suffix(".meta.json")
+    if sidecar.exists() and "checkpoint_signature" in sidecar.read_text(encoding="utf-8"):
+        parser.error("this output uses checkpoints; rerun with --checkpoint")
+    run.write_run_metadata(sidecar, run_meta)
+    _run_jobs(args, jobs, out, run_meta, [])
+
+
+def _run_jobs(args, jobs, out, run_meta, rows):
     row_meta = {
         "schema_version": run_meta["schema_version"],
         "run_id": run_meta["run_id"],
@@ -1881,10 +1984,16 @@ def main(argv: list[str] | None = None):
         "seed": run_meta["seed"],
     }
 
-    workdir = Path(tempfile.mkdtemp(prefix="aider-heldout-"))
+    artifacts = None
+    if args.checkpoint:
+        artifacts = out.parent / f"{out.stem}-artifacts"
+        artifacts.mkdir(exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="aider-heldout-", dir=artifacts))
     print(workdir, flush=True)
-    rows = []
-    for r, case_spec, spec, arm, backend, read_range, facts in jobs:
+    completed = len(rows)
+    for job_index, (r, case_spec, spec, arm, backend, read_range, facts) in enumerate(
+        jobs[completed:], start=completed
+    ):
         job_start = time.monotonic()
         try:
             result = run.run_spec(
@@ -1902,6 +2011,8 @@ def main(argv: list[str] | None = None):
                 facts_file=args.facts_file,
                 local_callers=args.local_callers_override,
                 metadata=row_meta,
+                auto_lint=args.auto_lint,
+                thinking_tokens=args.thinking_tokens,
             )
         except Exception as exc:
             result = _build_error_row(
@@ -1922,10 +2033,15 @@ def main(argv: list[str] | None = None):
                 workdir=workdir,
                 metadata=row_meta,
             )
+        if args.checkpoint:
+            result["checkpoint_job"] = job_index
+            checkpoint.append(out, result)
+            print(f"Checkpoint {job_index + 1}/{len(jobs)} attempts complete", flush=True)
+        else:
+            with out.open("a") as stream:
+                stream.write(json.dumps(result) + "\n")
         rows.append(result)
         print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)
-        with out.open("a") as stream:
-            stream.write(json.dumps(result) + "\n")
     summarize(rows)
 
 

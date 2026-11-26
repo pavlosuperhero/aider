@@ -6,6 +6,30 @@ from importlib.metadata import distribution
 import run
 
 
+def _json_check(document: str, position: int) -> str:
+    return f"""
+import pickle
+from requests import Response
+from requests.exceptions import JSONDecodeError
+
+document = {document!r}
+position = {position}
+for encoding in (None, "utf-8"):
+    r = Response()
+    r.encoding = encoding
+    r._content = document.encode("utf-8")
+    try:
+        r.json()
+    except JSONDecodeError as exc:
+        assert exc.msg and (exc.doc, exc.pos) == (document, position)
+        restored = pickle.loads(pickle.dumps(exc))
+        assert type(restored) is type(exc)
+        assert (restored.msg, restored.doc, restored.pos) == (exc.msg, document, position)
+    else:
+        raise AssertionError("Invalid JSON accepted")
+"""
+
+
 def cases():
     package = distribution("requests")
     if package.version != "2.34.2":
@@ -25,27 +49,17 @@ assert p.headers["x-name"] == "old"
 assert q.headers["X-Name"] == "new"
 assert p._cookies.get("a") == "1"
 """
-    json_check = """
-import pickle
-from requests import Response
-from requests.exceptions import JSONDecodeError
-for encoding in (None, "utf-8"):
-    r = Response()
-    r.encoding = encoding
-    r._content = b'{"x":}'
-    try:
-        r.json()
-    except JSONDecodeError as exc:
-        restored = pickle.loads(pickle.dumps(exc))
-        assert (restored.msg, restored.doc, restored.pos) == (exc.msg, '{"x":}', 5)
-    else:
-        raise AssertionError("Invalid JSON accepted")
-"""
+    copy_smoke = (
+        "from requests import Request\n"
+        "assert Request('GET', 'http://example.invalid').prepare().method == 'GET'\n"
+    )
     definitions = [
         (
             "requests_copy",
             "Fix copy so modifying headers or cookies on a copied prepared request preserves the original.",
             "A copied request must have independent case-insensitive headers and a separate cookie jar.",
+            copy_smoke,
+            True,
             copy_check,
             [
                 (
@@ -60,7 +74,9 @@ for encoding in (None, "utf-8"):
             "requests_json",
             "Fix json and __reduce__ so malformed responses preserve Requests' public exception contract.",
             "The public JSONDecodeError must preserve its message, document, and position through pickling.",
-            json_check,
+            _json_check('{"value":}', 9),
+            False,
+            _json_check('{"x":}', 5),
             [
                 (
                     "requests/models.py",
@@ -76,17 +92,16 @@ for encoding in (None, "utf-8"):
         ),
     ]
     result = []
-    for name, task, explicit, hidden, mutations in definitions:
+    for name, task, explicit, smoke, smoke_passes_on_base, hidden, mutations in definitions:
         seeded = files.copy()
-        seeded["smoke.py"] = (
-            "from requests import Request\n"
-            "assert Request('GET', 'http://example.invalid').prepare().method == 'GET'\n"
-        )
+        seeded["smoke.py"] = smoke
         for path, before, after in mutations:
             if before not in seeded[path]:
                 raise ValueError(f"Fixture source mismatch: {path}")
             seeded[path] = seeded[path].replace(before, after)
         first, second = (path for path, _, _ in mutations)
         case = run.py_case(name, seeded, task, hidden, explicit, editable_file=first)
-        result.append(replace(case, additional_editable=(second,)))
+        result.append(
+            replace(case, additional_editable=(second,), smoke_passes_on_base=smoke_passes_on_base)
+        )
     return result

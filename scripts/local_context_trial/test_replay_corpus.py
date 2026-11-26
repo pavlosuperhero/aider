@@ -612,10 +612,28 @@ class ReplayCorpusTests(unittest.TestCase):
                 real_spec = real_built[0]
                 self.assertIsInstance(real_spec, real_run.CaseSpec)
                 self.assertEqual(real_spec.additional_editable, ("pkg/store.py",))
+                self.assertEqual((real_spec.language, real_spec.kind), ("python", "caller"))
                 # Ensure no dict field on real_spec exposes the external hidden file
                 for value in dataclasses.asdict(real_spec).values():
                     if isinstance(value, dict):
                         self.assertNotIn("test_bag_hidden.py", value)
+
+    def test_replay_cases_keep_preregistered_language_and_category(self) -> None:
+        import run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = _create_sample_checkout(root)
+            manifest = _make_manifest_dict(fixture)
+            manifest["cases"][0]["preregistration"]["preregistered_notes"] = (
+                "Verified offline; language = javascript; category=control; repo=test/project"
+            )
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            [case] = replay_corpus.cases(manifest_path, run_module=run)
+
+            self.assertEqual((case.language, case.kind), ("javascript", "control"))
 
     def test_cli_schema_digest_list_and_validate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

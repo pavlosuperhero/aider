@@ -952,6 +952,12 @@ def get_parser(default_config_files, git_root):
         default=None,
     )
     group.add_argument(
+        "--auto-add-file-mentions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Offer to add files mentioned in chat (default: True)",
+    )
+    group.add_argument(
         "-v",
         "--verbose",
         action="store_true",

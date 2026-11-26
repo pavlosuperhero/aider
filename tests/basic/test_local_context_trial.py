@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -315,6 +316,9 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(ok_res["hidden_passed"], True)
         self.assertIs(ok_res["smoke_passed"], True)
         self.assertIs(ok_res["passed"], True)
+        self.assertIs(ok_res["patch_hidden_passed"], True)
+        self.assertIs(ok_res["strict_accepted"], True)
+        self.assertIs(ok_res["committed"], False)
         self.assertIs(ok_res["false_approval"], False)
         self.assertEqual(ok_res["tokens"], 1250)
         self.assertIs(ok_res["tokens_measured"], True)
@@ -357,6 +361,8 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(bad_hidden["hidden_passed"], False)
         self.assertIs(bad_hidden["passed"], False)
         self.assertIs(bad_hidden["false_approval"], True)
+        self.assertIs(bad_hidden["patch_hidden_passed"], False)
+        self.assertIs(bad_hidden["strict_accepted"], False)
 
         # 3. Audit FAIL, no repo edit -> commit_outcome=no_change
         no_edit, _ = self._run_spec_with_fake_aider(
@@ -399,6 +405,37 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(oos_res["commit_passed"], False)
         self.assertIs(oos_res["hidden_passed"], True)
         self.assertIs(oos_res["passed"], False)
+        self.assertIs(oos_res["patch_hidden_passed"], False)
+
+        blocked_res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="contract+audit",
+            log_content=(
+                "Local caller contract check: NO_EVIDENCE (pass-through)\n"
+                "Local caller audit: UNKNOWN\n"
+                "Trial usage: editor 850\n"
+            ),
+            edit_fn=fix_duration,
+        )
+        self.assertIs(blocked_res["contract_rejected"], False)
+        self.assertIs(blocked_res["patch_hidden_passed"], True)
+        self.assertIs(blocked_res["strict_accepted"], False)
+        self.assertIs(blocked_res["committed"], False)
+
+        rejected_res, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="contract",
+            log_content=(
+                "Local caller contract check: BLOCKED (enforcement exhausted)\n"
+                "Trial usage: editor 850\n"
+            ),
+        )
+        self.assertIs(rejected_res["contract_rejected"], True)
+
+        telemetry = heldout.build_summary([ok_res, blocked_res])["arm_outcomes"]
+        self.assertEqual(telemetry["audit"]["strict_accepted"], 1)
+        self.assertEqual(telemetry["contract+audit"]["strict_accepted"], 0)
+        self.assertEqual(telemetry["contract+audit"]["patch_hidden_passed"], 1)
 
     def test_p2_4_applied_vs_committed_outcomes(self):
         case_spec = heldout.CASE_BY_NAME["duration"]
@@ -464,8 +501,46 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertEqual(committed_res["commit_outcome"], "committed")
         self.assertEqual(committed_res["commits_added"], 1)
         self.assertIs(committed_res["commit_passed"], True)
+        self.assertIs(committed_res["committed"], True)
         self.assertIs(committed_res["only_target_modified"], True)
         self.assertIs(committed_res["passed"], True)
+
+        def commit_unrelated_and_apply_target(repo: Path):
+            (repo / "consumer.py").write_text(
+                (repo / "consumer.py").read_text() + "\n# unrelated edit\n"
+            )
+            subprocess.run(
+                ["git", "add", "consumer.py"], cwd=repo, check=True, capture_output=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Trial",
+                    "-c",
+                    "user.email=trial@localhost",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "unrelated change",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            apply_only(repo)
+
+        mixed, _ = self._run_spec_with_fake_aider(
+            case_spec=case_spec,
+            arm="audit",
+            log_content="Local caller audit: PASS\nTrial usage: editor 500\n",
+            edit_fn=commit_unrelated_and_apply_target,
+        )
+        self.assertIs(mixed["committed"], True)
+        self.assertIs(mixed["only_target_modified"], False)
+        self.assertIs(mixed["strict_accepted"], False)
+        self.assertIs(mixed["false_approval"], True)
 
         # heldout._extract_row_outcomes derives commit_passed from commits_added / commit_outcome
         self.assertIs(
@@ -642,6 +717,49 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
             self.assertIs(ok_row["passed"], True)
             self.assertIsNone(ok_row["trial_error"])
 
+    def test_heldout_checkpoint_recovers_partial_tail_and_keeps_completed_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "results.jsonl"
+            args = [
+                "--checkpoint", "--out", str(out), "--cases", "duration", "--arms", "baseline",
+                "--specs", "vague", "--rounds", "3",
+            ]
+
+            def fake_attempt(**kwargs):
+                return {"round": kwargs["round_id"], "metadata": kwargs["metadata"]}
+
+            def interrupted_attempt(**kwargs):
+                if out.exists():
+                    with out.open("ab") as stream:
+                        stream.write(b'{"checkpoint_job":')
+                    raise KeyboardInterrupt
+                return fake_attempt(**kwargs)
+
+            with mock.patch.object(heldout.run, "run_spec", side_effect=interrupted_attempt):
+                with self.assertRaises(KeyboardInterrupt):
+                    heldout.main(args)
+            saved = out.read_bytes().splitlines()[0]
+            run_id = json.loads(saved)["metadata"]["run_id"]
+
+            with (
+                mock.patch.object(heldout.run, "run_spec", side_effect=fake_attempt) as attempts,
+                mock.patch.object(heldout, "summarize"),
+            ):
+                with self.assertRaises(SystemExit):
+                    heldout.main([*args, "--seed", "42"])
+                attempts.assert_not_called()
+
+                heldout.main(args)
+                self.assertEqual(attempts.call_count, 2)
+                heldout.main(args)
+                self.assertEqual(attempts.call_count, 2)
+
+            self.assertEqual(out.read_bytes().splitlines()[0], saved)
+            rows = heldout.load_results(out)
+            self.assertEqual([row["checkpoint_job"] for row in rows], [0, 1, 2])
+            self.assertEqual({row["round"] for row in rows}, {0, 1, 2})
+            self.assertEqual({row["metadata"]["run_id"] for row in rows}, {run_id})
+
     def test_run_spec_complete_within_scope_and_project_facts_fields(self):
         import issue5_cases
 
@@ -696,6 +814,107 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIn("--facts-file", jsonl_cmd)
         self.assertEqual(jsonl_res["facts_backend"], "jsonl")
         self.assertEqual(jsonl_res["facts_file"], ".aider.custom.jsonl")
+
+    def test_p0_2_and_p0_3_run_spec_disables_auto_lint_and_pins_pythonhashseed(self):
+        case_spec = heldout.CASE_BY_NAME["duration"]
+        captured_cmd: list[str] = []
+        captured_env: dict[str, str] = {}
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and any(
+                "runpy.run_module('aider'" in str(part) for part in cmd
+            ):
+                captured_cmd.extend(cmd)
+                captured_env.update(kwargs.get("env") or {})
+                stdout = kwargs.get("stdout")
+                if stdout is not None:
+                    stdout.write("required foundations loaded\nTrial usage: editor 500\n")
+                return subprocess.CompletedProcess(cmd, 0)
+            return real_run(cmd, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="aider-p0-harness-") as tmp:
+            output = Path(tmp)
+            with mock.patch.dict(os.environ, {"PYTHONHASHSEED": "random"}):
+                with mock.patch.object(run.subprocess, "run", side_effect=fake_run):
+                    run.run_spec(
+                        output=output,
+                        case_spec=case_spec,
+                        arm="baseline",
+                        round_id=0,
+                        map_tokens=512,
+                        spec="vague",
+                        metadata={"schema_version": 2, "run_id": "p0check"},
+                    )
+
+        self.assertIn("--no-auto-lint", captured_cmd)
+        self.assertIn("--no-auto-add-file-mentions", captured_cmd)
+        self.assertIn("--no-auto-commits", captured_cmd)
+        self.assertNotIn("--auto-lint", captured_cmd)
+        self.assertNotIn("--thinking-tokens", captured_cmd)
+        self.assertEqual(captured_env.get("PYTHONHASHSEED"), "0")
+        self.assertEqual(captured_env.get("AIDER_ANALYTICS"), "false")
+        self.assertEqual(captured_env.get("AIDER_TRIAL_USAGE"), "1")
+
+        # Opt-in --auto-lint and --thinking-tokens are forwarded cleanly
+        optin_cmd: list[str] = []
+        optin_env: dict[str, str] = {}
+
+        def fake_run_optin(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and any(
+                "runpy.run_module('aider'" in str(part) for part in cmd
+            ):
+                optin_cmd.extend(cmd)
+                optin_env.update(kwargs.get("env") or {})
+                stdout = kwargs.get("stdout")
+                if stdout is not None:
+                    stdout.write("required foundations loaded\nTrial usage: editor 500\n")
+                return subprocess.CompletedProcess(cmd, 0)
+            return real_run(cmd, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="aider-p0-optin-") as tmp:
+            output = Path(tmp)
+            with mock.patch.object(run.subprocess, "run", side_effect=fake_run_optin):
+                run.run_spec(
+                    output=output,
+                    case_spec=case_spec,
+                    arm="passive",
+                    round_id=0,
+                    map_tokens=512,
+                    spec="vague",
+                    auto_lint=True,
+                    thinking_tokens="4096",
+                    metadata={"schema_version": 2, "run_id": "p0optin"},
+                )
+
+        self.assertIn("--auto-lint", optin_cmd)
+        self.assertNotIn("--no-auto-lint", optin_cmd)
+        idx = optin_cmd.index("--thinking-tokens")
+        self.assertEqual(optin_cmd[idx + 1], "4096")
+        self.assertEqual(optin_env.get("PYTHONHASHSEED"), "0")
+
+        # Precondition checks fail fast on blank values
+        with self.assertRaises(ValueError):
+            run._resolve_harness_flags(thinking_tokens="   ")
+        with self.assertRaises(ValueError):
+            run._build_trial_env(pythonhashseed="  ")
+
+        # Metadata records deterministic harness defaults and heldout CLI exposes opt-in controls
+        meta = run.collect_run_metadata(suite="synthetic", seed=1, rounds=1)
+        self.assertIs(meta["auto_lint"], False)
+        self.assertIs(meta["auto_add_file_mentions"], False)
+        self.assertIs(meta["auto_commits"], False)
+        self.assertEqual(meta["pythonhashseed"], "0")
+        self.assertIsNone(meta["thinking_tokens"])
+
+        parser = heldout.build_arg_parser()
+        default_ns = parser.parse_args([])
+        self.assertIs(default_ns.auto_lint, False)
+        self.assertIsNone(default_ns.thinking_tokens)
+
+        optin_ns = parser.parse_args(["--auto-lint", "--thinking-tokens", "8192"])
+        self.assertIs(optin_ns.auto_lint, True)
+        self.assertEqual(optin_ns.thinking_tokens, "8192")
 
 
 class TestReportingAndPairedIntervals(unittest.TestCase):
@@ -935,6 +1154,21 @@ class TestReportingAndPairedIntervals(unittest.TestCase):
             rc = heldout.check_fixtures([heldout.CASE_BY_NAME["duration"]])
         self.assertEqual(rc, 0)
         self.assertIn("1/1 passed", buf.getvalue())
+
+    def test_check_fixtures_can_expect_a_failing_smoke_but_rejects_setup_error(self):
+        case = heldout.CASE_BY_NAME["duration"]
+        for smoke, expected_status in (
+            ("raise AssertionError('fixture still broken')\n", 0),
+            ("import missing_trial_fixture_module\n", 1),
+            ("pass\n", 1),
+        ):
+            with self.subTest(smoke=smoke), contextlib.redirect_stdout(io.StringIO()):
+                modified = replace(
+                    case,
+                    files={**case.files, "smoke.py": smoke},
+                    smoke_passes_on_base=False,
+                )
+                self.assertEqual(heldout.check_fixtures([modified]), expected_status)
 
 
 class TestReplaySuiteCliWiring(unittest.TestCase):

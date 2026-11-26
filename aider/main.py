@@ -1297,6 +1297,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             repo=repo,
             fnames=fnames,
             read_only_fnames=read_only_fnames,
+            auto_add_file_mentions=args.auto_add_file_mentions,
             local_callers=args.local_callers,
             local_callers_hint=args.local_callers_hint,
             local_callers_mode=args.local_callers_mode,

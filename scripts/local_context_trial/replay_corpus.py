@@ -2057,6 +2057,16 @@ def to_case_spec(
     if dataclasses.is_dataclass(case):
         instance_fields = {f.name: f for f in dataclasses.fields(case)}
         updates: dict[str, Any] = {}
+        # The Python wrapper runs checks for every language. The trial strata come
+        # from the frozen notes when the manifest records them.
+        notes: dict[str, str] = {}
+        for note in entry.preregistration.preregistered_notes.split(";"):
+            key, separator, value = note.partition("=")
+            if separator:
+                notes[key.strip()] = value.strip()
+        for field, key in (("language", "language"), ("kind", "category")):
+            if field in instance_fields and notes.get(key):
+                updates[field] = notes[key]
         if "additional_editable" in instance_fields:
             updates["additional_editable"] = tuple(rest_editable)
         if (

@@ -19,7 +19,6 @@ from aider.caller_audit import (
 )
 from aider.coders import Coder
 from aider.commands import SwitchCoder
-from aider.hooks import ResponseHookResult
 from aider.io import InputOutput
 from aider.local_callers import CallerExcerpt
 from aider.main import (
@@ -29,7 +28,6 @@ from aider.main import (
     create_read_range_reader,
 )
 from aider.models import Model
-
 
 EDIT_BLOCK = (
     "pricing.py\n"
@@ -415,19 +413,29 @@ def test_auto_backend_falls_back_with_diagnostics_and_cymbal_mode_errors_explici
     cymbal_coder = make_coder(
         local_callers=True,
         local_callers_backend="cymbal",
+        local_callers_mode="contract",
         local_callers_audit=True,
         local_callers_policy="strict",
         local_caller_finder=cymbal_finder,
     )
     errors = []
     cymbal_coder.io.tool_error = lambda *a, **kw: errors.append(" ".join(str(x) for x in a))
+    cymbal_coder.io.tool_output = Mock()
     audit_backend = Mock(return_value="VERDICT: PASS")
     monkeypatch.setattr(cymbal_coder.local_caller_auditor, "_complete_fn", audit_backend)
-    fake_send(cymbal_coder, [EDIT_BLOCK.replace("f'${", "f'EUR {")])
+    followup_edit = EDIT_BLOCK.replace("return f'${", "return f'EUR {").replace(
+        "return f'{", "return f'${"
+    )
+    fake_send(cymbal_coder, [followup_edit])
     head_before = repo.head.commit
     cymbal_coder.run("update format_price")
+    outputs = [call.args[0] for call in cymbal_coder.io.tool_output.call_args_list if call.args]
     assert any("cymbal" in err.lower() for err in errors)
+    assert any(line.startswith("Local caller evidence: SEARCH_ERROR") for line in outputs)
+    assert "Local caller contract check: SEARCH_ERROR (pass-through)" in outputs
+    assert "Local caller audit: ERROR - SEARCH_ERROR" in outputs
     assert repo.head.commit == head_before
+    assert repo.is_dirty()
     audit_backend.assert_not_called()
 
 
@@ -950,8 +958,9 @@ def test_facts_never_make_missing_caller_evidence_pass_and_strict_precommit_pres
     audit_backend = Mock(return_value="VERDICT: PASS")
     monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", audit_backend)
 
-    # Even with facts and read-range attached, contract mode MUST reject on NO_EVIDENCE
-    # and strict mode must not write or commit edits.
+    # Even with facts and read-range attached, contract mode passes through on NO_EVIDENCE
+    # (so valid edits are not discarded), while strict IsolatedCallerAuditor MUST still
+    # report UNKNOWN - NO_EVIDENCE and leave edits uncommitted without calling the backend.
     repo = git.Repo(project)
     head = repo.head.commit
     fake_send(
@@ -965,9 +974,13 @@ def test_facts_never_make_missing_caller_evidence_pass_and_strict_precommit_pres
     coder.run("update format_price")
 
     assert repo.head.commit == head
-    assert not repo.is_dirty()
+    assert repo.is_dirty()
+    assert coder.local_caller_contract_hook.blocked is False
     assert len(coder.local_caller_contract_hook.supplementary_evidence) >= 1
     audit_backend.assert_not_called()
+
+    # Reset working tree before testing passive + strict audit mode.
+    repo.git.checkout("--", "pricing.py")
 
     # In passive + strict audit mode, facts + read-ranges still MUST NOT allow missing
     # caller evidence to PASS or auto-commit.
@@ -1018,7 +1031,10 @@ def test_facts_never_override_incomplete_caller_evidence(project):
 
     hook = CallerContractHook(enabled=True)
     hook.begin_turn((), facts=[fact])
-    assert hook(EDIT_BLOCK) == ResponseHookResult()
+    assert hook(EDIT_BLOCK) is None
+    assert hook.blocked is False
+    assert hook.format_present is False
+    assert hook.has_evidence is False
 
 
 # --- Regression tests: /arch handoff, /ask contract mode, /drop ranges, /read alias ---
@@ -1288,28 +1304,29 @@ def test_architect_strict_contract_no_callers_distinguishes_no_op_from_blocked(
     )
     assert not any(m["content"] == blocked_msg for m in noop_arch.done_messages)
 
-    # Edit proposal with NO caller excerpts in strict contract mode: blocked.
-    blocked_coders = []
+    # Edit proposal with NO caller excerpts in strict contract mode: passes through (NO_EVIDENCE).
+    passthrough_coders = []
     _script_coder_sends(
         monkeypatch,
         ["Update helper in standalone.py to return 2.", standalone_edit],
-        coders=blocked_coders,
+        coders=passthrough_coders,
     )
-    with pytest.raises(SwitchCoder) as blocked_exc:
+    with pytest.raises(SwitchCoder) as passthrough_exc:
         make_standalone_coder().commands.run("/arch update helper in standalone.py")
 
-    blocked_arch = blocked_exc.value.kwargs["from_coder"]
-    blocked_editor = next(c for c in blocked_coders if c.edit_format == "editor-diff")
-    assert blocked_editor._local_caller_excerpts == ()
-    assert blocked_editor.local_caller_contract_hook.blocked is True
-    assert standalone.read_text(encoding="utf-8") == orig_text
-    assert repo.head.commit == head
+    passthrough_arch = passthrough_exc.value.kwargs["from_coder"]
+    passthrough_editor = next(c for c in passthrough_coders if c.edit_format == "editor-diff")
+    assert passthrough_editor._local_caller_excerpts == ()
+    assert passthrough_editor.local_caller_contract_hook.blocked is False
+    assert "return 2" in standalone.read_text(encoding="utf-8")
+    assert repo.head.commit != head
     assert not repo.is_dirty()
-    assert blocked_arch.aider_edited_files == set()
-    assert any(m["content"] == blocked_msg for m in blocked_arch.done_messages)
-    assert not any(
-        m["content"] == "No changes were made to the files." for m in blocked_arch.done_messages
+    assert passthrough_arch.aider_edited_files == {"standalone.py"}
+    assert any(
+        m["content"] == "I made those changes to the files."
+        for m in passthrough_arch.done_messages
     )
+    assert not any(m["content"] == blocked_msg for m in passthrough_arch.done_messages)
 
 
 def test_ask_mode_contract_retains_context_and_allows_fenced_code(project):

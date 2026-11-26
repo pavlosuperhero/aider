@@ -18,8 +18,11 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "lm_studio/qwen/qwen3.6-35b-a3b"
 SCHEMA_VERSION = 2
+DEFAULT_AUTO_LINT = False
+DEFAULT_PYTHONHASHSEED = "0"
 
 _TRIAL_USAGE_RE = re.compile(r"^Trial usage:\s+(\S+)\s+(.+?)\s*$", re.M)
+_CONTRACT_BLOCKED_RE = re.compile(r"^Local caller contract check: BLOCKED\b", re.M)
 _USAGE_KV_RE = re.compile(
     r"\b(prompt|input|sent|completion|output|received|total|cached)=(\d+|None)\b"
 )
@@ -128,6 +131,7 @@ class CaseSpec:
     kind: str = "caller"
     additional_editable: tuple[str, ...] = ()
     seed_facts: tuple[dict[str, object], ...] = ()
+    smoke_passes_on_base: bool = True
 
 
 def py_case(
@@ -241,6 +245,35 @@ def resolve_arm_flags(
         flags.extend(["--facts-file", cleaned])
 
     return flags
+
+
+def _resolve_harness_flags(
+    *,
+    auto_lint: bool = DEFAULT_AUTO_LINT,
+    thinking_tokens: str | None = None,
+) -> list[str]:
+    """Return validated Aider CLI flags controlling harness lint and thinking budget."""
+    flags = ["--auto-lint" if auto_lint else "--no-auto-lint"]
+    if thinking_tokens is not None:
+        cleaned = thinking_tokens.strip()
+        if not cleaned:
+            raise ValueError("thinking_tokens must be a non-empty string when specified")
+        flags.extend(["--thinking-tokens", cleaned])
+    return flags
+
+
+def _build_trial_env(pythonhashseed: str = DEFAULT_PYTHONHASHSEED) -> dict[str, str]:
+    """Build deterministic child environment for an Aider trial subprocess."""
+    seed_value = pythonhashseed.strip()
+    if not seed_value:
+        raise ValueError("pythonhashseed must be a non-empty string")
+    return dict(
+        os.environ,
+        PYTHONPATH=str(ROOT),
+        AIDER_ANALYTICS="false",
+        AIDER_TRIAL_USAGE="1",
+        PYTHONHASHSEED=seed_value,
+    )
 
 
 def _slugify_control(value: str, fallback: str) -> str:
@@ -444,6 +477,9 @@ def collect_run_metadata(
     specs: list[str] | tuple[str, ...] | None = None,
     cases: list[str] | tuple[str, ...] | None = None,
     controls: dict | None = None,
+    auto_lint: bool = DEFAULT_AUTO_LINT,
+    pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
+    thinking_tokens: str | None = None,
     repo_root: Path = ROOT,
     run_id: str | None = None,
 ) -> dict:
@@ -465,6 +501,11 @@ def collect_run_metadata(
         "arms": list(arms) if arms is not None else None,
         "specs": list(specs) if specs is not None else None,
         "cases": list(cases) if cases is not None else None,
+        "auto_lint": auto_lint,
+        "auto_add_file_mentions": False,
+        "auto_commits": False,
+        "pythonhashseed": pythonhashseed,
+        "thinking_tokens": thinking_tokens,
         "controls": controls,
     }
 
@@ -666,6 +707,9 @@ def run_spec(
     facts_file: str | None = None,
     local_callers: bool | None = None,
     metadata: dict | None = None,
+    auto_lint: bool = DEFAULT_AUTO_LINT,
+    thinking_tokens: str | None = None,
+    pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
 ) -> dict:
     """Run a single Aider trial for case_spec under the requested arm and controls."""
     if spec not in ("vague", "explicit"):
@@ -679,6 +723,11 @@ def run_spec(
         facts_file=facts_file,
         local_callers=local_callers,
     )
+    harness_flags = _resolve_harness_flags(
+        auto_lint=auto_lint,
+        thinking_tokens=thinking_tokens,
+    )
+    env = _build_trial_env(pythonhashseed=pythonhashseed)
     local_callers_enabled = "--local-callers" in arm_flags
     facts_backend = "sqlite" if facts and facts_db else ("jsonl" if facts else "off")
     task = case_spec.task
@@ -737,7 +786,6 @@ def run_spec(
             )
     base_rev = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
 
-    env = dict(os.environ, PYTHONPATH=str(ROOT), AIDER_ANALYTICS="false", AIDER_TRIAL_USAGE="1")
     targets = (case_spec.editable_file, *case_spec.additional_editable)
     # A real fixture can contain a dependency of Aider itself (e.g. requests).
     # Keep the fixture on the smoke/hidden check import path only.
@@ -759,8 +807,12 @@ def run_spec(
         "--no-check-update",
         "--no-show-model-warnings",
         "--no-auto-commits",
+        "--no-auto-add-file-mentions",
+        "--local-callers-policy",
+        "strict",
         "--no-suggest-shell-commands",
         "--no-stream",
+        *harness_flags,
         "--map-tokens",
         str(map_tokens),
         "--auto-test",
@@ -795,7 +847,7 @@ def run_spec(
         )
     )
     oracle = "required foundations loaded" in log_text
-    contract_rejected = "Local caller contract check:" in log_text
+    contract_rejected = bool(_CONTRACT_BLOCKED_RE.search(log_text))
     verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
     usage_info = parse_trial_usage(log_text)
     missing_completion = code != 124 and usage_info["editor_calls"] == 0
@@ -812,26 +864,30 @@ def run_spec(
     )
     gitdiff = subprocess.check_output(["git", "diff", base_rev], cwd=repo, text=True)
     (folder / "patch.diff").write_text(gitdiff)
-    changed = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo, text=True
-    )
     (folder / "verification.txt").write_bytes(diagnostic)
-    changed_lines = [line for line in changed.splitlines() if line]
-    if commits_added > 0 and not changed_lines:
-        committed_files = set(
-            subprocess.check_output(
-                ["git", "diff", "--name-only", f"{base_rev}..HEAD"], cwd=repo, text=True
-            ).splitlines()
-        )
-        only_target_modified = committed_files == set(targets)
-    else:
-        only_target_modified = set(changed_lines) == {f" M {target}" for target in targets}
+    changed = subprocess.check_output(
+        ["git", "status", "--porcelain", "--no-renames", "-z", "--untracked-files=all"],
+        cwd=repo,
+        text=True,
+    )
+    changed_lines = changed.split("\0")[:-1]
+    changed_paths = subprocess.check_output(
+        ["git", "diff", "--name-only", "--no-renames", "-z", base_rev], cwd=repo, text=True
+    )
+    only_target_modified = set(changed_paths.split("\0")[:-1]) == set(targets) and not any(
+        line.startswith("?? ") for line in changed_lines
+    )
     commit_outcome, commit_passed = classify_commit_outcome(
         code, changed_lines, gitdiff, only_target_modified, commits_added
     )
 
     if missing_completion:
         commit_outcome, commit_passed = "error", False
+
+    patch_hidden_passed = only_target_modified and verification["hidden_passed"]
+    passed = code == 0 and not missing_completion and patch_hidden_passed and verified
+    audit_required = local_callers_enabled and "--local-callers-audit" in arm_flags
+    strict_accepted = passed and (not audit_required or audit_passed is True)
 
     if metadata is not None:
         row_metadata = dict(metadata)
@@ -879,11 +935,12 @@ def run_spec(
         audit_failed="FAIL" in verdicts,
         unknowns=verdicts.count("UNKNOWN"),
         errors=verdicts.count("ERROR"),
-        false_approval=bool(audit_outcome == "pass" and not verified),
+        false_approval=audit_passed is True and not (patch_hidden_passed and verified),
         commit_outcome=commit_outcome,
         commit_passed=commit_passed,
         only_target_modified=only_target_modified,
         commits_added=commits_added,
+        committed=commits_added > 0,
         smoke_outcome=verification["smoke_outcome"],
         smoke_passed=verification["smoke_passed"],
         hidden_outcome=verification["hidden_outcome"],
@@ -899,7 +956,9 @@ def run_spec(
         completion_tokens=usage_info["completion_tokens"],
         calls_by_role=usage_info["calls_by_role"],
         tokens_by_role=usage_info["tokens_by_role"],
-        passed=not missing_completion and verified and only_target_modified,
+        patch_hidden_passed=patch_hidden_passed,
+        strict_accepted=strict_accepted,
+        passed=passed,
         seconds=round(time.monotonic() - start, 1),
         patch=gitdiff,
         workdir=str(output),
@@ -922,6 +981,9 @@ def run_case(
     facts_file: str | None = None,
     local_callers: bool | None = None,
     metadata: dict | None = None,
+    auto_lint: bool = DEFAULT_AUTO_LINT,
+    thinking_tokens: str | None = None,
+    pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
 ):
     """Backwards-compatible wrapper for legacy tuple cases."""
     name, api, consumer, task, smoke, hidden = case
@@ -958,6 +1020,9 @@ def run_case(
         facts_file=facts_file,
         local_callers=local_callers,
         metadata=metadata,
+        auto_lint=auto_lint,
+        thinking_tokens=thinking_tokens,
+        pythonhashseed=pythonhashseed,
     )
     result["explicit_behavior"] = specify_behavior
     return result
@@ -1004,7 +1069,20 @@ def main():
         dest="local_callers_override",
         help="optional override for --local-callers / --no-local-callers",
     )
+    parser.add_argument(
+        "--auto-lint",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_AUTO_LINT,
+        help="enable/disable Aider automatic linting after edits (default: False)",
+    )
+    parser.add_argument(
+        "--thinking-tokens",
+        default=None,
+        help="optional thinking token budget passed via Aider --thinking-tokens",
+    )
     args = parser.parse_args()
+    if args.thinking_tokens is not None and not args.thinking_tokens.strip():
+        parser.error("--thinking-tokens must be a non-empty string when specified")
     output = Path(tempfile.mkdtemp(prefix="aider-local-trial-"))
     print(output, flush=True)
     run_meta = collect_run_metadata(
@@ -1015,6 +1093,9 @@ def main():
         arms=["baseline", "context"],
         specs=["explicit" if args.specify_behavior else "vague"],
         cases=[case[0] for case in CASES],
+        auto_lint=args.auto_lint,
+        pythonhashseed=DEFAULT_PYTHONHASHSEED,
+        thinking_tokens=args.thinking_tokens,
         controls={
             "backend": args.local_callers_backend,
             "read_range": args.local_callers_read_range,
@@ -1022,6 +1103,9 @@ def main():
             "facts_db": args.facts_db,
             "facts_file": args.facts_file,
             "local_callers": args.local_callers_override,
+            "auto_lint": args.auto_lint,
+            "pythonhashseed": DEFAULT_PYTHONHASHSEED,
+            "thinking_tokens": args.thinking_tokens,
         },
     )
     write_run_metadata(output / "metadata.json", run_meta)
@@ -1052,6 +1136,8 @@ def main():
                     facts_file=args.facts_file,
                     local_callers=args.local_callers_override,
                     metadata=row_meta,
+                    auto_lint=args.auto_lint,
+                    thinking_tokens=args.thinking_tokens,
                 )
                 print(json.dumps({k: v for k, v in result.items() if k != "patch"}), flush=True)
                 with (output / "results.jsonl").open("a") as stream:

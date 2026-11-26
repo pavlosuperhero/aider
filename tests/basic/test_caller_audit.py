@@ -135,7 +135,9 @@ def test_contract_hook_rejects_missing_contract_or_trace():
     assert "CALLER_CONTRACT:" in res.continuation
     assert "TRACE:" in res.continuation
     assert hook.rejections == 1
-    io.tool_output.assert_called_once_with("Local caller contract check: missing contract/trace")
+    io.tool_output.assert_called_once_with(
+        "Local caller contract check: BLOCKED (missing contract/trace)"
+    )
 
 
 def test_contract_hook_rejects_missing_caller_reference_before_search():
@@ -175,6 +177,30 @@ def test_contract_hook_ignores_non_edit_replies():
     assert hook.rejections == 0
 
 
+def test_contract_hook_ignores_fenced_explanation_in_diff_mode():
+    hook = CallerContractHook(enabled=True)
+    hook.begin_turn([SAMPLE_EXCERPT])
+
+    assert hook("Example:\n```python\nformat_price(1050)\n```\n") is None
+    assert hook.rejections == 0
+
+
+@pytest.mark.parametrize(
+    "edit_format, edit",
+    [
+        ("whole", "pricing.py\n```python\nreturn '10.50'\n```\n"),
+        ("patch", "*** Begin Patch\n*** Update File: pricing.py\n*** End Patch\n"),
+        ("udiff", "```diff\n--- a/pricing.py\n+++ b/pricing.py\n@@\n-old\n+new\n```\n"),
+    ],
+)
+def test_contract_hook_still_gates_other_patch_formats(edit_format, edit):
+    hook = CallerContractHook(enabled=True, edit_format=edit_format)
+    hook.begin_turn([SAMPLE_EXCERPT])
+
+    assert hook(edit).continuation
+    assert hook.blocked is True
+
+
 def test_contract_hook_respects_max_rejections_and_resets_on_begin_turn():
     hook = CallerContractHook(enabled=True, max_rejections=2)
     hook.begin_turn([SAMPLE_EXCERPT])
@@ -188,9 +214,14 @@ def test_contract_hook_respects_max_rejections_and_resets_on_begin_turn():
     assert hook.rejections == 0
     assert isinstance(hook(EDIT_BLOCK), ResponseHookResult)
 
-    # A strict format gate requires at least one source.
+    # Without caller excerpts (NO_EVIDENCE), pass through so valid edits are not discarded.
+    io = Mock()
     hook.begin_turn(())
-    assert hook(EDIT_BLOCK) == ResponseHookResult()
+    assert hook(EDIT_BLOCK, io=io) is None
+    assert hook.blocked is False
+    io.tool_output.assert_called_once_with(
+        "Local caller contract check: NO_EVIDENCE (pass-through)"
+    )
 
 
 def test_contract_hook_disabled_always_passes_through():
@@ -765,3 +796,138 @@ def test_max_reflections_unchanged_when_local_callers_disabled(project):
     baseline = make_coder(local_callers=False, local_callers_audit=False)
     disabled = make_coder(local_callers=False, local_callers_audit=True)
     assert disabled.max_reflections == baseline.max_reflections
+
+
+def test_read_range_does_not_raise_max_reflections(project):
+    baseline = make_coder(local_callers=False, local_callers_audit=False)
+    read_range_passive = make_coder(
+        local_callers=True,
+        local_callers_mode="passive",
+        local_callers_audit=False,
+        local_callers_read_range=True,
+    )
+    assert baseline.max_reflections == 3
+    assert read_range_passive.max_reflections == 3
+
+
+def test_strict_contract_mode_passes_through_on_no_evidence_and_enforces_with_evidence(
+    project, monkeypatch
+):
+    repo = git.Repo(project)
+    head = repo.head.commit
+
+    # 1. With excerpts=() (NO_EVIDENCE), strict contract mode passes valid edits through.
+    _patch_local_callers(monkeypatch, excerpts=())
+    no_ev_coder = make_coder(
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_policy="strict",
+    )
+    outputs = []
+    no_ev_coder.io.tool_output = lambda *a, **kw: outputs.append(" ".join(str(x) for x in a))
+    no_ev_sends = fake_send(no_ev_coder, [EDIT_BLOCK])
+    no_ev_coder.run("update format_price")
+
+    assert len(no_ev_sends) == 1
+    assert no_ev_coder.local_caller_contract_hook.blocked is False
+    assert any("NO_EVIDENCE (pass-through)" in line for line in outputs)
+    assert "${cents / 100:.2f}" in (project / "pricing.py").read_text(encoding="utf-8")
+    assert repo.head.commit != head
+    assert not repo.is_dirty()
+
+    # 2. With non-empty excerpts, strict contract mode still enforces CALLER_CONTRACT + TRACE.
+    _patch_local_callers(monkeypatch, excerpts=(SAMPLE_EXCERPT,))
+    ev_coder = make_coder(
+        local_callers=True,
+        local_callers_mode="contract",
+        local_callers_policy="strict",
+    )
+    valid_reply = (
+        "CALLER_CONTRACT: pkg/consumer.py calls format_price(1050) expecting '10.50'.\n"
+        "TRACE: format_price(1050) -> '10.50'; format_price(0) -> '0.00'.\n"
+        + FIX_EDIT_BLOCK
+    )
+    ev_sends = fake_send(ev_coder, [FIX_EDIT_BLOCK, valid_reply])
+    ev_coder.run("restore format_price")
+
+    assert len(ev_sends) == 2
+    assert ev_coder.local_caller_contract_hook.rejections == 1
+    assert ev_coder.local_caller_contract_hook.blocked is False
+    assert "{cents / 100:.2f}" in (project / "pricing.py").read_text(encoding="utf-8")
+    assert "${" not in (project / "pricing.py").read_text(encoding="utf-8")
+
+
+def test_auditor_system_prompt_requires_unknown_on_uninformative_snippets():
+    from aider.caller_audit import _AUDITOR_SYSTEM_PROMPT
+
+    prompt_lower = _AUDITOR_SYSTEM_PROMPT.lower()
+    assert "verdict: unknown" in prompt_lower
+    assert "required" in prompt_lower
+    assert "return value" in prompt_lower
+    assert "error condition" in prompt_lower
+    assert "relevant arguments" in prompt_lower
+    assert "bare call" in prompt_lower
+    assert "header declaration" in prompt_lower
+    assert "guessing" in prompt_lower
+
+    auditor = IsolatedCallerAuditor(lambda msgs: "VERDICT: UNKNOWN: uninformative")
+    auditor.begin_turn([SAMPLE_EXCERPT])
+    msgs = auditor.build_messages("+return '10.50'")
+    assert msgs[0]["content"] == _AUDITOR_SYSTEM_PROMPT
+
+
+def test_reflection_without_new_edits_runs_audit_once_without_double_auditing(project, monkeypatch):
+    _patch_local_callers(monkeypatch)
+    repo = git.Repo(project)
+    head = repo.head.commit
+
+    # 1. Lint reflection followed by a no-edit reply must still run the pending audit and commit.
+    coder = make_coder(local_callers=True, local_callers_audit=True)
+    coder.auto_lint = True
+    lint_calls = []
+
+    def fake_lint(paths):
+        lint_calls.append(paths)
+        return "false positive lint warning"
+
+    audit_calls = []
+
+    def pass_audit(messages):
+        audit_calls.append(messages)
+        return "VERDICT: PASS"
+
+    monkeypatch.setattr(coder, "lint_edited", fake_lint)
+    monkeypatch.setattr(coder.io, "confirm_ask", lambda *a, **kw: True)
+    monkeypatch.setattr(coder.local_caller_auditor, "_complete_fn", pass_audit)
+    sends = fake_send(coder, [EDIT_BLOCK, "Already applied, no further changes required."])
+
+    coder.run("update format_price")
+
+    assert len(sends) == 2
+    assert len(lint_calls) == 1
+    assert len(audit_calls) == 1
+    assert "+    return f'${cents / 100:.2f}'" in audit_calls[0][1]["content"]
+    assert repo.head.commit != head
+    assert not repo.is_dirty()
+
+    # 2. Audit FAIL followed by a no-edit reply must NOT double-audit the unchanged diff.
+    fail_head = repo.head.commit
+    fail_coder = make_coder(local_callers=True, local_callers_audit=True)
+    fail_audit_calls = []
+
+    def fail_audit(messages):
+        fail_audit_calls.append(messages)
+        return "VERDICT: FAIL: format mismatch"
+
+    monkeypatch.setattr(fail_coder.local_caller_auditor, "_complete_fn", fail_audit)
+    fail_sends = fake_send(
+        fail_coder,
+        [FIX_EDIT_BLOCK, "Cannot satisfy without changing the caller."],
+    )
+
+    fail_coder.run("restore format_price")
+
+    assert len(fail_sends) == 2
+    assert len(fail_audit_calls) == 1
+    assert repo.head.commit == fail_head
+    assert repo.is_dirty()

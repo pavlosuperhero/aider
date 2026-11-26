@@ -341,11 +341,26 @@ def parse_audit_verdict(raw: str | None) -> AuditVerdict:
 class CallerContractHook:
     """Check the format of the editor's explanation before applying a proposal."""
 
-    def __init__(self, *, enabled: bool = False, max_rejections: int = 2, advisory=False):
+    _EDIT_MARKERS = {
+        "patch": r"^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
+        "udiff": r"^```diff[^\n]*\n--- [^\n]+\n\+\+\+ ",
+        "whole": r"^(?:```|<(?:source|code|pre|codeblock|sourcecode)>)",
+    }
+    _SEARCH_MARKER = r"^<{5,9} SEARCH>?[ \t]*$"
+
+    def __init__(
+        self, *, enabled: bool = False, max_rejections: int = 2, advisory=False, edit_format="diff"
+    ):
         self.advisory = advisory
         self.enabled = bool(enabled)
         self.max_rejections = max_rejections
+        if edit_format == "editor-whole":
+            edit_format = "whole"
+        self._edit_marker = re.compile(
+            self._EDIT_MARKERS.get(edit_format, self._SEARCH_MARKER), re.M
+        )
         self._excerpts: tuple = ()
+        self._search_error = False
         self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.rejections: int = 0
         self.format_present = False
@@ -358,8 +373,10 @@ class CallerContractHook:
         supplementary_evidence: Iterable = (),
         facts: Iterable = (),
         read_ranges: Iterable = (),
+        search_error: bool = False,
     ) -> None:
         self._excerpts = tuple(excerpts or ())
+        self._search_error = search_error
         self._supplementary_evidence = _combine_supplementary(
             supplementary_evidence=supplementary_evidence,
             facts=facts,
@@ -410,12 +427,12 @@ class CallerContractHook:
         self.blocked = False
         if not self.enabled or not content:
             return None
-        edit_marker = re.search(
-            r"<<<<<<< SEARCH|^\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:)",
-            content,
-            re.M,
-        ) or re.search(r"```", content)
+        edit_marker = self._edit_marker.search(content)
         if not edit_marker:
+            return None
+        if self._search_error:
+            if io:
+                io.tool_output("Local caller contract check: SEARCH_ERROR (pass-through)")
             return None
         # Without caller excerpts (NO_EVIDENCE), pass through so valid edits are not discarded.
         # Supplementary evidence (facts/read-ranges) still never satisfies caller checks.
@@ -434,17 +451,19 @@ class CallerContractHook:
             return None
 
         if self.rejections >= self.max_rejections:
-            if io:
-                io.tool_output("Local caller contract check: ENFORCEMENT_EXHAUSTED")
             if self.advisory:
+                if io:
+                    io.tool_output("Local caller contract check: ENFORCEMENT_EXHAUSTED")
                 return None
             self.blocked = True
+            if io:
+                io.tool_output("Local caller contract check: BLOCKED (enforcement exhausted)")
             return ResponseHookResult()
 
         self.rejections += 1
         self.blocked = True
         if io is not None:
-            io.tool_output("Local caller contract check: missing contract/trace")
+            io.tool_output("Local caller contract check: BLOCKED (missing contract/trace)")
 
         caller_labels = ", ".join(
             sorted(
@@ -492,6 +511,7 @@ class IsolatedCallerAuditor:
         self._complete_fn = complete_fn
         self.max_audits = max_audits
         self._excerpts: tuple = ()
+        self._search_error = False
         self._supplementary_evidence: tuple[ProvenanceEvidence, ...] = ()
         self.audits_run: int = 0
 
@@ -502,8 +522,10 @@ class IsolatedCallerAuditor:
         supplementary_evidence: Iterable = (),
         facts: Iterable = (),
         read_ranges: Iterable = (),
+        search_error: bool = False,
     ) -> None:
         self._excerpts = tuple(excerpts or ())
+        self._search_error = search_error
         self._supplementary_evidence = _combine_supplementary(
             supplementary_evidence=supplementary_evidence,
             facts=facts,
@@ -570,7 +592,9 @@ class IsolatedCallerAuditor:
     ) -> AuditVerdict:
         # Supplementary evidence (facts/read-ranges) NEVER substitutes for missing
         # or incomplete caller excerpts.
-        if not self._excerpts:
+        if self._search_error:
+            verdict = AuditVerdict("ERROR", "SEARCH_ERROR")
+        elif not self._excerpts:
             verdict = AuditVerdict("UNKNOWN", "NO_EVIDENCE")
         elif not diff_text.strip() or len(diff_text) > _MAX_PATCH_CHARS:
             verdict = AuditVerdict("UNKNOWN", "INCOMPLETE: patch missing or truncated")
