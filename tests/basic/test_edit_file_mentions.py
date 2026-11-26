@@ -42,7 +42,7 @@ def repo(tmp_path, monkeypatch):
     return repo
 
 
-def make_coder(replies, **kwargs):
+def make_coder(replies, *, test_cmd=None, **kwargs):
     coder = Coder.create(
         main_model=Model("gpt-3.5-turbo"),
         edit_format="diff",
@@ -50,7 +50,8 @@ def make_coder(replies, **kwargs):
         io=InputOutput(yes=True, pretty=False, fancy_input=False),
         auto_commits=True,
         auto_lint=False,
-        auto_test=False,
+        auto_test=bool(test_cmd),
+        test_cmd=test_cmd,
         stream=False,
         map_tokens=0,
         detect_urls=False,
@@ -67,6 +68,122 @@ def make_coder(replies, **kwargs):
 
     coder.send = Mock(side_effect=send)
     return coder
+
+
+@pytest.mark.parametrize("test_errors", [None, "Configured test failed."])
+def test_ordinary_auto_commit_waits_for_configured_tests(repo, test_errors):
+    coder = make_coder([EDIT], test_cmd="test command")
+    initial_head = repo.head.commit.hexsha
+    checks = []
+
+    def run_test(command):
+        assert command == "test command"
+        checks.append((repo.head.commit.hexsha, Path("a.py").read_text(encoding="utf-8")))
+        return test_errors
+
+    coder.commands.cmd_test = Mock(side_effect=run_test)
+    coder.io.confirm_ask.return_value = False
+    coder.run_one("Update the value.", preproc=False)
+
+    assert checks == [(initial_head, AFTER)]
+    assert Path("a.py").read_text(encoding="utf-8") == AFTER
+    if test_errors:
+        assert repo.head.commit.hexsha == initial_head
+        assert repo.is_dirty()
+        coder.io.confirm_ask.assert_called_once_with("Attempt to fix test errors?")
+    else:
+        assert len(list(repo.iter_commits())) == 2
+        assert not repo.is_dirty()
+        coder.io.confirm_ask.assert_not_called()
+
+
+def test_ordinary_test_retry_does_not_commit_failed_candidate(repo):
+    fixed = "value = 2\n"
+    repair = EDIT.replace(BEFORE, AFTER, 1).replace(f"=======\n{AFTER}", f"=======\n{fixed}")
+    coder = make_coder([EDIT, repair], test_cmd="test command")
+    assert coder.dirty_commits
+    initial_head = repo.head.commit.hexsha
+    checks = []
+
+    def run_test(command):
+        contents = Path("a.py").read_text(encoding="utf-8")
+        checks.append((repo.head.commit.hexsha, contents))
+        return None if contents == fixed else "Configured test failed."
+
+    coder.commands.cmd_test = Mock(side_effect=run_test)
+    coder.run_one("Update the value.", preproc=False)
+
+    assert checks == [(initial_head, AFTER), (initial_head, fixed)]
+    assert repo.head.commit.tree["a.py"].data_stream.read().decode("utf-8") == fixed
+    assert len(list(repo.iter_commits())) == 2
+    assert not repo.is_dirty()
+    assert coder.num_reflections == 1
+
+
+def test_ordinary_test_retry_without_new_edit_leaves_failed_patch_dirty(repo):
+    coder = make_coder([EDIT, "I have no fix."], test_cmd="test command")
+    initial_head = repo.head.commit.hexsha
+    coder.commands.cmd_test = Mock(return_value="Configured test failed.")
+
+    coder.run_one("Update the value.", preproc=False)
+
+    assert coder.num_reflections == 1
+    assert repo.head.commit.hexsha == initial_head
+    assert Path("a.py").read_text(encoding="utf-8") == AFTER
+    assert repo.is_dirty()
+    coder.commands.cmd_test.assert_called_once_with("test command")
+
+
+def test_declining_ordinary_lint_repair_still_checks_tests_before_commit(repo):
+    coder = make_coder([EDIT], test_cmd="test command")
+    initial_head = repo.head.commit.hexsha
+    coder.auto_lint = True
+    coder.lint_edited = Mock(return_value="Lint warning.")
+    coder.io.confirm_ask.return_value = False
+
+    def run_test(command):
+        assert repo.head.commit.hexsha == initial_head
+
+    coder.commands.cmd_test = Mock(side_effect=run_test)
+    coder.run_one("Update the value.", preproc=False)
+
+    coder.io.confirm_ask.assert_called_once_with("Attempt to fix lint errors?")
+    coder.commands.cmd_test.assert_called_once_with("test command")
+    assert len(list(repo.iter_commits())) == 2
+    assert not repo.is_dirty()
+
+
+@pytest.mark.parametrize("changed_during_review", [False, True])
+def test_ordinary_test_hook_reviews_passing_patch_before_commit(repo, changed_during_review):
+    coder = make_coder([EDIT, "Done."], test_cmd="test command")
+    initial_head = repo.head.commit.hexsha
+    review_heads = []
+
+    def run_test(command):
+        coder.test_hook_continuation = "Review the passing patch."
+
+    original_send = coder.send.side_effect
+
+    def review(messages, functions=None):
+        if coder.send.call_count == 2:
+            review_heads.append(repo.head.commit.hexsha)
+            if changed_during_review:
+                Path("a.py").write_text("value = 999\n", encoding="utf-8")
+        return original_send(messages, functions=functions)
+
+    coder.commands.cmd_test = Mock(side_effect=run_test)
+    coder.send.side_effect = review
+    coder.run_one("Update the value.", preproc=False)
+
+    assert review_heads == [initial_head]
+    coder.commands.cmd_test.assert_called_once_with("test command")
+    if changed_during_review:
+        assert repo.head.commit.hexsha == initial_head
+        assert repo.is_dirty()
+    else:
+        assert repo.head.commit.tree["a.py"].data_stream.read().decode("utf-8") == AFTER
+        assert len(list(repo.iter_commits())) == 2
+        assert not repo.is_dirty()
 
 
 @pytest.mark.parametrize("accept_mention", [True, False])

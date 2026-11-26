@@ -236,9 +236,11 @@ class Coder:
             if hasattr(coder, "edit_format") and coder.edit_format == edit_format:
                 res = coder(main_model, io, **kwargs)
                 res.original_kwargs = dict(kwargs)
-                if from_coder and res.local_caller_auditor is not None:
-                    res._unreviewed_paths.update(from_coder._unreviewed_paths)
-                    res._unreviewed_paths.update(from_coder._audit_originals)
+                if from_coder:
+                    res._pending_test_paths.update(from_coder._pending_test_paths)
+                    if res.local_caller_auditor is not None:
+                        res._unreviewed_paths.update(from_coder._unreviewed_paths)
+                        res._unreviewed_paths.update(from_coder._audit_originals)
                 return res
 
         valid_formats = [
@@ -454,6 +456,8 @@ class Coder:
         self._audit_originals = {}
         self._last_audited_diff = None
         self._unreviewed_paths = {}
+        self._pending_test_paths = set()
+        self._tested_ordinary_edits = None
         self.local_callers_audit = local_callers_audit
         self.oracle_provider = oracle_provider
         self.response_hooks = tuple(response_hooks)
@@ -1028,9 +1032,9 @@ class Coder:
         if self.oracle_provider is not None and not user_message:
             return
         while True:
-            self.response_hook_pending = False
-            if self.local_caller_auditor is not None:
+            if self.response_hook_pending or self.local_caller_auditor is not None:
                 self.reflected_message = None
+            self.response_hook_pending = False
             yield from self.send_message(user_message)
             retry_audited_edit = self.local_caller_auditor is not None and self.reflected_message
             if not self.response_hook_pending and not retry_audited_edit:
@@ -1717,6 +1721,7 @@ class Coder:
         self.num_reflections = 0
         self.lint_outcome = None
         self.test_outcome = None
+        self._tested_ordinary_edits = None
         self.shell_commands = []
         self.message_cost = 0
         if self._preserve_local_caller_state:
@@ -2525,6 +2530,14 @@ class Coder:
             return
 
         auditing = self.local_caller_auditor is not None
+        defer_commit = (
+            not auditing
+            and self.repo is not None
+            and self.auto_commits
+            and self.auto_test
+            and bool(self.test_cmd)
+            and not self.dry_run
+        )
         if auditing:
             self.shell_commands = []
         shell_command_count = len(self.shell_commands)
@@ -2534,15 +2547,13 @@ class Coder:
 
         if edited:
             self.aider_edited_files.update(edited)
+            if defer_commit:
+                self._tested_ordinary_edits = None
+                self._pending_test_paths.update(self.abs_root_path(path) for path in edited if path)
         if auditing and edited:
             edited = set(self._audit_originals)
-        if edited and not auditing:
-            saved_message = self.auto_commit(edited)
-
-            if not saved_message and hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
-                saved_message = self.gpt_prompts.files_content_gpt_edits_no_repo
-
-            self.move_back_cur_messages(saved_message)
+        if edited and not auditing and not defer_commit:
+            self._finish_ordinary_edits(edited)
 
         if self.reflected_message:
             return
@@ -2552,9 +2563,20 @@ class Coder:
             del self.shell_commands[shell_command_count:]
             return
 
+        if defer_commit and not edited and self._tested_ordinary_edits is not None:
+            paths, tested_head, tested_diff = self._tested_ordinary_edits
+            self._tested_ordinary_edits = None
+            if (
+                self.repo.get_head_commit_sha() == tested_head
+                and self.repo.get_diffs(paths) == tested_diff
+            ):
+                self._finish_ordinary_edits(paths)
+            else:
+                self.io.tool_warning("Files changed after testing. Edits remain uncommitted.")
+
         if edited and self.auto_lint:
             lint_errors = self.lint_edited(edited)
-            if not auditing:
+            if not auditing and not defer_commit:
                 self.auto_commit(edited, context="Ran the linter")
             self.lint_outcome = not lint_errors
             if lint_errors:
@@ -2575,16 +2597,37 @@ class Coder:
             test_errors = self.commands.cmd_test(self.test_cmd)
             self.test_outcome = not test_errors
             continuation, self.test_hook_continuation = self.test_hook_continuation, None
+            verified_paths = []
+            if defer_commit and not test_errors:
+                verified_paths = sorted(
+                    path
+                    for path in self.aider_edited_files
+                    if path and self.abs_root_path(path) in self._pending_test_paths
+                )
             if continuation:
+                if verified_paths:
+                    diff = self.repo.get_diffs(verified_paths)
+                    if diff is not None:
+                        self._tested_ordinary_edits = (
+                            verified_paths,
+                            self.repo.get_head_commit_sha(),
+                            diff,
+                        )
                 self.reflected_message = continuation
+                if defer_commit:
+                    self.response_hook_pending = True
                 return
+            if verified_paths:
+                self._finish_ordinary_edits(verified_paths)
             if test_errors:
                 ok = self.io.confirm_ask("Attempt to fix test errors?")
                 if ok:
                     self.reflected_message = test_errors
                     return
-                if auditing:
+                if auditing or defer_commit:
                     self.io.tool_warning("Tests failed. Edits remain uncommitted.")
+                if defer_commit:
+                    return
 
         if (
             auditing
@@ -2603,6 +2646,16 @@ class Coder:
             and not self._audit_originals
         ):
             self.check_for_file_mentions(content)
+
+    def _finish_ordinary_edits(self, edited):
+        saved_message = self.auto_commit(edited)
+        if saved_message:
+            self._pending_test_paths.difference_update(
+                self.abs_root_path(path) for path in edited if path
+            )
+        else:
+            saved_message = getattr(self.gpt_prompts, "files_content_gpt_edits_no_repo", None)
+        self.move_back_cur_messages(saved_message)
 
     def _share_shell_output(self):
         shared_output = self.run_shell_commands()
@@ -2627,7 +2680,8 @@ class Coder:
                     self.io.tool_output(f"Audit response tail: {verdict.raw_response[-200:]!r}")
             if not verdict.passed and not self.caller_advisory:
                 self.io.tool_warning(
-                    "Edits remain uncommitted. Review the working tree with git status and git diff."
+                    "Edits remain uncommitted. Review the working tree with "
+                    "git status and git diff."
                 )
                 if verdict.status == "FAIL":
                     self.reflected_message = self.local_caller_auditor.build_continuation(verdict)
@@ -3257,12 +3311,16 @@ class Coder:
             return
         if not self.dirty_commits:
             return
+        absolute_path = self.abs_root_path(path)
         if (
             self._audit_originals
-            and self.get_rel_fname(self.abs_root_path(path)) in self._audit_originals
+            and self.get_rel_fname(absolute_path) in self._audit_originals
         ):
             return
         if not self.repo.is_dirty(path):
+            self._pending_test_paths.discard(absolute_path)
+            return
+        if absolute_path in self._pending_test_paths:
             return
 
         # We need a committed copy of the file in order to /undo, so skip this
