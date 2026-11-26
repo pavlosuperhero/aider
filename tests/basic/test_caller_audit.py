@@ -534,7 +534,9 @@ def test_auditor_keeps_patch_when_updated_file_is_long():
 
 @pytest.mark.parametrize("auto_commit", [True, False])
 @pytest.mark.parametrize("stream", [False, True])
-def test_audit_uses_late_hunk_and_only_commits_after_acceptance(project, monkeypatch, auto_commit, stream):
+def test_audit_uses_late_hunk_and_only_commits_after_acceptance(
+    project, monkeypatch, auto_commit, stream
+):
     repo = git.Repo(project)
     path = project / "pricing.py"
     path.write_text("# padding\n" * 700 + path.read_text())
@@ -712,7 +714,10 @@ def test_reflection_rechecks_all_pending_files_in_one_commit(project, monkeypatc
     head = repo.index.commit("add second editable file")
     coder = make_coder(local_callers=True, local_callers_audit=True)
     coder.add_rel_fname("notes.py")
-    second = "notes.py\n```python\n<<<<<<< SEARCH\nvalue = 1\n=======\nvalue = 2\n>>>>>>> REPLACE\n```\n"
+    second = (
+        "notes.py\n```python\n<<<<<<< SEARCH\nvalue = 1\n=======\n"
+        "value = 2\n>>>>>>> REPLACE\n```\n"
+    )
     fix = FIX_EDIT_BLOCK.replace("return f'{cents", "return  f'{cents")
     fake_send(coder, [EDIT_BLOCK + second, fix])
     prompts = []
@@ -773,7 +778,9 @@ def test_complete_caller_audit_retries_transient_litellm_errors(project, monkeyp
 
     coder = make_coder(local_callers=True, local_callers_audit=True)
     calls = []
-    ok_resp = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="VERDICT: PASS"))])
+    ok_resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="VERDICT: PASS"))]
+    )
 
     def flaky_send(**kwargs):
         calls.append(kwargs)
@@ -874,6 +881,52 @@ def test_auditor_system_prompt_requires_unknown_on_uninformative_snippets():
     auditor.begin_turn([SAMPLE_EXCERPT])
     msgs = auditor.build_messages("+return '10.50'")
     assert msgs[0]["content"] == _AUDITOR_SYSTEM_PROMPT
+
+
+def test_auditor_system_prompt_calibrates_unspecified_conventions_and_smoke_tests():
+    from aider.caller_audit import _AUDITOR_SYSTEM_PROMPT
+
+    for heading in (
+        "CALLER_EXPECTS",
+        "TRACE_REALISTIC",
+        "MISMATCH_CHECK",
+        "VERDICT: PASS",
+        "VERDICT: UNKNOWN: <reason>",
+        "VERDICT: FAIL:",
+    ):
+        assert heading in _AUDITOR_SYSTEM_PROMPT
+
+    prompt_lower = _AUDITOR_SYSTEM_PROMPT.lower()
+    assert "sentinel value" in prompt_lower
+    assert "formatting rule" in prompt_lower
+    assert "repository convention" in prompt_lower
+    assert "unspecified" in prompt_lower
+    assert "explicitly check, unpack, or branch" in prompt_lower
+    assert "minimal smoke tests" in prompt_lower
+    assert "changed edge case" in prompt_lower
+    assert "arbitrary default" in prompt_lower
+
+
+def test_caller_audit_module_remains_pure_policy_without_forbidden_imports():
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "aider" / "caller_audit.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+
+    forbidden_prefixes = ("aider.coders", "aider.local_callers", "litellm", "tree_sitter", "git")
+    for mod in imported:
+        assert not any(
+            mod == prefix or mod.startswith(f"{prefix}.") for prefix in forbidden_prefixes
+        ), f"Pure policy module must not import {mod}"
+        if mod.startswith("aider.") or mod == "aider":
+            assert mod == "aider.hooks", f"Unexpected internal import: {mod}"
 
 
 def test_reflection_without_new_edits_runs_audit_once_without_double_auditing(project, monkeypatch):

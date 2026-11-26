@@ -13,9 +13,6 @@ manifest=/tmp/issue5-replay-corpus/manifest.json
 
 bash "$trial/issue5_trials.sh" --plan fast "$model" trial-results/issue5-fast
 bash "$trial/issue5_trials.sh" --plan long "$model" trial-results/issue5-long "$manifest"
-
-bash "$trial/issue5_trials.sh" fast "$model" trial-results/issue5-fast
-bash "$trial/issue5_trials.sh" long "$model" trial-results/issue5-long "$manifest"
 ```
 
 | Profile | Schedule | Use |
@@ -23,7 +20,32 @@ bash "$trial/issue5_trials.sh" long "$model" trial-results/issue5-long "$manifes
 | Fast | 5 Issue #5 fixtures × passive and audit × 1 round = 10 attempts | Check model connectivity, candidate evaluation and telemetry |
 | Long | 30 frozen cases × 5 baseline arms, then 30 per Cymbal, ReadRange and Facts ablation = 240 attempts | Reproduce the earlier sweep's scale. The archived attempts total 9 h 31 min. Runtime depends on the model, hardware and timeouts. |
 
-Run the offline gate and check that LM Studio and Oracle are reachable before starting either profile. Keep the replay manifest, source snapshots and hidden-check assets available across a reboot. Put outputs on persistent storage rather than in `/tmp`.
+Run the offline gate and check that LM Studio and Oracle are reachable before starting either profile. Start with one canary and check its artifacts before launching the fast profile. Keep the replay manifest, source snapshots and hidden-check assets available across a reboot. Put outputs on persistent storage rather than in `/tmp`.
+
+```bash
+.venv/bin/python "$trial/heldout.py" --checkpoint --suite issue5 \
+  --cases caller_multi_scope --arms passive --rounds 1 --specs vague \
+  --seed 20261123 --map-tokens 1024 --model "$model" \
+  --local-callers-backend builtin --no-local-callers-read-range --no-facts --no-auto-lint \
+  --out trial-results/issue5-fast/canary.jsonl
+```
+
+Verify a completed editor call, input and output token usage, and the Oracle foundation message in `aider.log`. Check `verification.txt` and the independent outcome fields in the JSONL. The passive canary should show `contract_rejected=false` and `commits_added=0`. A recorded model miss with usable telemetry can still validate the pipeline.
+
+After the canary gate, run and summarize the fast profile.
+
+```bash
+bash "$trial/issue5_trials.sh" fast "$model" trial-results/issue5-fast
+.venv/bin/python "$trial/heldout.py" --summarize --out trial-results/issue5-fast/fast.jsonl
+```
+
+Review the fast summary and verify the provider settings before starting a separate long calibration.
+
+```bash
+bash "$trial/issue5_trials.sh" long "$model" trial-results/issue5-long "$manifest"
+```
+
+For thinking models such as `qwen/qwen3.6-35b-a3b`, set `TRIAL_THINKING_TOKENS` (for example, `TRIAL_THINKING_TOKENS=4096 bash "$trial/issue5_trials.sh" fast "$model" trial-results/issue5-fast`) to forward `--thinking-tokens` and bound multi-minute runaway reasoning turns. Leave `TRIAL_THINKING_TOKENS` unset to omit `--thinking-tokens`.
 
 ### Resume after an interruption
 
@@ -86,7 +108,7 @@ curl --fail --silent --show-error "$LM_STUDIO_API_BASE/models"
 
 Check that both arms return five rows, usage records include editor calls, and `contract_rejected` stays false in both arms. To exercise format-block telemetry, run `--arms passive,contract` on the historical corpus with `--suite replay --replay-manifest "$manifest"` and a fresh output filename. That calibration schedules 60 attempts. Run two separate `--arms passive` jobs with the same configuration and different output filenames to measure A/A disagreement. Match rows by case, spec and round.
 
-Record the served model revision, quantization, inference settings and timeout. The harness pins `PYTHONHASHSEED=0`, disables automatic file-mention prompts and auto-commits, and uses `--seed` for job order. Verify model sampling seed and thinking limits at the provider before treating them as controlled. The harness records the requested `--thinking-tokens` value when supplied.
+Record the served model revision, quantization, inference settings and timeout. The harness pins `PYTHONHASHSEED=0`, disables automatic file-mention prompts, auto-commits and dirty commits, and uses `--seed` for job order. Verify model sampling seed and thinking limits at the provider before treating them as controlled. The harness records the requested `--thinking-tokens` value when supplied.
 
 ## Fresh paired replay
 
@@ -120,6 +142,6 @@ Report `patch_hidden_passed`, `strict_accepted`, and `committed` individually wi
 
 | Priority | Verified or prepared | Still open |
 | --- | --- | --- |
-| P0 | Edit-before-mention regression, focused hook and strict-audit cases, evidence/error distinction, fixture checks, harness classification and checkpoint recovery. Replay pins Python hash seed and disables automatic file additions and lint. | Complete veto and commit/test policy matrix, first-editor-call acceptance metrics, deduplication when evidence changes, cross-platform CI, C/C++ header lint behavior, provider seed and thinking limits. |
+| P0 | Edit-before-mention regression, focused hook and strict-audit cases, evidence/error distinction, fixture checks, harness classification and checkpoint recovery. Ordinary auto-commit waits for configured automatic tests and a failed candidate stays in the working tree. Replay pins Python hash seed and disables automatic file additions, lint and both commit modes. | Complete the remaining veto and commit policy cases, first-editor-call acceptance metrics, deduplication when evidence changes, cross-platform CI, C/C++ header lint behavior, provider seed and thinking limits. |
 | P1 | Historical retrieval benchmark and opt-in documentation exist. The long profile has separate ablations and a persistent artifact directory per stage. | Expanded language and caller-resolution coverage, independently labeled auditor evaluation, targeted ReadRange and seeded Facts efficacy runs, versioned release and reproducible artifact archival. |
 | P2 | Frozen historical corpus and resumable 240-attempt calibration profile. | New unseen corpus, at least three paired rounds with A/A controls, independent acceptance and safety gates, and the release decision. |

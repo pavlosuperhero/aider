@@ -1151,3 +1151,237 @@ def test_pinned_v0_18_0_cymbal_smoke(tmp_path):
     assert isinstance(changed_dirty.entries, tuple)
     assert "api.py" in changed_dirty.changed_files
     assert any(e.path == "api.py" and e.symbol == "parse" for e in changed_dirty.entries)
+
+
+def test_c_cpp_editable_target_extraction_and_regex_fallback(tmp_path, monkeypatch):
+    import aider.cymbal_callers as cc
+
+    (tmp_path / "parser.c").write_text(
+        "static int ini_parse_stream(ini_reader reader, void *user);\n"
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length) {\n"
+        "    return (long long)length;\n"
+        "}\n"
+        "int redisReaderGetReply(redisReader *r, void **reply) {\n"
+        "    return 0;\n"
+        "}\n"
+        "static int ini_parse_stream(ini_reader reader, void *user) {\n"
+        "    return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.c").write_text(
+        "long long handle(const unsigned char *buf, unsigned int n) {\n"
+        "    return yajl_parse_integer(buf, n);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "service.cpp").write_text(
+        "class Engine {\n"
+        "public:\n"
+        "    int decode(const char *s) { return 1; }\n"
+        "};\n"
+        "int Engine::finish(int code) {\n"
+        "    return code;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.cpp").write_text(
+        "int run(Engine &e) {\n"
+        "    return e.finish(e.decode(\"ok\"));\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # 1. Tree-sitter + Cymbal lookup discovers C targets without false duplicate from prototype.
+    runner = FakeCymbalRunner(
+        refs={
+            "yajl_parse_integer": {
+                "definitions": [{"file": "parser.c", "line": 2, "name": "yajl_parse_integer"}],
+                "references": [
+                    {
+                        "file": "consumer.c",
+                        "line": 2,
+                        "kind": "call",
+                        "snippet": "    return yajl_parse_integer(buf, n);",
+                    }
+                ],
+            },
+            "redisReaderGetReply": {"references": []},
+            "ini_parse_stream": {"references": []},
+        },
+        impact={
+            "yajl_parse_integer": {"direct_callers": []},
+            "redisReaderGetReply": {"direct_callers": []},
+            "ini_parse_stream": {"direct_callers": []},
+        },
+    )
+    c_res = find_callers_with_backend(
+        tmp_path,
+        "fix yajl_parse_integer redisReaderGetReply ini_parse_stream",
+        ["parser.c"],
+        ["consumer.c"],
+        backend=BACKEND_CYMBAL,
+        runner=runner,
+    )
+    assert ("parser.c", "yajl_parse_integer") in c_res.definitions
+    assert ("parser.c", "redisReaderGetReply") in c_res.definitions
+    assert ("parser.c", "ini_parse_stream") in c_res.definitions
+    assert "duplicate symbol definition" not in c_res.ambiguity
+    assert [e.path for e in c_res.excerpts] == ["consumer.c"]
+    assert "yajl_parse_integer(buf, n)" in c_res.excerpts[0].code
+
+    # 2. C++ inline and out-of-line methods are extracted as targets.
+    cpp_runner = FakeCymbalRunner(
+        refs={
+            "decode": {"references": []},
+            "finish": {
+                "definitions": [{"file": "service.cpp", "line": 5, "name": "finish"}],
+                "references": [
+                    {
+                        "file": "main.cpp",
+                        "line": 2,
+                        "kind": "call",
+                        "snippet": '    return e.finish(e.decode("ok"));',
+                    }
+                ],
+            },
+        },
+        impact={"decode": {"direct_callers": []}, "finish": {"direct_callers": []}},
+    )
+    cpp_res = find_callers_with_backend(
+        tmp_path,
+        "fix decode and finish",
+        ["service.cpp"],
+        ["main.cpp"],
+        backend=BACKEND_CYMBAL,
+        runner=cpp_runner,
+    )
+    assert ("service.cpp", "decode") in cpp_res.definitions
+    assert ("service.cpp", "finish") in cpp_res.definitions
+    assert [e.path for e in cpp_res.excerpts] == ["main.cpp"]
+
+    # 3. Regex fallback works when tree-sitter extraction is unavailable.
+    monkeypatch.setattr(cc, "_extract_c_cpp_ts_targets", lambda path, source, words: [])
+    c_src = (tmp_path / "parser.c").read_text(encoding="utf-8")
+    fallback_defs = cc._extract_generic_targets(
+        "parser.c",
+        c_src,
+        {"yajl_parse_integer", "redisReaderGetReply", "ini_parse_stream"},
+    )
+    assert {d.symbol for d in fallback_defs} == {
+        "yajl_parse_integer",
+        "redisReaderGetReply",
+        "ini_parse_stream",
+    }
+
+
+def test_per_symbol_not_found_isolated_while_other_errors_propagate(tmp_path):
+    (tmp_path / "api.py").write_text(
+        "def missing_helper(x):\n    return x\n\ndef parse_value(x):\n    return int(x)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.py").write_text(
+        "from api import parse_value\n\ndef run(raw):\n    return parse_value(raw) + 1\n",
+        encoding="utf-8",
+    )
+
+    # 1. Non-zero exit with "Symbol not found" for one symbol continues querying the second.
+    runner_isolated = FakeCymbalRunner(
+        refs={
+            "missing_helper": CommandResult(
+                argv=("cymbal", "refs", "--json", "--no-federate", "missing_helper"),
+                returncode=1,
+                stdout=b"",
+                stderr=b"error: Symbol Not Found: missing_helper\n",
+            ),
+            "parse_value": {
+                "definitions": [{"file": "api.py", "line": 4, "name": "parse_value"}],
+                "references": [
+                    {
+                        "file": "consumer.py",
+                        "line": 4,
+                        "kind": "call",
+                        "snippet": "    return parse_value(raw) + 1",
+                    }
+                ],
+            },
+        },
+        impact={
+            "missing_helper": {"error": "symbol not found in index"},
+            "parse_value": {"direct_callers": []},
+        },
+    )
+    res = find_callers_with_backend(
+        tmp_path,
+        "fix missing_helper and parse_value",
+        ["api.py"],
+        ["consumer.py"],
+        backend=BACKEND_CYMBAL,
+        runner=runner_isolated,
+    )
+    assert [e.path for e in res.excerpts] == ["consumer.py"]
+    assert res.excerpts[0].symbol == "parse_value"
+    assert any("symbol not found (missing_helper)" in d for d in res.diagnostics)
+
+    # 2. Other CymbalExecutionError (not symbol-not-found) MUST still propagate loudly.
+    runner_exec_err = FakeCymbalRunner(
+        refs={
+            "missing_helper": CommandResult(
+                argv=("cymbal", "refs", "--json", "--no-federate", "missing_helper"),
+                returncode=2,
+                stdout=b"",
+                stderr=b"fatal: index database corrupted\n",
+            ),
+            "parse_value": {"references": []},
+        },
+        impact={"missing_helper": {"direct_callers": []}, "parse_value": {"direct_callers": []}},
+    )
+    with pytest.raises(CymbalExecutionError, match="corrupted"):
+        find_callers_with_backend(
+            tmp_path,
+            "fix missing_helper and parse_value",
+            ["api.py"],
+            ["consumer.py"],
+            backend=BACKEND_CYMBAL,
+            runner=runner_exec_err,
+        )
+
+    # 3. Protocol/timeout/version errors continue propagating loudly.
+    runner_proto = FakeCymbalRunner(refs={"missing_helper": b"{bad json"})
+    with pytest.raises(CymbalProtocolError):
+        find_callers_with_backend(
+            tmp_path,
+            "fix missing_helper and parse_value",
+            ["api.py"],
+            ["consumer.py"],
+            backend=BACKEND_CYMBAL,
+            runner=runner_proto,
+        )
+
+
+def test_builtin_backend_large_file_skip_marks_lookup_result_incomplete(tmp_path):
+    (tmp_path / "api.py").write_text(
+        "def normalize_code(raw):\n    return raw.strip().upper()\n",
+        encoding="utf-8",
+    )
+    padding = "\n".join(f"# pad {i:04d} " + ("x" * 64) for i in range(2200))
+    (tmp_path / "consumer.py").write_text(
+        f"from api import normalize_code\n{padding}\nval = normalize_code('a')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_smoke.py").write_text(
+        "from api import normalize_code\nassert normalize_code(' a ') == 'A'\n",
+        encoding="utf-8",
+    )
+
+    res = find_callers_with_backend(
+        tmp_path,
+        "fix normalize_code",
+        ["api.py"],
+        ["consumer.py", "test_smoke.py"],
+        backend=BACKEND_BUILTIN,
+    )
+    assert res.status == "INCOMPLETE"
+    assert [e.path for e in res.excerpts] == ["test_smoke.py"]
+    assert res.excerpts[0].incomplete is True
+    assert any("128 KiB" in note for note in res.truncation)

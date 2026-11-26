@@ -36,23 +36,34 @@ supplementary evidence (such as project facts or read-range excerpts) is \
 auxiliary context only and never replaces missing or incomplete caller snippets.
 
 Evidence sufficiency rule (calibration):
-- Emit `VERDICT: PASS` ONLY when the attached caller excerpts directly show \
-the relevant arguments and how the caller inspects or consumes the return \
-value, side effect, or error condition affected by the diff, and your trace \
-verifies every observed caller expectation.
-- `VERDICT: UNKNOWN: <reason>` is REQUIRED whenever the attached caller \
-excerpts do not inspect the return value, error condition, or relevant \
-arguments of the changed symbol (for example, a bare call with no arguments, \
-a header declaration/prototype only, or a call site that omits how the changed \
-behavior is consumed). Abstain with `VERDICT: UNKNOWN` instead of guessing \
-unshown caller behavior to emit `PASS`.
+- Emit `VERDICT: PASS` ONLY when every requirement of the task is either \
+explicitly specified in the task or directly verified by attached caller \
+excerpts that show the relevant arguments and explicitly check, unpack, or \
+branch on the exact return value, sentinel, formatting rule, unit, side \
+effect, or error condition affected by the diff, and your trace verifies every \
+observed caller expectation.
+- `VERDICT: UNKNOWN: <reason>` is REQUIRED whenever ANY of the following holds:
+  (a) the task leaves an expected sentinel value, formatting rule, unit, or \
+repository convention unspecified AND the attached caller snippets do not \
+explicitly check, unpack, or branch on that exact convention (for example, a \
+caller that only interpolates the return value or checks a broad condition \
+like `< 0` without constraining the exact sentinel);
+  (b) the only attached excerpts are minimal smoke tests or declarations that \
+do not exercise the changed edge case;
+  (c) the attached caller excerpts do not inspect the return value, error \
+condition, or relevant arguments of the changed symbol (for example, a bare \
+call with no arguments, a header declaration/prototype only, or a call site \
+that omits how the changed behavior is consumed).
+- Abstain with `VERDICT: UNKNOWN: <reason>` instead of guessing that an \
+arbitrary default satisfies unshown callers to emit `PASS`.
 
 Complete these 4 steps in order:
 1. CALLER_EXPECTS: Quote each caller line and state the exact semantic role of \
 every variable assigned or unpacked from the call, plus how downstream lines use \
 it (element order, types, units, prefixes/formatting, and null/sentinel/error \
-checks). Explicitly note whether the snippet actually observes the return \
-value, error condition, or relevant arguments touched by the diff.
+checks). Explicitly note whether the task specifies the exact convention or \
+whether the snippet actually observes, asserts, or branches on the changed \
+edge case, return value, error condition, or relevant arguments.
 2. TRACE_REALISTIC: Pick 1 realistic, standard-format, asymmetric input matching \
 the task and parameter names (avoid symmetric placeholders like 'A B' or \
 [1, 1]) and 1 edge case. Trace the EXACT changed behavior in the proposed diff \
@@ -63,13 +74,18 @@ the caller's final output expression.
 what its variable name and downstream expression require (e.g., unpacked items \
 are not swapped, numeric values use the caller's expected unit, types and \
 null/sentinel/error checks match, and the caller's final output is valid). If \
-the snippet does not observe the affected return value, error condition, or \
-relevant arguments, record that evidence is insufficient for PASS.
+the task leaves a sentinel, formatting rule, unit, or repository convention \
+unspecified and the snippet does not explicitly check, unpack, or branch on \
+that exact convention—or if only minimal smoke tests or declarations are \
+attached without exercising the changed edge case—record that evidence is \
+insufficient for PASS.
 4. Output your verdict on a separate final line in plain text, without numbering or Markdown.
-For a verified match where the caller snippet directly observes the changed behavior output:
+For a verified match where the task and caller snippets directly establish and \
+observe every changed behavior and edge case output:
 VERDICT: PASS
-Whenever evidence is insufficient or the caller snippet does not inspect the \
-affected return value, error condition, or relevant arguments output:
+Whenever evidence is insufficient, a task convention is unspecified and \
+unverified by callers, or attached excerpts are minimal smoke tests or do not \
+inspect the affected return value, error condition, or relevant arguments output:
 VERDICT: UNKNOWN: <reason>
 ONLY if you proved a concrete input where a caller variable or caller result \
 is wrong output:

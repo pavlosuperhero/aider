@@ -30,6 +30,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Iterable, Literal, Protocol, Sequence
+import warnings
 
 from aider.local_callers import (
     CallerEvidenceReport,
@@ -37,8 +38,9 @@ from aider.local_callers import (
     CallerFinder,
     PythonAstCallerFinder,
     TreeSitterCallerFinder,
-    _DEF_REGEXES,
     _CONTROL_KEYWORDS,
+    _DEF_REGEXES,
+    _LARGE_FILE_LIMITATION,
     _WORD_RE,
     _is_test_path,
 )
@@ -485,6 +487,9 @@ class CymbalEvidenceReport(CallerEvidenceReport):
                 else:
                     ambiguities.append(lim)
 
+        if self.skipped_large > 0:
+            truncations.append(_LARGE_FILE_LIMITATION)
+
         unique_ambiguity = _unique_ordered(ambiguities)
         unique_truncation = _unique_ordered(truncations)
         if isinstance(self.scope, list):
@@ -496,8 +501,13 @@ class CymbalEvidenceReport(CallerEvidenceReport):
         unique_diagnostics = _unique_ordered(self.diagnostics)
 
         if not excerpt_tuple:
-            status: EvidenceStatus = "NO_EVIDENCE"
-        elif unique_ambiguity or unique_truncation or any(e.incomplete for e in excerpt_tuple):
+            status: EvidenceStatus = "INCOMPLETE" if self.skipped_large > 0 else "NO_EVIDENCE"
+        elif (
+            unique_ambiguity
+            or unique_truncation
+            or self.skipped_large > 0
+            or any(e.incomplete for e in excerpt_tuple)
+        ):
             status = "INCOMPLETE"
         else:
             status = "COMPLETE_WITHIN_SCOPE"
@@ -1942,7 +1952,182 @@ def _extract_python_targets(path: str, source: str, words: set[str]) -> list[_Ta
     return found
 
 
+_C_CPP_SUFFIXES = frozenset(
+    {".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".tpp"}
+)
+_CPP_ONLY_SUFFIXES = frozenset({".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".tpp"})
+_C_CPP_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx"})
+_C_NON_DECL_KEYWORDS = frozenset(
+    {
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "switch",
+        "case",
+        "do",
+        "goto",
+        "throw",
+        "delete",
+        "new",
+        "sizeof",
+        "typeof",
+        "typedef",
+        "using",
+        "namespace",
+        "co_return",
+        "co_await",
+        "co_yield",
+    }
+)
+_C_CPP_FUNC_DEF_RE = re.compile(
+    r"(?m)^[ \t]*"
+    r"(?P<prefix>(?:[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?(?:\s*[*&]+)?[ \t]+)+)"
+    r"(?:(?P<owner>[A-Za-z_]\w*)\s*::\s*)?"
+    r"(?P<name>[A-Za-z_]\w*)[ \t]*\([^;{}]*\)[ \t\r\n]*"
+    r"(?:(?:const|noexcept|override|final)\b[ \t\r\n]*)*"
+    r"(?P<term>\{|;)"
+)
+
+
+def _unwrap_c_declarator_name(node: Any, *, in_class: bool = False) -> tuple[str | None, str]:
+    """Extract ``(symbol_name, kind)`` from a tree-sitter C/C++ declarator node."""
+    cur = node
+    # Locate the innermost function_declarator (e.g., through pointer_declarator).
+    while cur is not None and getattr(cur, "type", "") != "function_declarator":
+        child = cur.child_by_field_name("declarator")
+        if child is None:
+            return None, "function"
+        cur = child
+    if cur is None:
+        return None, "function"
+
+    inner = cur.child_by_field_name("declarator")
+    if inner is None:
+        return None, "function"
+
+    inner_type = getattr(inner, "type", "")
+    # Skip function-pointer declarators such as `int (*cb)(int)`.
+    if inner_type == "parenthesized_declarator":
+        return None, "function"
+    if inner_type == "identifier":
+        name = inner.text.decode("utf-8", errors="ignore").strip()
+        return (name or None), ("method" if in_class else "function")
+    if inner_type == "field_identifier":
+        name = inner.text.decode("utf-8", errors="ignore").strip()
+        return (name or None), "method"
+    if inner_type == "qualified_identifier":
+        leaf = inner
+        while leaf is not None and getattr(leaf, "type", "") == "qualified_identifier":
+            leaf = leaf.child_by_field_name("name")
+        if leaf is not None:
+            name = leaf.text.decode("utf-8", errors="ignore").strip()
+            return (name or None), "method"
+    return None, "function"
+
+
+def _extract_c_cpp_ts_targets(
+    path: str,
+    source: str,
+    words: set[str],
+) -> list[_TargetDefinition]:
+    suffix = Path(path).suffix.lower()
+    lang = "cpp" if suffix in _CPP_ONLY_SUFFIXES else "c"
+    try:
+        warnings.simplefilter("ignore", category=FutureWarning)
+        from grep_ast.tsl import get_parser
+
+        parser = get_parser(lang)
+        tree = parser.parse(source.encode("utf-8"))
+    except Exception:
+        return []
+
+    definitions: list[_TargetDefinition] = []
+    declarations: list[_TargetDefinition] = []
+    seen_defs: set[str] = set()
+    seen_decls: set[str] = set()
+
+    stack: list[tuple[Any, bool, bool]] = [(tree.root_node, False, False)]
+    while stack:
+        node, in_class, in_param = stack.pop()
+        node_type = getattr(node, "type", "")
+        if node_type == "parameter_declaration":
+            continue
+        if node_type == "function_definition":
+            decl = node.child_by_field_name("declarator")
+            name, kind = _unwrap_c_declarator_name(decl, in_class=in_class)
+            if name and name in words and name not in _CONTROL_KEYWORDS and name not in seen_defs:
+                seen_defs.add(name)
+                line = node.start_point[0] + 1
+                definitions.append(_TargetDefinition(path=path, symbol=name, kind=kind, line=line))
+        elif node_type == "function_declarator" and not in_param:
+            parent = getattr(node, "parent", None)
+            parent_type = getattr(parent, "type", "") if parent is not None else ""
+            if parent_type != "function_definition":
+                name, kind = _unwrap_c_declarator_name(node, in_class=in_class)
+                if (
+                    name
+                    and name in words
+                    and name not in _CONTROL_KEYWORDS
+                    and name not in seen_decls
+                ):
+                    seen_decls.add(name)
+                    line = node.start_point[0] + 1
+                    declarations.append(
+                        _TargetDefinition(path=path, symbol=name, kind=kind, line=line)
+                    )
+
+        next_in_class = in_class or node_type in ("class_specifier", "struct_specifier")
+        next_in_param = in_param or node_type == "parameter_list"
+        for child in reversed(node.children):
+            stack.append((child, next_in_class, next_in_param))
+
+    found = list(definitions)
+    for item in declarations:
+        if item.symbol not in seen_defs:
+            found.append(item)
+            seen_defs.add(item.symbol)
+    return found
+
+
+def _extract_c_cpp_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
+    found = _extract_c_cpp_ts_targets(path, source, words)
+    seen = {item.symbol for item in found}
+    is_header = Path(path).suffix.lower() in _C_CPP_HEADER_SUFFIXES
+
+    proto_candidates: list[_TargetDefinition] = []
+    for match in _C_CPP_FUNC_DEF_RE.finditer(source):
+        prefix = match.group("prefix") or ""
+        name = match.group("name") or ""
+        owner = match.group("owner") or ""
+        term = match.group("term") or ""
+        if not name or name not in words or name in _CONTROL_KEYWORDS or name in seen:
+            continue
+        if "=" in prefix:
+            continue
+        first_tok = prefix.split()[0] if prefix.split() else ""
+        if not first_tok or first_tok in _C_NON_DECL_KEYWORDS:
+            continue
+        line = source.count("\n", 0, match.start()) + 1
+        kind = "method" if owner else "function"
+        target = _TargetDefinition(path=path, symbol=name, kind=kind, line=line)
+        if term == "{":
+            seen.add(name)
+            found.append(target)
+        elif is_header:
+            proto_candidates.append(target)
+
+    for target in proto_candidates:
+        if target.symbol not in seen:
+            seen.add(target.symbol)
+            found.append(target)
+    return found
+
+
 def _extract_generic_targets(path: str, source: str, words: set[str]) -> list[_TargetDefinition]:
+    if Path(path).suffix.lower() in _C_CPP_SUFFIXES:
+        return _extract_c_cpp_targets(path, source, words)
     found: list[_TargetDefinition] = []
     seen: set[str] = set()
     for pattern in _DEF_REGEXES:
@@ -1967,13 +2152,22 @@ def _extract_editable_targets(
         source = _read_editable_text(resolved_root, rel_path, max_bytes=max_scan_bytes)
         if not source or not any(word in source for word in words):
             continue
-        if Path(rel_path).suffix == ".py":
+        suffix = Path(rel_path).suffix.lower()
+        if suffix == ".py":
             defs = _extract_python_targets(rel_path, source, words)
+        elif suffix in _C_CPP_SUFFIXES:
+            defs = _extract_c_cpp_targets(rel_path, source, words)
         else:
             defs = _extract_generic_targets(rel_path, source, words)
         for item in defs:
             by_symbol.setdefault(item.symbol, []).append(item)
     return by_symbol
+
+
+def _is_symbol_not_found_error(exc: CymbalExecutionError) -> bool:
+    """Return True when a Cymbal execution failure specifically reports symbol-not-found."""
+    haystack = f"{exc}\n{exc.details}".lower()
+    return "symbol not found" in haystack
 
 
 def _reference_priority(ref: CymbalReference) -> int:
@@ -2109,42 +2303,56 @@ class CymbalCallerFinder:
             if any(d.kind == "method" for d in target_defs):
                 symbol_ambiguities.append("ambiguous method receiver")
 
-            refs_res = self.client.refs(resolved_root, symbol, deadline=deadline)
-            for diag in refs_res.diagnostics:
-                _report_add_diagnostic(report, diag)
-            if refs_res.stale:
-                symbol_ambiguities.append("stale index")
-            if refs_res.ambiguous or len({d.path for d in refs_res.definitions}) > 1:
-                symbol_ambiguities.append("duplicate symbol definition")
-            if refs_res.truncated:
-                symbol_truncations.append("cymbal refs truncated")
-            if refs_res.definitions and not any(
-                d.path in editable_norm_set for d in refs_res.definitions
-            ):
-                symbol_ambiguities.append("ambiguous symbol binding")
+            combined_refs: list[tuple[CymbalReference, str]] = []
+            try:
+                refs_res = self.client.refs(resolved_root, symbol, deadline=deadline)
+            except CymbalExecutionError as exc:
+                if not _is_symbol_not_found_error(exc):
+                    raise
+                _report_add_diagnostic(report, f"cymbal refs: symbol not found ({symbol})")
+                refs_res = None
 
-            combined_refs: list[tuple[CymbalReference, str]] = [
-                (ref, "cymbal:refs") for ref in refs_res.references
-            ]
-
-            if self.config.use_impact:
-                impact_res = self.client.impact(resolved_root, symbol, deadline=deadline)
-                for diag in impact_res.diagnostics:
+            if refs_res is not None:
+                for diag in refs_res.diagnostics:
                     _report_add_diagnostic(report, diag)
-                if impact_res.stale:
+                if refs_res.stale:
                     symbol_ambiguities.append("stale index")
-                if impact_res.ambiguous or len({d.path for d in impact_res.definitions}) > 1:
+                if refs_res.ambiguous or len({d.path for d in refs_res.definitions}) > 1:
                     symbol_ambiguities.append("duplicate symbol definition")
-                if impact_res.truncated:
-                    symbol_truncations.append("cymbal impact truncated")
-                if impact_res.definitions and not any(
-                    d.path in editable_norm_set for d in impact_res.definitions
+                if refs_res.truncated:
+                    symbol_truncations.append("cymbal refs truncated")
+                if refs_res.definitions and not any(
+                    d.path in editable_norm_set for d in refs_res.definitions
                 ):
                     symbol_ambiguities.append("ambiguous symbol binding")
-                for ref in impact_res.direct_callers:
-                    combined_refs.append((ref, "cymbal:impact"))
-                for ref in impact_res.transitive_callers:
-                    combined_refs.append((ref, "cymbal:impact"))
+                combined_refs.extend((ref, "cymbal:refs") for ref in refs_res.references)
+
+            if self.config.use_impact:
+                try:
+                    impact_res = self.client.impact(resolved_root, symbol, deadline=deadline)
+                except CymbalExecutionError as exc:
+                    if not _is_symbol_not_found_error(exc):
+                        raise
+                    _report_add_diagnostic(report, f"cymbal impact: symbol not found ({symbol})")
+                    impact_res = None
+
+                if impact_res is not None:
+                    for diag in impact_res.diagnostics:
+                        _report_add_diagnostic(report, diag)
+                    if impact_res.stale:
+                        symbol_ambiguities.append("stale index")
+                    if impact_res.ambiguous or len({d.path for d in impact_res.definitions}) > 1:
+                        symbol_ambiguities.append("duplicate symbol definition")
+                    if impact_res.truncated:
+                        symbol_truncations.append("cymbal impact truncated")
+                    if impact_res.definitions and not any(
+                        d.path in editable_norm_set for d in impact_res.definitions
+                    ):
+                        symbol_ambiguities.append("ambiguous symbol binding")
+                    for ref in impact_res.direct_callers:
+                        combined_refs.append((ref, "cymbal:impact"))
+                    for ref in impact_res.transitive_callers:
+                        combined_refs.append((ref, "cymbal:impact"))
 
             for amb in _unique_ordered(symbol_ambiguities):
                 _report_add_ambiguity(report, amb)

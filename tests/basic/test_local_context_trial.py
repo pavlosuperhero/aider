@@ -850,6 +850,7 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIn("--no-auto-lint", captured_cmd)
         self.assertIn("--no-auto-add-file-mentions", captured_cmd)
         self.assertIn("--no-auto-commits", captured_cmd)
+        self.assertIn("--no-dirty-commits", captured_cmd)
         self.assertNotIn("--auto-lint", captured_cmd)
         self.assertNotIn("--thinking-tokens", captured_cmd)
         self.assertEqual(captured_env.get("PYTHONHASHSEED"), "0")
@@ -904,6 +905,7 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIs(meta["auto_lint"], False)
         self.assertIs(meta["auto_add_file_mentions"], False)
         self.assertIs(meta["auto_commits"], False)
+        self.assertIs(meta["dirty_commits"], False)
         self.assertEqual(meta["pythonhashseed"], "0")
         self.assertIsNone(meta["thinking_tokens"])
 
@@ -1784,6 +1786,92 @@ class TestIssue5SuiteAndEconomyReporting(unittest.TestCase):
             backend_summary["arm_outcomes"]["passive[facts_backend=sqlite]"]["tokens_per_solved"],
             900.0,
         )
+
+    def test_issue5_trials_launcher_plan_and_optional_thinking_tokens(self):
+        launcher = TRIAL_DIR / "issue5_trials.sh"
+        with tempfile.TemporaryDirectory(prefix="aider-launcher-test-") as tmp:
+            tmp_path = Path(tmp)
+            results_dir = tmp_path / "results"
+            base_env = os.environ.copy()
+            base_env.pop("TRIAL_THINKING_TOKENS", None)
+            base_env["TRIAL_PYTHON"] = sys.executable
+
+            # 1. Default --plan fast without TRIAL_THINKING_TOKENS
+            proc_default = subprocess.run(
+                ["bash", str(launcher), "--plan", "fast", "test-model", str(results_dir)],
+                capture_output=True,
+                text=True,
+                env=base_env,
+                check=False,
+            )
+            self.assertEqual(proc_default.returncode, 0, proc_default.stderr)
+            self.assertEqual(
+                json.loads(proc_default.stdout),
+                {"suite": "issue5", "cases": 5, "attempts": 10},
+            )
+
+            # 2. --plan fast with TRIAL_THINKING_TOKENS=4096
+            budget_env = dict(base_env, TRIAL_THINKING_TOKENS="4096")
+            proc_budget = subprocess.run(
+                ["bash", str(launcher), "--plan", "fast", "test-model", str(results_dir)],
+                capture_output=True,
+                text=True,
+                env=budget_env,
+                check=False,
+            )
+            self.assertEqual(proc_budget.returncode, 0, proc_budget.stderr)
+            self.assertEqual(
+                json.loads(proc_budget.stdout),
+                {"suite": "issue5", "cases": 5, "attempts": 10},
+            )
+
+            # 3. Verify exact argv forwarding via a lightweight TRIAL_PYTHON shim
+            argv_log = tmp_path / "argv.json"
+            shim = tmp_path / "python_shim.sh"
+            shim.write_text(
+                "#!/usr/bin/env bash\n"
+                f'exec "{sys.executable}" -c '
+                '"import json, pathlib, sys; '
+                f"pathlib.Path({str(argv_log)!r}).write_text(json.dumps(sys.argv[1:]))\" "
+                '"$@"\n',
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+
+            shim_env = dict(base_env, TRIAL_PYTHON=str(shim))
+            res_unset = subprocess.run(
+                ["bash", str(launcher), "--plan", "fast", "test-model", str(results_dir)],
+                capture_output=True,
+                text=True,
+                env=shim_env,
+                check=False,
+            )
+            self.assertEqual(res_unset.returncode, 0, res_unset.stderr)
+            argv_unset = json.loads(argv_log.read_text(encoding="utf-8"))
+            self.assertNotIn("--thinking-tokens", argv_unset)
+
+            res_empty = subprocess.run(
+                ["bash", str(launcher), "--plan", "fast", "test-model", str(results_dir)],
+                capture_output=True,
+                text=True,
+                env=dict(shim_env, TRIAL_THINKING_TOKENS=""),
+                check=False,
+            )
+            self.assertEqual(res_empty.returncode, 0, res_empty.stderr)
+            argv_empty = json.loads(argv_log.read_text(encoding="utf-8"))
+            self.assertNotIn("--thinking-tokens", argv_empty)
+
+            res_set = subprocess.run(
+                ["bash", str(launcher), "--plan", "fast", "test-model", str(results_dir)],
+                capture_output=True,
+                text=True,
+                env=dict(shim_env, TRIAL_THINKING_TOKENS="4096"),
+                check=False,
+            )
+            self.assertEqual(res_set.returncode, 0, res_set.stderr)
+            argv_set = json.loads(argv_log.read_text(encoding="utf-8"))
+            idx = argv_set.index("--thinking-tokens")
+            self.assertEqual(argv_set[idx + 1], "4096")
 
 
 if __name__ == "__main__":

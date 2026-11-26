@@ -21,6 +21,9 @@ trial_dir=$(cd "$(dirname "$0")" && pwd)
 python_bin=${TRIAL_PYTHON:-"$trial_dir/../../.venv/bin/python"}
 common=("$mode" --model "$model" --rounds 1 --specs vague --map-tokens 1024 --seed 20261123
         --no-auto-lint)
+if [[ -n ${TRIAL_THINKING_TOKENS:-} ]]; then
+    common+=(--thinking-tokens "$TRIAL_THINKING_TOKENS")
+fi
 
 if [[ $profile == fast ]]; then
     "$python_bin" "$trial_dir/heldout.py" "${common[@]}" --suite issue5 --arms passive,audit \

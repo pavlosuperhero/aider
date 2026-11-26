@@ -53,7 +53,110 @@ _EXTRA_LANG_BY_SUFFIX = {
     ".cjs": "javascript",
     ".mts": "typescript",
     ".cts": "typescript",
+    ".hh": "cpp",
 }
+_LARGE_FILE_LIMITATION = "large candidate file omitted (>128 KiB)"
+_C_NON_DECL_KEYWORDS = frozenset(
+    {
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "switch",
+        "case",
+        "do",
+        "goto",
+        "throw",
+        "delete",
+        "new",
+        "typeof",
+        "sizeof",
+        "await",
+        "yield",
+        "co_await",
+        "co_return",
+        "co_yield",
+        "assert",
+        "raise",
+        "go",
+        "defer",
+        "match",
+        "elif",
+        "unless",
+        "until",
+        "when",
+        "export",
+        "print",
+        "puts",
+        "echo",
+        "not",
+    }
+)
+_C_PARAM_TYPE_KEYWORDS = frozenset(
+    {
+        "const",
+        "unsigned",
+        "signed",
+        "struct",
+        "enum",
+        "union",
+        "volatile",
+        "restrict",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "void",
+        "size_t",
+        "ssize_t",
+        "bool",
+        "uint8_t",
+        "uint16_t",
+        "uint32_t",
+        "uint64_t",
+        "int8_t",
+        "int16_t",
+        "int32_t",
+        "int64_t",
+        "ptrdiff_t",
+        "intptr_t",
+        "uintptr_t",
+        "wchar_t",
+        "char16_t",
+        "char32_t",
+        "FILE",
+    }
+)
+_C_CALL_BODY_ANCESTORS = frozenset(
+    {
+        "init_declarator",
+        "initializer_list",
+        "compound_statement",
+        "return_statement",
+        "expression_statement",
+        "argument_list",
+        "assignment_expression",
+        "field_initializer",
+    }
+)
+_C_DECL_SPEC_PREFIX_RE = re.compile(
+    r"^(?:extern\s+\"C\"\s+)?"
+    r"(?:template\s*<[^<>{};]*>\s*)?"
+    r"(?:[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?(?:\s*[*&]+|\s+))+"
+    r"(?:[A-Za-z_]\w*\s*::\s*)?$"
+)
+_C_RETURN_TYPE_LINE_RE = re.compile(
+    r"^(?:extern\s+\"C\"\s+)?"
+    r"(?:template\s*<[^<>{};]*>\s*)?"
+    r"[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?"
+    r"(?:\s+[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*<[^<>{};]*>)?)*"
+    r"(?:\s*[*&]+)*$"
+)
+_C_VOID_PARAMS_RE = re.compile(r"^\s*void\s*\)")
+_C_FIRST_PARAM_WORD_RE = re.compile(r"^\s*([A-Za-z_]\w*)(?:\s+|\s*[*&])")
 _CALL_NODE_TYPES = frozenset(
     {
         "call_expression",
@@ -137,7 +240,7 @@ _JS_DEFAULT_REQUIRE_RE = re.compile(
 _DECL_LINE_RE = re.compile(
     r"^\s*(?:(?://|/\*|\*|#)"
     r"|(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function|func|fn|def|class)\b"
-    r"|import\b)"
+    r"|(?:import|typedef)\b)"
 )
 
 
@@ -205,6 +308,7 @@ class CallerScope:
     max_chars: int = 700
     context_lines: int = 3
     sources: tuple[str, ...] = ()
+    skipped_large: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "editable", tuple(self.editable))
@@ -217,6 +321,8 @@ class CallerScope:
         ]
         if self.omitted_test_candidates:
             parts.append(f"omitted_tests={self.omitted_test_candidates}")
+        if self.skipped_large:
+            parts.append(f"skipped_large={self.skipped_large}")
         if self.matched_files or self.selected_files:
             parts.append(f"files={self.selected_files}/{self.matched_files}")
         parts.append(f"max_files={self.max_files}")
@@ -417,6 +523,8 @@ class CallerEvidenceReport:
     sources: list[str] = field(default_factory=list)
     scope: CallerScope = field(default_factory=CallerScope)
     result: CallerEvidenceResult | None = None
+    skipped_large: int = 0
+    _skipped_large_paths: set[str] = field(default_factory=set, repr=False)
 
     def record_definition(self, path: str, symbol: str) -> None:
         self.definitions.add((path, symbol))
@@ -425,6 +533,15 @@ class CallerEvidenceReport:
         text = str(source).strip()
         if text and text not in self.sources:
             self.sources.append(text)
+
+    def record_skipped_large(self, path: str = "") -> None:
+        text = str(path).strip()
+        if text:
+            if text in self._skipped_large_paths:
+                return
+            self._skipped_large_paths.add(text)
+        self.skipped_large += 1
+        self.record_truncation(_LARGE_FILE_LIMITATION)
 
     def record_ambiguity(self, reason: str) -> None:
         text = str(reason).strip()
@@ -484,11 +601,17 @@ class CallerEvidenceReport:
                 )
         evidence_tuple = tuple(evidence_items)
 
+        skipped_large = max(self.skipped_large, self.scope.skipped_large)
+        extra_large = (_LARGE_FILE_LIMITATION,) if skipped_large > 0 else ()
         ambiguity = _dedupe_str(
             (*self.ambiguity, *(reason for e in evidence_tuple for reason in e.ambiguity))
         )
         truncation = _dedupe_str(
-            (*self.truncation, *(reason for e in evidence_tuple for reason in e.truncation))
+            (
+                *self.truncation,
+                *(reason for e in evidence_tuple for reason in e.truncation),
+                *extra_large,
+            )
         )
         limitations = _dedupe_str(
             (
@@ -502,14 +625,14 @@ class CallerEvidenceReport:
             (*self.sources, *(e.source for e in evidence_tuple if e.source), *self.scope.sources)
         )
         scope = (
-            replace(self.scope, sources=sources)
-            if sources != self.scope.sources
+            replace(self.scope, sources=sources, skipped_large=skipped_large)
+            if sources != self.scope.sources or skipped_large != self.scope.skipped_large
             else self.scope
         )
 
         if not evidence_tuple:
-            status: EvidenceStatus = "NO_EVIDENCE"
-        elif ambiguity or truncation or limitations:
+            status: EvidenceStatus = "INCOMPLETE" if skipped_large > 0 else "NO_EVIDENCE"
+        elif ambiguity or truncation or limitations or skipped_large > 0:
             status = "INCOMPLETE"
         else:
             status = "COMPLETE_WITHIN_SCOPE"
@@ -561,6 +684,45 @@ class CallerFinder(Protocol):
         ...
 
 
+def _read_source_checked(
+    root: Path | str,
+    name: str,
+    *,
+    max_bytes: int = MAX_SOURCE_BYTES,
+) -> tuple[str, bool]:
+    """Safely read a bounded UTF-8 source file inside ``root``.
+
+    Returns ``(text, skipped_large)`` where ``skipped_large`` is True only when
+    an otherwise valid file exceeded ``max_bytes``.
+    """
+    if not name or max_bytes <= 0:
+        return "", False
+    try:
+        resolved_root = Path(root).resolve()
+        path = resolved_root / name
+        if (
+            path.is_symlink()
+            or path.resolve() != path
+            or not path.is_relative_to(resolved_root)
+            or not path.is_file()
+        ):
+            return "", False
+        with path.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return "", True
+        return data.decode("utf-8"), False
+    except (OSError, UnicodeError, ValueError):
+        return "", False
+
+
+def _read_python_checked(root: Path | str, name: str) -> tuple[str, bool]:
+    """Bounded safe reader restricted to ``.py`` files, reporting oversized skips."""
+    if Path(name).suffix != ".py":
+        return "", False
+    return _read_source_checked(root, name)
+
+
 def read_source(root: Path | str, name: str, *, max_bytes: int = MAX_SOURCE_BYTES) -> str:
     """Safely read a bounded UTF-8 source file inside ``root``.
 
@@ -571,23 +733,8 @@ def read_source(root: Path | str, name: str, *, max_bytes: int = MAX_SOURCE_BYTE
     Postcondition:
         - Returns decoded text on success, or ``""`` if any guard fails.
     """
-    if not name or max_bytes <= 0:
-        return ""
-    try:
-        resolved_root = Path(root).resolve()
-        path = resolved_root / name
-        if (
-            path.is_symlink()
-            or path.resolve() != path
-            or not path.is_relative_to(resolved_root)
-            or not path.is_file()
-        ):
-            return ""
-        with path.open("rb") as stream:
-            data = stream.read(max_bytes + 1)
-        return data.decode("utf-8") if len(data) <= max_bytes else ""
-    except (OSError, UnicodeError, ValueError):
-        return ""
+    text, _ = _read_source_checked(root, name, max_bytes=max_bytes)
+    return text
 
 
 def read_python(root: Path | str, name: str) -> str:
@@ -713,11 +860,17 @@ class PythonAstCallerFinder:
 
         target_symbols = {sym for _, sym in target_funcs} | {m for _, _, m in target_methods}
         excerpts: list[CallerExcerpt] = []
+        skipped_large = 0
 
         for name in sorted(candidates):
             if not self.supports(name):
                 continue
-            source = read_python(resolved_root, name)
+            source, is_large = _read_python_checked(resolved_root, name)
+            if is_large:
+                skipped_large += 1
+                if report is not None and hasattr(report, "record_skipped_large"):
+                    report.record_skipped_large(name)
+                continue
             if not source or not any(symbol in source for symbol in target_symbols):
                 continue
             try:
@@ -832,6 +985,12 @@ class PythonAstCallerFinder:
             )
             if len(excerpts) >= max_files:
                 break
+
+        if skipped_large > 0 and excerpts:
+            excerpts[-1] = replace(
+                excerpts[-1],
+                truncation=_dedupe_str((*excerpts[-1].truncation, _LARGE_FILE_LIMITATION)),
+            )
 
         return tuple(excerpts)
 
@@ -1070,6 +1229,65 @@ def _extract_callee_name(call_node) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _is_c_declaration_node(node) -> bool:
+    """Return True when a tree-sitter node sits inside a C/C++ prototype/declaration."""
+    cur = node
+    while cur is not None:
+        node_type = getattr(cur, "type", "")
+        if node_type == "function_declarator":
+            return True
+        if node_type in _C_CALL_BODY_ANCESTORS:
+            return False
+        parent = getattr(cur, "parent", None)
+        if parent is not None and getattr(parent, "type", "") == "field_declaration":
+            default_val = parent.child_by_field_name("default_value")
+            if default_val is not None and default_val == cur:
+                return False
+        if node_type in ("declaration", "field_declaration"):
+            return True
+        cur = parent
+    return False
+
+
+def _is_c_cpp_declaration_match(
+    line: str,
+    match_start: int,
+    match_end: int,
+    prev_line: str = "",
+) -> bool:
+    """Return True if a regex ``name(`` hit is a C/C++ prototype or definition header."""
+    before = line[:match_start]
+    same_line_stmt_reset = "{" in before or ";" in before
+    stmt_before = before.rsplit("{", 1)[-1].rsplit(";", 1)[-1].lstrip()
+    stripped_before = stmt_before.strip()
+
+    if stripped_before:
+        if any(ch in stripped_before for ch in ("=", ",", "?", "(", ")", "[", "]", ".", "->")):
+            return False
+        if _C_DECL_SPEC_PREFIX_RE.match(stmt_before):
+            first_word_match = _WORD_RE.search(stripped_before)
+            first_word = first_word_match.group(0) if first_word_match else ""
+            if first_word and first_word not in _C_NON_DECL_KEYWORDS:
+                return True
+        return False
+
+    after_paren = line[match_end:]
+    if _C_VOID_PARAMS_RE.match(after_paren):
+        return True
+    first_param = _C_FIRST_PARAM_WORD_RE.match(after_paren)
+    if first_param and first_param.group(1) in _C_PARAM_TYPE_KEYWORDS:
+        return True
+
+    if not same_line_stmt_reset and prev_line:
+        prev_stripped = prev_line.strip()
+        if prev_stripped and _C_RETURN_TYPE_LINE_RE.match(prev_stripped):
+            prev_word_match = _WORD_RE.search(prev_stripped)
+            prev_word = prev_word_match.group(0) if prev_word_match else ""
+            if prev_word and prev_word not in _C_NON_DECL_KEYWORDS:
+                return True
+    return False
+
+
 class TreeSitterCallerFinder:
     """Language-agnostic caller finder backed by tree-sitter queries with regex fallback."""
 
@@ -1120,10 +1338,16 @@ class TreeSitterCallerFinder:
             report.record_ambiguity("duplicate symbol definition")
 
         excerpts: list[CallerExcerpt] = []
+        skipped_large = 0
         for name in sorted(candidates):
             if not self.supports(name):
                 continue
-            source = read_source(resolved_root, name)
+            source, is_large = _read_source_checked(resolved_root, name)
+            if is_large:
+                skipped_large += 1
+                if report is not None and hasattr(report, "record_skipped_large"):
+                    report.record_skipped_large(name)
+                continue
             if not source:
                 continue
 
@@ -1185,6 +1409,12 @@ class TreeSitterCallerFinder:
             )
             if len(excerpts) >= max_files:
                 break
+
+        if skipped_large > 0 and excerpts:
+            excerpts[-1] = replace(
+                excerpts[-1],
+                truncation=_dedupe_str((*excerpts[-1].truncation, _LARGE_FILE_LIMITATION)),
+            )
 
         return tuple(excerpts)
 
@@ -1335,6 +1565,8 @@ class TreeSitterCallerFinder:
             for node, tag in captures:
                 if tag not in ("name.reference.call", "name.reference.class"):
                     continue
+                if _is_c_declaration_node(node):
+                    continue
                 called = node.text.decode("utf-8", errors="ignore")
                 row, col = node.start_point
                 if called in call_names:
@@ -1358,13 +1590,16 @@ class TreeSitterCallerFinder:
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
+            if node.type == "function_declarator":
+                continue
             if node.type in _CALL_NODE_TYPES:
-                owner, called = _extract_callee_name(node)
-                row, col = node.start_point
-                if called and called in call_names:
-                    ast_matches.append((row, col, call_names[called]))
-                elif owner and called and owner in ns_aliases and called in ns_aliases[owner]:
-                    ast_matches.append((row, col, called))
+                if not _is_c_declaration_node(node):
+                    owner, called = _extract_callee_name(node)
+                    row, col = node.start_point
+                    if called and called in call_names:
+                        ast_matches.append((row, col, call_names[called]))
+                    elif owner and called and owner in ns_aliases and called in ns_aliases[owner]:
+                        ast_matches.append((row, col, called))
             stack.extend(reversed(node.children))
 
         if ast_matches:
@@ -1402,13 +1637,27 @@ class TreeSitterCallerFinder:
             return []
 
         matches: list[tuple[int, str]] = []
+        prev_nonempty = ""
         for row, line in enumerate(source.splitlines()):
+            stripped = line.strip()
             if _DECL_LINE_RE.match(line):
+                if stripped and not stripped.startswith(("//", "/*", "*", "#")):
+                    prev_nonempty = stripped
                 continue
+            matched_line = False
             for pattern, sym in patterns:
-                if pattern.search(line):
+                for match in pattern.finditer(line):
+                    if _is_c_cpp_declaration_match(
+                        line, match.start(), match.end(), prev_nonempty
+                    ):
+                        continue
                     matches.append((row, sym))
+                    matched_line = True
                     break
+                if matched_line:
+                    break
+            if stripped:
+                prev_nonempty = stripped
         return matches
 
     @classmethod
@@ -1656,6 +1905,7 @@ class CompositeCallerFinder:
                     max_chars=max_chars,
                     context_lines=context_lines,
                     sources=tuple(active_report.sources),
+                    skipped_large=active_report.skipped_large,
                 )
                 result = active_report.to_result(tuple(selected))
                 active_report.result = result
@@ -1684,6 +1934,7 @@ class CompositeCallerFinder:
             max_chars=max_chars,
             context_lines=context_lines,
             sources=tuple(active_report.sources),
+            skipped_large=active_report.skipped_large,
         )
         result = active_report.to_result(())
         active_report.result = result

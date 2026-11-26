@@ -735,3 +735,166 @@ def test_composite_merges_duplicate_matches_and_supports_legacy_and_empty_adapte
     assert "stale index" in propagated.ambiguity
     assert propagated.excerpts[-1].incomplete is True
     assert "stale index" in propagated.excerpts[-1].ambiguity
+
+
+def test_c_cpp_header_prototypes_rejected_while_c_and_inline_hpp_calls_preserved(tmp_path):
+    from aider.local_callers import TreeSitterCallerFinder
+
+    (tmp_path / "yajl_parser.c").write_text(
+        "long long yajl_parse_integer(const unsigned char *number, unsigned int length) {\n"
+        "    return (long long)length;\n"
+        "}\n"
+        "YAJL_API int yajl_parse(yajl_handle hand, const unsigned char *jsonText, size_t len) {\n"
+        "    return 0;\n"
+        "}\n"
+        "int redisReaderGetReply(redisReader *r, void **reply) {\n"
+        "    return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "yajl_parse.h").write_text(
+        "extern long long yajl_parse_integer(\n"
+        "    const unsigned char *number,\n"
+        "    unsigned int length);\n"
+        "extern long long\n"
+        "yajl_parse_integer(const unsigned char *number, unsigned int length);\n"
+        "YAJL_API int yajl_parse(yajl_handle hand, const unsigned char *jsonText, size_t len);\n"
+        "int redisReaderGetReply(redisReader *r, void **reply);\n"
+        "typedef int (*parse_cb)(int x);\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.c").write_text(
+        '#include "yajl_parse.h"\n'
+        "long long run_parse(const unsigned char *buf, unsigned int n) {\n"
+        "    long long val = yajl_parse_integer(buf, n);\n"
+        "    return val;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "inline_wrap.hpp").write_text(
+        "extern long long yajl_parse_integer(const unsigned char *number, unsigned int length);\n"
+        "struct Helper {\n"
+        "    int redisReaderGetReply(redisReader *r, void **reply);\n"
+        "    inline long long wrap(const unsigned char *s, unsigned int n) {\n"
+        "        return yajl_parse_integer(s, n);\n"
+        "    }\n"
+        "};\n"
+        "inline long long one_liner(const unsigned char *s, unsigned int n) "
+        "{ return yajl_parse_integer(s, n); }\n",
+        encoding="utf-8",
+    )
+
+    # Header-only candidates must NOT match C/C++ prototypes as callers.
+    header_only = discover_related_callers(
+        tmp_path,
+        "fix yajl_parse_integer yajl_parse redisReaderGetReply",
+        ["yajl_parser.c"],
+        ["yajl_parse.h"],
+    )
+    assert header_only.status == "NO_EVIDENCE"
+    assert header_only.excerpts == ()
+
+    # Real calls in .c and inline .hpp function bodies ARE preserved (and header skipped).
+    real_calls = discover_related_callers(
+        tmp_path,
+        "fix yajl_parse_integer",
+        ["yajl_parser.c"],
+        ["yajl_parse.h", "consumer.c", "inline_wrap.hpp"],
+    )
+    assert [e.path for e in real_calls.excerpts] == ["consumer.c", "inline_wrap.hpp"]
+    assert real_calls.evidence[0].line == 3
+    assert "yajl_parse_integer(buf, n)" in real_calls.excerpts[0].code
+    assert real_calls.evidence[1].line == 5
+    assert "return yajl_parse_integer(s, n);" in real_calls.excerpts[1].code
+
+    # Direct regex fallback check: prototypes rejected, inline & .c calls matched.
+    call_names = {
+        "yajl_parse_integer": "yajl_parse_integer",
+        "yajl_parse": "yajl_parse",
+        "redisReaderGetReply": "redisReaderGetReply",
+    }
+    header_src = (tmp_path / "yajl_parse.h").read_text(encoding="utf-8")
+    assert TreeSitterCallerFinder._find_regex_call_lines(header_src, call_names, {}) == []
+
+    hpp_src = (tmp_path / "inline_wrap.hpp").read_text(encoding="utf-8")
+    hpp_regex_hits = TreeSitterCallerFinder._find_regex_call_lines(hpp_src, call_names, {})
+    assert hpp_regex_hits == [(4, "yajl_parse_integer"), (7, "yajl_parse_integer")]
+
+    c_src = (tmp_path / "consumer.c").read_text(encoding="utf-8")
+    c_regex_hits = TreeSitterCallerFinder._find_regex_call_lines(c_src, call_names, {})
+    assert c_regex_hits == [(2, "yajl_parse_integer")]
+
+
+def test_large_file_skip_marks_report_incomplete_even_with_test_fallback(tmp_path):
+    (tmp_path / "api.py").write_text(
+        "def normalize_code(raw):\n    return raw.strip().upper()\n",
+        encoding="utf-8",
+    )
+    padding = "\n".join(f"# padding line {i:04d} " + ("x" * 60) for i in range(2200))
+    (tmp_path / "consumer.py").write_text(
+        "from api import normalize_code\n"
+        f"{padding}\n"
+        "def route_code(raw):\n"
+        "    code = normalize_code(raw)\n"
+        "    return 'fallback-queue' if code == 'MISSING_CODE' else f'queue:{code}'\n",
+        encoding="utf-8",
+    )
+    assert (tmp_path / "consumer.py").stat().st_size > 131072
+    (tmp_path / "test_smoke.py").write_text(
+        "from api import normalize_code\nassert normalize_code(' ab-1 ') == 'AB-1'\n",
+        encoding="utf-8",
+    )
+
+    # Production consumer.py skipped for size, falls back to test_smoke.py -> MUST be INCOMPLETE.
+    report = CallerEvidenceReport()
+    result = discover_related_callers(
+        tmp_path,
+        "update normalize_code",
+        ["api.py"],
+        ["consumer.py", "test_smoke.py"],
+        report=report,
+    )
+    assert result.status == "INCOMPLETE"
+    assert report.skipped_large == 1
+    assert result.scope.skipped_large == 1
+    assert result.scope.pool == "tests"
+    assert [e.path for e in result.excerpts] == ["test_smoke.py"]
+    assert result.excerpts[0].incomplete is True
+    assert any("128 KiB" in note for note in result.truncation)
+    desc = report.describe()
+    assert "INCOMPLETE" in desc
+    assert "COMPLETE_WITHIN_SCOPE" not in desc
+    assert "skipped_large=1" in desc
+
+    # Only oversized candidate with no matching fallback -> still INCOMPLETE (not NO_EVIDENCE).
+    only_large_report = CallerEvidenceReport()
+    only_large = discover_related_callers(
+        tmp_path,
+        "update normalize_code",
+        ["api.py"],
+        ["consumer.py"],
+        report=only_large_report,
+    )
+    assert only_large.status == "INCOMPLETE"
+    assert only_large.excerpts == ()
+    assert only_large_report.skipped_large == 1
+    assert any("128 KiB" in note for note in only_large.truncation)
+
+    # Non-Python oversized candidate alongside a valid caller -> also INCOMPLETE.
+    (tmp_path / "api.mjs").write_text("export function splitName(s) { return s.split(' '); }\n")
+    (tmp_path / "oversized.mjs").write_text(
+        "import { splitName } from './api.mjs';\nsplitName('a b');\n//" + ("x" * 140000)
+    )
+    (tmp_path / "valid.mjs").write_text(
+        "import { splitName } from './api.mjs';\nconst out = splitName('a b');\n"
+    )
+    js_res = discover_related_callers(
+        tmp_path,
+        "fix splitName",
+        ["api.mjs"],
+        ["oversized.mjs", "valid.mjs"],
+    )
+    assert js_res.status == "INCOMPLETE"
+    assert js_res.scope.skipped_large == 1
+    assert [e.path for e in js_res.excerpts] == ["valid.mjs"]
+    assert js_res.excerpts[0].incomplete is True
