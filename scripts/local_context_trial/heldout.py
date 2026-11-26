@@ -1871,6 +1871,7 @@ def _build_error_row(
         "calls_by_role": {},
         "tokens_by_role": {},
         "effective_model_params": None,
+        "config_provenance": None,
         "ignored_settings": [],
         "patch_hidden_passed": False,
         "strict_accepted": False,
@@ -1934,6 +1935,16 @@ def main(argv: list[str] | None = None):
         model_contract = run.inspect_model_request_contract(
             args.model, thinking_tokens=args.thinking_tokens
         )
+    try:
+        preflight = run.run_subprocess_preflight(
+            args.model,
+            model_contract["effective_params"],
+            auto_lint=args.auto_lint,
+            thinking_tokens=args.thinking_tokens,
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    provider_provenance = run.probe_provider_provenance(args.model)
     run_meta = run.collect_run_metadata(
         model=args.model,
         suite=args.suite,
@@ -1947,6 +1958,8 @@ def main(argv: list[str] | None = None):
         pythonhashseed=run.DEFAULT_PYTHONHASHSEED,
         thinking_tokens=args.thinking_tokens,
         model_contract=model_contract,
+        config_provenance=preflight["config_provenance"],
+        provider_provenance=provider_provenance,
         controls={
             "backends": [b for b in dict.fromkeys(b for b, _, _ in control_grid)],
             "read_ranges": [rr for rr in dict.fromkeys(rr for _, rr, _ in control_grid)],

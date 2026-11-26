@@ -14,7 +14,14 @@ def fingerprint(metadata, cases, root):
     config = {
         key: value
         for key, value in metadata.items()
-        if key not in {"run_id", "timestamp_utc", "git_dirty"}
+        if key
+        not in {
+            "run_id",
+            "timestamp_utc",
+            "git_dirty",
+            "git_tracked_dirty",
+            "git_untracked_count",
+        }
     }
     digest = sha256(json.dumps(config, sort_keys=True).encode())
     for case in cases:

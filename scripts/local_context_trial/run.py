@@ -13,9 +13,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
+REPO_MODEL_SETTINGS_FILE = ROOT / "aider" / "resources" / "model-settings.yml"
 MODEL = "lm_studio/qwen/qwen3.6-35b-a3b"
 SCHEMA_VERSION = 2
 DEFAULT_AUTO_LINT = False
@@ -23,6 +27,7 @@ DEFAULT_PYTHONHASHSEED = "0"
 
 _TRIAL_USAGE_RE = re.compile(r"^Trial usage:\s+(\S+)\s+(.+?)\s*$", re.M)
 _TRIAL_MODEL_PARAMS_PREFIX_RE = re.compile(r"^Trial model params:\s*", re.M)
+_TRIAL_CONFIG_PROVENANCE_PREFIX_RE = re.compile(r"^Trial config provenance:\s*", re.M)
 _IGNORED_SETTING_RE = re.compile(
     r"Warning:\s+\S+\s+does\s+not\s+support\s+'([^']+)'\s*,\s*ignoring\.", re.M
 )
@@ -251,6 +256,16 @@ def resolve_arm_flags(
     return flags
 
 
+def _hermetic_config_flags() -> list[str]:
+    """Pin repo model settings and empty config so host ~/.aider* files cannot drift trials."""
+    return [
+        "--config",
+        os.devnull,
+        "--model-settings-file",
+        str(REPO_MODEL_SETTINGS_FILE),
+    ]
+
+
 def _resolve_harness_flags(
     *,
     auto_lint: bool = DEFAULT_AUTO_LINT,
@@ -405,10 +420,10 @@ def parse_trial_usage(log_text: str) -> dict:
     }
 
 
-def parse_trial_model_params(log_text: str) -> dict | None:
-    """Parse the last Trial model params JSON object emitted by Aider, if present."""
+def _parse_prefixed_json_object(log_text: str, prefix_re: re.Pattern[str]) -> dict | None:
+    """Parse the last JSON object emitted after prefix_re, tolerating 80-col line wraps."""
     decoder = json.JSONDecoder()
-    matches = list(_TRIAL_MODEL_PARAMS_PREFIX_RE.finditer(log_text))
+    matches = list(prefix_re.finditer(log_text))
     for match in reversed(matches):
         tail = log_text[match.end() :]
         if not tail.startswith("{"):
@@ -416,7 +431,6 @@ def parse_trial_model_params(log_text: str) -> dict | None:
         try:
             parsed, _ = decoder.raw_decode(tail)
         except json.JSONDecodeError:
-            # Handle 80-column console wrapping inside long JSON lines.
             joined = "".join(line.rstrip("\r\n") for line in tail.splitlines()[:20])
             try:
                 parsed, _ = decoder.raw_decode(joined)
@@ -425,6 +439,16 @@ def parse_trial_model_params(log_text: str) -> dict | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+def parse_trial_model_params(log_text: str) -> dict | None:
+    """Parse the last Trial model params JSON object emitted by Aider, if present."""
+    return _parse_prefixed_json_object(log_text, _TRIAL_MODEL_PARAMS_PREFIX_RE)
+
+
+def parse_trial_config_provenance(log_text: str) -> dict | None:
+    """Parse the last Trial config provenance JSON object emitted by Aider, if present."""
+    return _parse_prefixed_json_object(log_text, _TRIAL_CONFIG_PROVENANCE_PREFIX_RE)
 
 
 def parse_ignored_settings(log_text: str) -> list[str]:
@@ -516,6 +540,166 @@ def inspect_model_request_contract(
     }
 
 
+def compare_effective_model_params(
+    expected: dict,
+    actual: dict | None,
+    ignored_settings: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """Return human-readable mismatches between expected metadata and runtime Aider params."""
+    mismatches: list[str] = []
+    if ignored_settings:
+        mismatches.append(
+            f"Aider ignored unsupported settings: {', '.join(str(s) for s in ignored_settings)}"
+        )
+    if actual is None:
+        mismatches.append("missing 'Trial model params:' output from Aider subprocess")
+        return mismatches
+    for key in sorted(set(expected) | set(actual)):
+        if expected.get(key) != actual.get(key):
+            mismatches.append(f"{key}: expected {expected.get(key)!r}, actual {actual.get(key)!r}")
+    return mismatches
+
+
+def probe_provider_provenance(
+    model_name: str,
+    *,
+    api_base: str | None = None,
+    timeout: float = 2.0,
+) -> dict | None:
+    """Best-effort query of LM Studio /api/v0/models/<id> for quantization & loaded context."""
+    if not model_name.startswith("lm_studio/"):
+        return None
+    base = (api_base if api_base is not None else os.environ.get("LM_STUDIO_API_BASE", "")).strip()
+    if not base:
+        return None
+    parsed = urllib.parse.urlparse(base)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    bare_model = model_name.removeprefix("lm_studio/")
+    encoded_model = urllib.parse.quote(bare_model, safe="/")
+    url = f"{parsed.scheme}://{parsed.netloc}/api/v0/models/{encoded_model}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    keep_keys = (
+        "id",
+        "publisher",
+        "arch",
+        "compatibility_type",
+        "quantization",
+        "state",
+        "max_context_length",
+        "loaded_context_length",
+        "capabilities",
+    )
+    info = {key: payload[key] for key in keep_keys if key in payload}
+    info["api_base"] = base
+    return info
+
+
+def run_subprocess_preflight(
+    model_name: str,
+    expected_params: dict,
+    *,
+    auto_lint: bool = DEFAULT_AUTO_LINT,
+    thinking_tokens: str | None = None,
+    pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
+    timeout: int = 30,
+) -> dict:
+    """Run a zero-LLM-call Aider --exit preflight; return verified params and config provenance."""
+    harness_flags = _resolve_harness_flags(
+        auto_lint=auto_lint,
+        thinking_tokens=thinking_tokens,
+    )
+    env = _build_trial_env(pythonhashseed=pythonhashseed)
+    command = [
+        sys.executable,
+        "-c",
+        "import runpy, sys; sys.path[:] = [entry for entry in sys.path if entry]; "
+        "runpy.run_module('aider', run_name='__main__', alter_sys=True)",
+        *_hermetic_config_flags(),
+        "--model",
+        model_name,
+        "--edit-format",
+        "diff",
+        "--no-git",
+        "--no-oracle",
+        "--no-tdd",
+        "--no-check-update",
+        "--no-show-model-warnings",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--no-auto-add-file-mentions",
+        "--no-suggest-shell-commands",
+        "--no-stream",
+        "--yes-always",
+        *harness_flags,
+        "--exit",
+    ]
+    with tempfile.TemporaryDirectory(prefix="aider-trial-preflight-") as tmpdir:
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=tmpdir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Aider preflight timed out after {timeout}s for model {model_name!r}"
+            ) from exc
+
+    combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+    if proc.returncode != 0:
+        snippet = combined.strip().splitlines()[-5:]
+        detail = " | ".join(snippet) if snippet else "no output"
+        raise RuntimeError(
+            f"Aider preflight exited with code {proc.returncode} for model {model_name!r}: {detail}"
+        )
+
+    actual = parse_trial_model_params(combined)
+    ignored = parse_ignored_settings(combined)
+    config_provenance = parse_trial_config_provenance(combined)
+    mismatches = compare_effective_model_params(expected_params, actual, ignored)
+    if mismatches:
+        raise RuntimeError(
+            "Runtime Aider model parameters disagree with trial metadata before attempt #1: "
+            + "; ".join(mismatches)
+        )
+    assert actual is not None
+    return {
+        "effective_model_params": actual,
+        "config_provenance": config_provenance,
+        "ignored_settings": ignored,
+    }
+
+
+def verify_subprocess_model_params(
+    model_name: str,
+    expected_params: dict,
+    *,
+    auto_lint: bool = DEFAULT_AUTO_LINT,
+    thinking_tokens: str | None = None,
+    pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
+    timeout: int = 30,
+) -> dict:
+    """Run a zero-LLM-call Aider --exit preflight and fail fast if runtime params diverge."""
+    return run_subprocess_preflight(
+        model_name,
+        expected_params,
+        auto_lint=auto_lint,
+        thinking_tokens=thinking_tokens,
+        pythonhashseed=pythonhashseed,
+        timeout=timeout,
+    )["effective_model_params"]
+
+
 def classify_audit_outcome(verdicts: list[str]) -> tuple[str, bool | None]:
     """Return (audit_outcome, audit_passed) from parsed audit verdicts."""
     if not verdicts:
@@ -553,7 +737,7 @@ def classify_commit_outcome(
 
 
 def _git_repo_state(repo_root: Path = ROOT) -> dict[str, object]:
-    """Capture git commit SHA and dirty flag for repo_root without failing outside git."""
+    """Capture git commit SHA and tracked/untracked dirty state without failing outside git."""
     try:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
@@ -569,9 +753,22 @@ def _git_repo_state(repo_root: Path = ROOT) -> dict[str, object]:
             text=True,
             timeout=5,
         )
-        return {"git_commit": commit, "git_dirty": bool(status.strip())}
+        lines = [line for line in status.splitlines() if line.strip()]
+        untracked = [line for line in lines if line.startswith("?? ")]
+        tracked = [line for line in lines if not line.startswith("?? ")]
+        return {
+            "git_commit": commit,
+            "git_dirty": bool(lines),
+            "git_tracked_dirty": bool(tracked),
+            "git_untracked_count": len(untracked),
+        }
     except (OSError, subprocess.SubprocessError):
-        return {"git_commit": None, "git_dirty": None}
+        return {
+            "git_commit": None,
+            "git_dirty": None,
+            "git_tracked_dirty": None,
+            "git_untracked_count": None,
+        }
 
 
 def _default_repo_state() -> dict[str, object]:
@@ -596,6 +793,8 @@ def collect_run_metadata(
     pythonhashseed: str = DEFAULT_PYTHONHASHSEED,
     thinking_tokens: str | None = None,
     model_contract: dict | None = None,
+    config_provenance: dict | None = None,
+    provider_provenance: dict | None = None,
     repo_root: Path = ROOT,
     run_id: str | None = None,
 ) -> dict:
@@ -618,6 +817,8 @@ def collect_run_metadata(
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "git_commit": git_state["git_commit"],
         "git_dirty": git_state["git_dirty"],
+        "git_tracked_dirty": git_state["git_tracked_dirty"],
+        "git_untracked_count": git_state["git_untracked_count"],
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "model": model,
@@ -636,6 +837,8 @@ def collect_run_metadata(
         "thinking_tokens": thinking_tokens,
         "requested_thinking_tokens": contract["requested_thinking_tokens"],
         "effective_model_params": contract["effective_params"],
+        "config_provenance": config_provenance,
+        "provider_provenance": provider_provenance,
         "controls": resolved_controls,
     }
 
@@ -924,6 +1127,7 @@ def run_spec(
         "-c",
         "import runpy, sys; sys.path[:] = [entry for entry in sys.path if entry]; "
         "runpy.run_module('aider', run_name='__main__', alter_sys=True)",
+        *_hermetic_config_flags(),
         "--model",
         model,
         "--edit-format",
@@ -982,6 +1186,7 @@ def run_spec(
     verdicts = re.findall(r"^Local caller audit: (PASS|FAIL|UNKNOWN|ERROR)\b", log_text, re.M)
     usage_info = parse_trial_usage(log_text)
     effective_model_params = parse_trial_model_params(log_text)
+    config_provenance = parse_trial_config_provenance(log_text)
     ignored_settings = parse_ignored_settings(log_text)
     missing_completion = code != 124 and usage_info["editor_calls"] == 0
 
@@ -1090,6 +1295,7 @@ def run_spec(
         calls_by_role=usage_info["calls_by_role"],
         tokens_by_role=usage_info["tokens_by_role"],
         effective_model_params=effective_model_params,
+        config_provenance=config_provenance,
         ignored_settings=ignored_settings,
         patch_hidden_passed=patch_hidden_passed,
         strict_accepted=strict_accepted,
@@ -1224,6 +1430,16 @@ def main():
             model_contract["unsupported_reason"]
             or f"--thinking-tokens is not supported for model {MODEL!r}"
         )
+    try:
+        preflight = run_subprocess_preflight(
+            MODEL,
+            model_contract["effective_params"],
+            auto_lint=args.auto_lint,
+            thinking_tokens=args.thinking_tokens,
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    provider_provenance = probe_provider_provenance(MODEL)
     output = Path(tempfile.mkdtemp(prefix="aider-local-trial-"))
     print(output, flush=True)
     run_meta = collect_run_metadata(
@@ -1238,6 +1454,8 @@ def main():
         pythonhashseed=DEFAULT_PYTHONHASHSEED,
         thinking_tokens=args.thinking_tokens,
         model_contract=model_contract,
+        config_provenance=preflight["config_provenance"],
+        provider_provenance=provider_provenance,
         controls={
             "backend": args.local_callers_backend,
             "read_range": args.local_callers_read_range,

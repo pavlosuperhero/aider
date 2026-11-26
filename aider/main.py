@@ -332,13 +332,15 @@ def generate_search_path_list(default_file, git_root, command_line_file):
     return files
 
 
-def register_models(git_root, model_settings_fname, io, verbose=False):
+def register_models(git_root, model_settings_fname, io, verbose=False, loaded_files_out=None):
     model_settings_files = generate_search_path_list(
         ".aider.model.settings.yml", git_root, model_settings_fname
     )
 
     try:
         files_loaded = models.register_models(model_settings_files)
+        if loaded_files_out is not None:
+            loaded_files_out.extend(files_loaded)
         if len(files_loaded) > 0:
             if verbose:
                 io.tool_output("Loaded model settings from:")
@@ -1045,7 +1047,14 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     is_first_run = is_first_run_of_new_version(io, verbose=args.verbose)
     check_and_load_imports(io, is_first_run, verbose=args.verbose)
 
-    register_models(git_root, args.model_settings_file, io, verbose=args.verbose)
+    loaded_model_settings_files = []
+    register_models(
+        git_root,
+        args.model_settings_file,
+        io,
+        verbose=args.verbose,
+        loaded_files_out=loaded_model_settings_files,
+    )
     register_litellm_models(git_root, args.model_metadata_file, io, verbose=args.verbose)
 
     if args.list_models:
@@ -1165,12 +1174,20 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             "Trial model params: "
             + json.dumps(main_model.effective_completion_params(), sort_keys=True)
         )
+        trial_provenance_line = "Trial config provenance: " + json.dumps(
+            {
+                "config_file": args.config,
+                "model_settings_files": loaded_model_settings_files,
+            },
+            sort_keys=True,
+        )
         console = getattr(io, "console", None)
         prev_soft_wrap = getattr(console, "soft_wrap", None)
         if prev_soft_wrap is not None:
             console.soft_wrap = True
         try:
             io.tool_output(trial_params_line)
+            io.tool_output(trial_provenance_line)
         finally:
             if prev_soft_wrap is not None:
                 console.soft_wrap = prev_soft_wrap

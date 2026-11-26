@@ -851,6 +851,13 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         self.assertIn("--no-auto-add-file-mentions", captured_cmd)
         self.assertIn("--no-auto-commits", captured_cmd)
         self.assertIn("--no-dirty-commits", captured_cmd)
+        self.assertIn("--config", captured_cmd)
+        self.assertEqual(captured_cmd[captured_cmd.index("--config") + 1], os.devnull)
+        self.assertIn("--model-settings-file", captured_cmd)
+        self.assertEqual(
+            captured_cmd[captured_cmd.index("--model-settings-file") + 1],
+            str(run.REPO_MODEL_SETTINGS_FILE),
+        )
         self.assertNotIn("--auto-lint", captured_cmd)
         self.assertNotIn("--thinking-tokens", captured_cmd)
         self.assertEqual(captured_env.get("PYTHONHASHSEED"), "0")
@@ -1054,6 +1061,110 @@ class TestTrialUsageAndOutcomes(unittest.TestCase):
         )
         self.assertEqual(run.parse_trial_model_params(aider_out), expected_params)
         self.assertEqual(run.parse_ignored_settings(aider_out), ["thinking_tokens"])
+
+    def test_p0_hermetic_model_settings_and_subprocess_preflight_fail_fast(self):
+        expected_params = run.inspect_model_request_contract(
+            "lm_studio/qwen/qwen3.6-35b-a3b"
+        )["effective_params"]
+        self.assertEqual(expected_params["temperature"], 0.6)
+
+        # Pure comparator catches missing params, ignored settings, and field drift
+        self.assertEqual(run.compare_effective_model_params(expected_params, dict(expected_params)), [])
+        drifted = dict(expected_params, temperature=0)
+        diffs = run.compare_effective_model_params(expected_params, drifted, ["thinking_tokens"])
+        self.assertTrue(any("temperature: expected 0.6, actual 0" in d for d in diffs))
+        self.assertTrue(any("thinking_tokens" in d for d in diffs))
+        missing = run.compare_effective_model_params(expected_params, None)
+        self.assertTrue(any("missing 'Trial model params:'" in d for d in missing))
+
+        # End-to-end preflight under poisoned HOME/.aider.model.settings.yml + HOME/.aider.conf.yml:
+        # hermetic flags (--config /dev/null --model-settings-file <repo>) MUST keep temperature=0.6.
+        with tempfile.TemporaryDirectory(prefix="aider-poisoned-home-") as fake_home:
+            home_path = Path(fake_home)
+            (home_path / ".aider.model.settings.yml").write_text(
+                "- name: lm_studio/qwen/qwen3.6-35b-a3b\n"
+                "  edit_format: diff\n"
+                "  use_repo_map: true\n"
+                "  extra_params:\n"
+                "    max_tokens: 32768\n",
+                encoding="utf-8",
+            )
+            (home_path / ".aider.conf.yml").write_text(
+                "auto-lint: true\noracle-top-k: 1\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HOME": fake_home}):
+                preflight = run.run_subprocess_preflight(
+                    "lm_studio/qwen/qwen3.6-35b-a3b",
+                    expected_params,
+                )
+            actual = preflight["effective_model_params"]
+            self.assertEqual(actual, expected_params)
+            self.assertEqual(actual["temperature"], 0.6)
+            provenance = preflight["config_provenance"]
+            self.assertIsNotNone(provenance)
+            self.assertEqual(provenance["config_file"], os.devnull)
+            self.assertEqual(
+                Path(provenance["model_settings_files"][-1]).resolve(),
+                run.REPO_MODEL_SETTINGS_FILE.resolve(),
+            )
+
+            # Preflight fails fast with RuntimeError if expected metadata disagrees with runtime
+            with mock.patch.dict(os.environ, {"HOME": fake_home}):
+                with self.assertRaises(RuntimeError) as ctx:
+                    run.verify_subprocess_model_params(
+                        "lm_studio/qwen/qwen3.6-35b-a3b",
+                        drifted,
+                    )
+            self.assertIn("temperature: expected 0, actual 0.6", str(ctx.exception))
+
+        # heldout.main aborts before attempt #1 if preflight reports runtime-vs-metadata drift
+        with tempfile.TemporaryDirectory(prefix="aider-preflight-fail-") as tmp:
+            out_path = Path(tmp) / "out.jsonl"
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(
+                    heldout.run,
+                    "run_subprocess_preflight",
+                    side_effect=RuntimeError(
+                        "Runtime Aider model parameters disagree with trial metadata before attempt #1: "
+                        "temperature: expected 0.6, actual 0"
+                    ),
+                ),
+                mock.patch.object(heldout.run, "run_spec") as mock_run_spec,
+                contextlib.redirect_stderr(err_buf),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    heldout.main(
+                        [
+                            "--cases",
+                            "duration",
+                            "--arms",
+                            "baseline",
+                            "--specs",
+                            "vague",
+                            "--rounds",
+                            "1",
+                            "--out",
+                            str(out_path),
+                        ]
+                    )
+            self.assertEqual(ctx.exception.code, 2)
+            mock_run_spec.assert_not_called()
+            self.assertFalse(out_path.with_suffix(".meta.json").exists())
+            self.assertIn("temperature: expected 0.6, actual 0", err_buf.getvalue())
+
+        # Provider provenance gracefully returns None when offline / non-LM-Studio
+        self.assertIsNone(run.probe_provider_provenance("claude-3-7-sonnet-20250219"))
+        with mock.patch.dict(os.environ, {"LM_STUDIO_API_BASE": ""}):
+            self.assertIsNone(run.probe_provider_provenance("lm_studio/qwen/qwen3.6-35b-a3b"))
+
+        # Git state separates tracked dirty changes from untracked directories
+        meta_check = run.collect_run_metadata(suite="synthetic", seed=1, rounds=1)
+        self.assertIn("git_tracked_dirty", meta_check)
+        self.assertIn("git_untracked_count", meta_check)
+        self.assertIn("config_provenance", meta_check)
+        self.assertIn("provider_provenance", meta_check)
 
 
 class TestReportingAndPairedIntervals(unittest.TestCase):
